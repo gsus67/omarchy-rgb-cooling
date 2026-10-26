@@ -29,6 +29,8 @@
     "Cyan": "Cian",
     "Blue": "Azul",
     "Purple": "Morado",
-    "Off": "Apagado"
+    "Off": "Apagado",
+    "Scanning…": "Escaneando…",
+    "Scan for devices (S)": "Buscar dispositivos (S)"
   }
 }

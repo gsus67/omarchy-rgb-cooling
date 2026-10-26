@@ -76,7 +76,8 @@ def snapshot(home):
 def run(command, env, cwd=None):
     result = subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
-        raise AssertionError(f"{command} failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
+        raise AssertionError(
+            f"{command} failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
     return result.stdout
 
 
@@ -110,15 +111,21 @@ def scenario(name, prepare):
         if reply.get("ok") is not True:
             raise AssertionError(f"bootstrap failed: {reply}")
         units = home / ".config/systemd/user"
-        for expected in (units / f"{NAME}.socket", units / f"{NAME}.service",
-                         home / f".local/state/{NAME}/bin/rgbcd", units / f"sockets.target.wants/{NAME}.socket"):
+        expected_paths = (
+            units / f"{NAME}.socket",
+            units / f"{NAME}.service",
+            home / f".local/state/{NAME}/bin/rgbcd",
+            units / f"sockets.target.wants/{NAME}.socket",
+        )
+        for expected in expected_paths:
             if not os.path.lexists(expected):
                 raise AssertionError(f"bootstrap did not create {expected}")
         # try-restart is fine: it only restarts a service that is already running.
         for line in (home / "stubs/log").read_text().splitlines():
             words = line.split()
             if f"{NAME}.service" in words and {"enable", "start", "restart"} & set(words):
-                raise AssertionError(f"bootstrap must activate only the socket, never the service: {line}")
+                raise AssertionError(
+                    f"bootstrap must activate only the socket, never the service: {line}")
 
         run(["bash", str(plugin / "uninstall.sh")], env)
         after = snapshot(home)
@@ -126,7 +133,8 @@ def scenario(name, prepare):
         removed = sorted(set(before) - set(after))
         changed = sorted(p for p in set(before) & set(after) if before[p] != after[p])
         if added or removed or changed:
-            raise AssertionError(f"{name}: left behind {added}, removed {removed}, changed {changed}")
+            raise AssertionError(
+                f"{name}: left behind {added}, removed {removed}, changed {changed}")
         print(f"ok: {name}")
 
 
@@ -137,7 +145,8 @@ def fresh(home):
 def existing_units(home):
     units = home / ".config/systemd/user"
     (units / "sockets.target.wants").mkdir(parents=True)
-    (units / "other.socket").write_text("[Socket]\nListenStream=%t/other.sock\n[Install]\nWantedBy=sockets.target\n")
+    (units / "other.socket").write_text(
+        "[Socket]\nListenStream=%t/other.sock\n[Install]\nWantedBy=sockets.target\n")
     (units / "sockets.target.wants/other.socket").symlink_to(units / "other.socket")
     (home / ".config/omarchy-rgb-cooling-unrelated").write_text("keep me\n")
 

@@ -46,6 +46,8 @@ class OpenRgbServer:
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
         self.fragment = fragment
+        self.respond = threading.Event()
+        self.respond.set()
         self.commands = []
         self.command_times = []
         self.accepted = 0
@@ -105,6 +107,10 @@ class OpenRgbServer:
                         data = data[16 + length:]
                         self.commands.append((device, command, payload))
                         self.command_times.append((command, time.monotonic()))
+                        while not self.respond.wait(0.1) and not self.stop_event.is_set():
+                            pass
+                        if self.stop_event.is_set():
+                            break
                         if self.behavior == "timeout":
                             continue
                         if self.behavior == "huge":

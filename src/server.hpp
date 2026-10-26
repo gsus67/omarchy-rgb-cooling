@@ -29,12 +29,15 @@ private:
     std::unique_ptr<Hotplug> hotplug;
     QSet<Connection *> clients;
     QElapsedTimer clock;
+    QElapsedTimer demoScan;
+    bool deviceSubscriber = false;
     QTimer events;
     QTimer idleExit;
     int sampleInterval = 2000;
     void initializeAdapters();
     void accept(qintptr descriptor);
     void dispatch(Connection *connection, const Protocol::Request &request);
+    void dispatchLighting(Connection *connection, const Protocol::Request &request);
     void subscriptionsChanged();
     void tick();
     void devicesChanged();

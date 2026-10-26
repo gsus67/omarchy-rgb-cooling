@@ -68,7 +68,7 @@ Reply validate(const QString &operation, const QJsonObject &params)
     // Closed operation set with an explicit parameter schema for every operation.
     static const QMap<QString, QList<Field>> schemas{
         {"hello", {}}, {"status", {}}, {"sensors", {}}, {"devices", {}},
-        {"unsubscribe", {}},
+        {"unsubscribe", {}}, {"devices.rescan", {}},
         {"subscribe", {{"topics", Type::Topics}, {"interval_ms", Type::Interval, false}}},
         {"lighting.get", {{"device", Type::Device}}},
         {"lighting.set", {{"device", Type::Device}, {"color", Type::Color},

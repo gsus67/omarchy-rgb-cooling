@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+BOOTSTRAP_COMMAND = ('["python3", root.pluginDirectory + "/bootstrap.py", '
+                     'root.pluginDirectory]')
 QML_FILES = sorted(path for path in ROOT.rglob("*.qml") if ".git" not in path.parts)
 # Elements that interpret markup unless told otherwise.
 TEXT_ELEMENTS = ("Text", "TextEdit", "Label", "Controls.Label", "Controls.TextArea", "TextArea")
@@ -41,29 +43,33 @@ class QmlSecurityTest(unittest.TestCase):
             for line, element, block in text_blocks(path.read_text()):
                 with self.subTest(file=path.name, line=line):
                     self.assertIn("textFormat: Text.PlainText", block,
-                                  f"{path.name}:{line} {element} must set textFormat: Text.PlainText")
+                                  f"{path.name}:{line} {element} must set "
+                                  "textFormat: Text.PlainText")
 
     def test_no_rich_text_formats(self):
         for path in QML_FILES:
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 with self.subTest(file=path.name, line=number):
-                    self.assertIsNone(re.search(r"\b(RichText|StyledText|AutoText|MarkdownText)\b", line),
+                    markup = r"\b(RichText|StyledText|AutoText|MarkdownText)\b"
+                    self.assertIsNone(re.search(markup, line),
                                       f"{path.name}:{number} uses a markup text format")
 
     def test_no_remote_urls(self):
         for path in QML_FILES:
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 with self.subTest(file=path.name, line=number):
-                    self.assertNotRegex(line, r"https?://", f"{path.name}:{number} references a remote URL")
+                    self.assertNotRegex(line, r"https?://",
+                                        f"{path.name}:{number} references a remote URL")
 
     def test_only_process_is_bootstrap(self):
         for path in QML_FILES:
             source = path.read_text()
             with self.subTest(file=path.name):
-                self.assertNotRegex(source, r"\bexecDetached\b", f"{path.name} must not detach processes")
+                self.assertNotRegex(source, r"\bexecDetached\b",
+                                    f"{path.name} must not detach processes")
                 commands = re.findall(r"^\s*command:\s*(.+)$", source, re.MULTILINE)
                 for command in commands:
-                    self.assertEqual(command.strip(), '["python3", root.pluginDirectory + "/bootstrap.py", root.pluginDirectory]',
+                    self.assertEqual(command.strip(), BOOTSTRAP_COMMAND,
                                      f"{path.name} starts an unexpected process: {command.strip()}")
 
     def test_core_lines_are_bounded(self):
@@ -73,7 +79,8 @@ class QmlSecurityTest(unittest.TestCase):
 
     def test_socket_lives_in_the_runtime_dir(self):
         source = (ROOT / "RgbCooling.qml").read_text()
-        self.assertIn('Quickshell.env("XDG_RUNTIME_DIR") || "") + "/omarchy-rgb-cooling.sock"', source)
+        self.assertIn('Quickshell.env("XDG_RUNTIME_DIR") || "") + "/omarchy-rgb-cooling.sock"',
+                      source)
 
 
 if __name__ == "__main__":

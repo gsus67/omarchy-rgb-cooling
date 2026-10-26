@@ -41,13 +41,16 @@ bool Hotplug::active() const
 void Hotplug::drain(const std::function<void()> &reconcile)
 {
     // Reconcile the complete inventory instead of treating event payloads as paths.
-    // Subscription ticks also reconcile, recovering from dropped netlink messages.
+    bool received = false;
     for (int count = 0; count < 256; ++count) {
         udev_device *device = udev_monitor_receive_device(monitor);
         if (device == nullptr) {
             break;
         }
+        received = true;
         udev_device_unref(device);
     }
-    reconcile();
+    if (received) {
+        reconcile();
+    }
 }

@@ -4,7 +4,6 @@
 #include "hwmon.hpp"
 #include "openrgb.hpp"
 #include "protocol.hpp"
-#include "retry_backoff.hpp"
 #include "sdk_reader.hpp"
 #include "server.hpp"
 #include <QDir>
@@ -69,6 +68,7 @@ void testProtocol(Checks &checks)
         Protocol::Request parsed;
         return Protocol::parse(QJsonDocument(envelope).toJson(), parsed).ok();
     };
+    checks.verify(valid({}, "devices.rescan"), "devices.rescan accepts empty parameters");
     const QJsonObject lighting{{"device", "demo:rgb0"}, {"color", "#aAbBcC"},
                                {"brightness", 50}};
     checks.verify(valid(lighting, "lighting.set"), "lighting.set accepts RGB and brightness");
@@ -206,18 +206,6 @@ void testHwmon(Checks &checks)
                   "hwmon leaves PWM bytes unchanged");
 }
 
-void testBackoff(Checks &checks)
-{
-    RetryBackoff backoff;
-    bool matches = true;
-    for (const int expected : {2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000}) {
-        matches = matches && backoff.next() == expected;
-    }
-    checks.verify(matches, "OpenRGB retries double from two seconds and cap at sixty seconds");
-    backoff.reset();
-    checks.verify(backoff.next() == 2000, "OpenRGB backoff resets for a fresh interest or success");
-}
-
 void testDemo(Checks &checks)
 {
     DemoAdapter demo;
@@ -236,7 +224,6 @@ int runSelfTests()
     testSdk(checks);
     testHwmon(checks);
     testDemo(checks);
-    testBackoff(checks);
     checks.verify(!Server::peerAllowed(-1, ::getuid()), "SO_PEERCRED rejects invalid descriptors");
     QTextStream(stdout) << "Self-tests: " << checks.failures << " failures\n";
     return checks.failures == 0 ? 0 : 1;

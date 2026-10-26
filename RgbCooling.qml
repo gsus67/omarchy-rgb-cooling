@@ -171,8 +171,9 @@ Panel {
   }
 
   function subscribe() {
-    // The bar only needs the headline temperature; refresh faster while open.
-    send("subscribe", { topics: ["sensors", "devices"], interval_ms: opened ? 2000 : 5000 })
+    // The bar only needs the headline temperature; refresh faster while open,
+    // and follow device hotplug only while the panel shows the device list.
+    send("subscribe", { topics: opened ? ["sensors", "devices"] : ["sensors"], interval_ms: opened ? 2000 : 5000 })
   }
 
   function onConnected() {
@@ -184,20 +185,39 @@ Panel {
       demo = result.demo === true
       coreReady = true
       send("sensors", {}, function(ok, r) { if (ok) applySensors(r) })
-      send("devices", {}, function(ok, r) { if (ok) applyDevices(r) })
       subscribe()
+      if (opened) scan()
     })
+  }
+
+  // Engines are only contacted on request (docs/API.md, "Engine scans"):
+  // once each time the panel opens and from the Scan button.
+  property bool scanning: false
+  function scan() {
+    if (scanning) return
+    scanning = true
+    var sent = send("devices.rescan", {}, function(ok, r) {
+      root.scanning = false
+      if (ok) root.applyDevices(r)
+      else root.send("devices", {}, function(ok2, r2) { if (ok2) root.applyDevices(r2) })
+    })
+    if (!sent) scanning = false
   }
 
   function onDisconnected() {
     coreReady = false
+    scanning = false
     pending = ({})
     reconnectTimer.interval = reconnectDelay
     reconnectDelay = Math.min(reconnectDelay * 2, 30000)
     reconnectTimer.restart()
   }
 
-  onOpenedChanged: if (coreReady) subscribe()
+  onOpenedChanged: {
+    if (!coreReady) return
+    subscribe()
+    if (opened) scan()
+  }
 
   Process {
     id: bootstrapProc
@@ -341,6 +361,7 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onCloseRequested: root.close()
+      onTextKey: function(key) { if (key === "s") root.scan() }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       ScrollView {
@@ -483,10 +504,30 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
 
-            PanelSectionHeader {
-              text: root.t("LIGHTING")
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(lightingHeader.implicitHeight, scanButton.height)
+
+              PanelSectionHeader {
+                id: lightingHeader
+                text: root.t("LIGHTING")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              PanelActionButton {
+                id: scanButton
+                iconText: root.scanning ? "󰑓" : "󰍉"
+                tooltipText: root.scanning ? root.t("Scanning…") : root.t("Scan for devices (S)")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                enabled: !root.scanning
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.scan()
+              }
             }
 
             Text {

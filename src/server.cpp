@@ -33,7 +33,9 @@ void Server::initializeAdapters()
         adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); });
         hotplug = std::make_unique<Hotplug>([this] {
             sensorSource.invalidate();
-            static_cast<OpenRgbAdapter *>(adapter.get())->refresh();
+            if (deviceSubscriber) {
+                static_cast<OpenRgbAdapter *>(adapter.get())->refresh();
+            }
         });
     }
 }
@@ -141,34 +143,10 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
         connection->topics.clear();
         connection->subscriptionChanged();
         subscriptionsChanged();
-    } else if (op == "devices" || op == "lighting.get" || op == "lighting.set") {
-        if (op == "lighting.set" && !connection->allowLightingWrite()) {
-            reply = Protocol::Reply::failure(
-                "rate_limited", "At most 10 lighting.set requests per second");
-        } else {
-            auto ready = [this, peer = QPointer(connection), request] {
-                if (!peer || !clients.contains(peer)) {
-                    return;
-                }
-                Protocol::Reply result;
-                const auto &params = request.params;
-                if (request.operation == "devices") {
-                    result.result = {{"devices", adapter->devices()}};
-                } else if (request.operation == "lighting.get") {
-                    result = adapter->lighting(params.value("device").toString());
-                } else {
-                    result = adapter->setLighting(params.value("device").toString(),
-                        params.value("color").toString(), params.value("brightness").toInt());
-                }
-                peer->send(Protocol::response(request.id, result));
-            };
-            if (demo) {
-                ready();
-            } else {
-                static_cast<OpenRgbAdapter *>(adapter.get())->request(std::move(ready));
-            }
-            return;
-        }
+    } else if (op == "devices" || op == "devices.rescan"
+               || op == "lighting.get" || op == "lighting.set") {
+        dispatchLighting(connection, request);
+        return;
     } else {
         reply = Protocol::Reply::failure("unknown_op", "Operation is not supported by API v1");
     }
@@ -178,15 +156,12 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
 void Server::subscriptionsChanged()
 {
     sampleInterval = 10000;
-    bool deviceSubscriber = false;
+    deviceSubscriber = false;
     for (const auto *connection : clients) {
         if (connection->topics.contains("sensors")) {
             sampleInterval = std::min(sampleInterval, connection->intervalMilliseconds);
         }
         deviceSubscriber = deviceSubscriber || connection->topics.contains("devices");
-    }
-    if (!demo) {
-        static_cast<OpenRgbAdapter *>(adapter.get())->setInterested(deviceSubscriber);
     }
     scheduleEvents();
 }

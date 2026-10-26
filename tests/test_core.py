@@ -22,11 +22,12 @@ REPO = Path(__file__).resolve().parents[1]
 BUILD_DIRECTORY = None
 BINARY = None
 PEERCRED_LIBRARY = None
+UDEV_LIBRARY = None
 
 
 def setUpModule():
     """Compile exactly once for this module, in a disposable directory."""
-    global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY
+    global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY, UDEV_LIBRARY
     BUILD_DIRECTORY = tempfile.TemporaryDirectory(prefix="rgbcd-contract-")
     result = subprocess.run(
         [sys.executable, str(REPO / "native_build.py"), "--output", BUILD_DIRECTORY.name],
@@ -38,12 +39,14 @@ def setUpModule():
     BINARY = Path(BUILD_DIRECTORY.name) / "rgbcd"
     PEERCRED_LIBRARY = Path(BUILD_DIRECTORY.name) / "peercred.so"
     compiler = shutil.which(os.environ.get("CXX", "g++"))
-    result = subprocess.run([
-        compiler, "-std=c++20", "-shared", "-fPIC", str(REPO / "tests/fakes/peercred.cpp"),
-        "-ldl", "-o", str(PEERCRED_LIBRARY),
-    ], capture_output=True, text=True, timeout=30)
-    if result.returncode:
-        raise RuntimeError(result.stdout + result.stderr)
+    UDEV_LIBRARY = Path(BUILD_DIRECTORY.name) / "udev.so"
+    for name, library in (("peercred", PEERCRED_LIBRARY), ("udev", UDEV_LIBRARY)):
+        result = subprocess.run([
+            compiler, "-std=c++20", "-shared", "-fPIC", str(REPO / f"tests/fakes/{name}.cpp"),
+            "-ldl", "-o", str(library),
+        ], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
 
 
 def tearDownModule():
@@ -103,12 +106,13 @@ class Client:
 
 
 class Daemon:
-    def __init__(self, directory, *, demo=False, activation=None, extra=None, alien_uid=False):
+    def __init__(self, directory, *, demo=False, activation=None, extra=None,
+                 alien_uid=False, environment=None):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tree = HwmonTree(self.directory / "hwmon")
         self.path = self.directory / "core.sock"
-        environment = os.environ.copy()
+        environment = {**os.environ, **(environment or {})}
         for variable in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"):
             environment.pop(variable, None)
         if alien_uid:
@@ -178,6 +182,13 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(result, {"v": 1, "id": 1, "ok": True, "result": {
             "version": "0.1.0", "api": 1, "demo": True,
         }})
+
+    def test_contract_demo_rescan_lists_devices_and_rate_limits(self):
+        devices = self.client.request("devices.rescan")["result"]
+        self.assertEqual(devices["devices"][0]["id"], "demo:rgb0")
+        self.assert_error(self.client.request("devices.rescan"), "rate_limited")
+        time.sleep(2.05)
+        self.assertEqual(self.client.request("devices.rescan")["result"], devices)
 
     def test_contract_status_engine_schema_and_uptime(self):
         status = self.client.request("status")["result"]
@@ -267,7 +278,7 @@ class CoreContract(unittest.TestCase):
                 self.assert_error(reply, "bad_request")
                 self.assertEqual(reply["id"], self.client.sequence)
         # No-parameter operations still require params to be an object.
-        for operation in ("hello", "status", "sensors", "devices", "unsubscribe"):
+        for operation in ("hello", "status", "sensors", "devices", "devices.rescan", "unsubscribe"):
             self.client.send({"v": 1, "id": 800, "op": operation, "params": []})
             self.assert_error(self.client.read(), "bad_request")
         self.assertEqual(self.client.request("lighting.set", {
@@ -559,12 +570,20 @@ class OpenRgbContract(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="rgbcd-sdk-")
         self.addCleanup(self.temporary.cleanup)
         self.counter = 0
+        self.udev_fifo = Path(self.temporary.name) / "udev.fifo"
+        os.mkfifo(self.udev_fifo)
+        self.udev_fd = os.open(self.udev_fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, self.udev_fd)
+        self.environment = {
+            "LD_PRELOAD": str(UDEV_LIBRARY), "CORE_TEST_UDEV_FIFO": str(self.udev_fifo),
+        }
 
     def launch(self, *, interested=True, **options):
         fake = OpenRgbServer(**options)
         self.addCleanup(fake.close)
         self.counter += 1
-        daemon = Daemon(Path(self.temporary.name) / str(self.counter))
+        daemon = Daemon(Path(self.temporary.name) / str(self.counter),
+                        environment=self.environment)
         self.addCleanup(daemon.close)
         client = daemon.client()
         self.addCleanup(client.close)
@@ -572,6 +591,7 @@ class OpenRgbContract(unittest.TestCase):
             self.assertTrue(client.request("subscribe", {
                 "topics": ["devices"], "interval_ms": 10000,
             })["ok"])
+            client.request("devices")
         return fake, daemon, client
 
     def wait_state(self, client, expected, timeout=5):
@@ -583,82 +603,166 @@ class OpenRgbContract(unittest.TestCase):
             time.sleep(0.03)
         self.fail(f"Expected {expected}, got {engine}")
 
-    def test_contract_openrgb_interest_gates_connection_rescan_and_disconnect(self):
-        fake, daemon, client = self.launch(interested=False)
-        client.request("hello")
-        client.request("status")
-        client.request("sensors")
+    def subscribe_devices(self, client):
+        return client.request("subscribe", {"topics": ["devices"], "interval_ms": 500})
+
+    def hotplug(self):
+        os.write(self.udev_fd, b"+")
+
+    def test_contract_openrgb_no_requests_or_subscriptions_start_engine_polling(self):
+        fake, _daemon, client = self.launch(interested=False)
+        # Longer than both the old initial retry and periodic reconciliation interval.
+        time.sleep(5.3)
+        self.assertEqual(fake.accepted, 0)
+        for operation in ("hello", "status", "sensors"):
+            self.assertTrue(client.request(operation)["ok"])
         client.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
         client.event("sensors")
-        time.sleep(2.2)
+        self.hotplug()
+        time.sleep(0.2)
+        self.assertEqual(fake.accepted, 0)
+        self.subscribe_devices(client)
+        client.event("devices")
+        time.sleep(5.3)
         self.assertEqual(fake.accepted, 0)
         self.assertEqual(fake.commands, [])
-        client.request("unsubscribe")
-        device = client.request("devices")["result"]["devices"][0]
-        self.assertTrue(fake.disconnected.wait(1))
-        accepted = fake.accepted
-        response = client.request("lighting.get", {"device": device["id"]})
-        self.assertTrue(response["ok"])
-        self.assertTrue(fake.disconnected.wait(1))
-        self.assertEqual(fake.accepted, accepted + 1)
+
+    def test_contract_openrgb_first_devices_then_lighting_and_devices_use_cache(self):
+        fake, _daemon, client = self.launch(interested=False)
+        devices = client.request("devices")["result"]
+        self.assertEqual(client.request("devices")["result"], devices)
+        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
+        device = devices["devices"][0]
+        self.assertTrue(client.request("lighting.get", {"device": device["id"]})["ok"])
         response = client.request("lighting.set", {
             "device": device["id"], "color": "#ABCDEF", "brightness": 50,
         })
         self.assertEqual(response["error"]["code"], "blocked")
+        self.assertEqual(fake.accepted, 1)
         self.assertTrue(fake.disconnected.wait(1))
-        self.assertTrue(self.subscribe_devices(client)["ok"])
-        second = daemon.client()
-        self.addCleanup(second.close)
-        self.subscribe_devices(second)
-        self.wait_state(client, "blocked")
-        client.request("unsubscribe")
-        self.assertFalse(fake.disconnected.wait(0.2))
-        # Only interested subscribers permit the five-second reconciliation scan.
-        counts = sum(command == 0 for _device, command, _payload in fake.commands)
-        deadline = time.monotonic() + 6
-        while sum(command == 0 for _device, command, _payload in fake.commands) == counts:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
-        second.close()
-        self.assertTrue(fake.disconnected.wait(1))
-        commands = list(fake.commands)
-        accepted = fake.accepted
-        fake.hotplug([controller("Other")])
-        time.sleep(5.3)
-        self.assertEqual(fake.commands, commands)
-        self.assertEqual(fake.accepted, accepted)
-
-    def subscribe_devices(self, client):
-        return client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
-
-    def test_contract_openrgb_retry_backoff_and_cancellation_without_interests(self):
-        fake, _daemon, client = self.launch(behavior="magic")
-        deadline = time.monotonic() + 9
-        while len(fake.command_times) < 3:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.05)
-        times = [stamp for command, stamp in fake.command_times if command == 40]
-        self.assertGreaterEqual(times[1] - times[0], 1.8)
-        self.assertLess(times[1] - times[0], 3)
-        self.assertGreaterEqual(times[2] - times[1], 3.8)
-        self.assertLess(times[2] - times[1], 5)
-        client.request("unsubscribe")
-        count = fake.accepted
-        time.sleep(8.3)
-        self.assertEqual(fake.accepted, count)
-        # A fresh interest after cancellation starts immediately with a reset backoff.
         self.subscribe_devices(client)
-        self.wait_state(client, "unreachable")
-        deadline = time.monotonic() + 3
-        while fake.accepted == count:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.02)
+        time.sleep(5.3)
+        self.assertEqual(fake.accepted, 1)
 
-    def test_contract_openrgb_pending_request_keeps_loop_responsive_and_releases_interest(self):
+    def test_contract_openrgb_first_lighting_operations_each_scan_once(self):
+        for operation in ("lighting.get", "lighting.set"):
+            with self.subTest(operation=operation):
+                fake, daemon, client = self.launch(interested=False)
+                response = client.request(operation, {
+                    "device": "unknown", "color": "#123456", "brightness": 50,
+                })
+                self.assertEqual(response["error"]["code"], "unavailable")
+                self.assertTrue(client.request("devices")["result"]["devices"])
+                self.assertEqual(fake.accepted, 1)
+                client.close()
+                daemon.close()
+                fake.close()
+
+    def test_contract_openrgb_rescan_fresh_list_global_rate_limit_and_deferred_response(self):
+        fake, daemon, client = self.launch(interested=False)
+        # devices.rescan may also be the very first scan.
+        self.assertTrue(client.request("devices.rescan")["ok"])
+        self.assertTrue(fake.disconnected.wait(1))
+        other = daemon.client()
+        self.addCleanup(other.close)
+        response = other.request("devices.rescan")
+        self.assertEqual(response["error"]["code"], "rate_limited")
+        self.assertEqual(fake.accepted, 1)
+        time.sleep(2.05)
+        fake.descriptors = [controller("Replacement")]
+        fake.respond.clear()
+        client.send({"v": 1, "id": 100, "op": "devices.rescan"})
+        deadline = time.monotonic() + 1
+        while fake.accepted < 2:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        started = time.monotonic()
+        self.assertTrue(other.request("hello")["ok"])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(select.select([client.socket], [], [], 0.1)[0], [])
+        # Reads and manual scans on different peers share this scan, not stale cache.
+        other.send({"v": 1, "id": 101, "op": "devices"})
+        other.send({"v": 1, "id": 102, "op": "devices.rescan"})
+        other.send({"v": 1, "id": 103, "op": "lighting.get",
+                    "params": {"device": "missing"}})
+        other.send({"v": 1, "id": 104, "op": "lighting.set",
+                    "params": {"device": "missing", "color": "#112233", "brightness": 50}})
+        # A barrier proves all requests were dispatched while the scan was still running.
+        other.send({"v": 1, "id": 105, "op": "hello"})
+        self.assertEqual(other.read()["id"], 105)
+        fake.respond.set()
+        response = client.read()
+        self.assertEqual(response["id"], 100)
+        self.assertEqual(response["result"]["devices"][0]["name"], "Replacement")
+        for identifier in (101, 102):
+            joined = other.read()
+            self.assertEqual(joined["id"], identifier)
+            self.assertEqual(joined["result"], response["result"])
+        for identifier in (103, 104):
+            joined = other.read()
+            self.assertEqual(joined["id"], identifier)
+            self.assertEqual(joined["error"]["code"], "unavailable")
+        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
+        self.assertTrue(fake.disconnected.wait(1))
+        self.assertEqual(fake.accepted, 2)
+
+    def test_contract_openrgb_failed_scan_cached_without_automatic_retries(self):
+        fake, _daemon, client = self.launch(behavior="magic")
+        self.wait_state(client, "unreachable")
+        self.assertTrue(fake.disconnected.wait(1))
+        fake.behavior = "normal"
+        # Even a subscribed client and subsequent reads must not cause retries.
+        self.assertEqual(client.request("devices")["result"], {"devices": []})
+        time.sleep(6.3)
+        self.assertEqual(fake.accepted, 1)
+        self.wait_state(client, "unreachable")
+        self.assertTrue(client.request("devices.rescan")["result"]["devices"])
+        self.assertEqual(fake.accepted, 2)
+
+    def test_contract_openrgb_udev_hotplug_requires_a_device_subscriber(self):
+        fake, daemon, client = self.launch(interested=False)
+        self.hotplug()
+        time.sleep(0.2)
+        self.assertEqual(fake.accepted, 0)
+        self.subscribe_devices(client)
+        self.hotplug()
+        self.wait_state(client, "blocked")
+        self.assertEqual(fake.accepted, 1)
+        self.assertTrue(fake.disconnected.wait(1))
+        # Only one of the two peers needs to subscribe to devices.
+        other = daemon.client()
+        self.addCleanup(other.close)
+        self.subscribe_devices(other)
+        client.request("unsubscribe")
+        fake.descriptors = [controller("Hotplug replacement")]
+        self.hotplug()
+        deadline = time.monotonic() + 2
+        while True:
+            event = other.event("devices")
+            devices = event["data"]["devices"]
+            if devices and devices[0]["name"] == "Hotplug replacement":
+                break
+            self.assertLess(time.monotonic(), deadline)
+        self.assertEqual(fake.accepted, 2)
+        # Hotplug scans also count towards the manual scan rate limit.
+        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
+        other.close()
+        client.request("hello")
+        time.sleep(0.1)
+        self.hotplug()
+        time.sleep(0.2)
+        self.assertEqual(fake.accepted, 2)
+
+    def test_contract_openrgb_initial_scan_shares_failures_and_keeps_loop_responsive(self):
         fake, daemon, client = self.launch(interested=False, behavior="timeout")
         client.send({"v": 1, "id": 100, "op": "devices"})
         other = daemon.client()
         self.addCleanup(other.close)
+        other.send({"v": 1, "id": 101, "op": "devices"})
+        other.send({"v": 1, "id": 102, "op": "devices.rescan"})
+        abandoned = daemon.client()
+        abandoned.send({"v": 1, "id": 200, "op": "devices"})
+        abandoned.close()
         started = time.monotonic()
         self.assertTrue(other.request("hello")["ok"])
         self.assertLess(time.monotonic() - started, 0.5)
@@ -666,6 +770,11 @@ class OpenRgbContract(unittest.TestCase):
         self.assertEqual(reply["id"], 100)
         self.assertEqual(reply["result"], {"devices": []})
         self.assertTrue(fake.disconnected.wait(1))
+        for identifier in (101, 102):
+            joined = other.read()
+            self.assertEqual(joined["id"], identifier)
+            self.assertEqual(joined["result"], {"devices": []})
+        self.assertEqual(fake.accepted, 1)
         accepted = fake.accepted
         time.sleep(2.3)
         self.assertEqual(fake.accepted, accepted)
@@ -723,9 +832,9 @@ class OpenRgbContract(unittest.TestCase):
         fake, _daemon, client = self.launch(descriptors=[first, second])
         self.wait_state(client, "blocked")
         before = client.request("devices")["result"]
-        fake.hotplug([second, first])
-        self.wait_state(client, "unreachable")
-        self.wait_state(client, "blocked", timeout=6)
+        fake.descriptors = [second, first]
+        time.sleep(2.05)
+        self.assertEqual(client.request("devices.rescan")["result"], before)
         self.assertEqual(client.request("devices")["result"], before)
 
     def test_contract_openrgb_bad_magic_lengths_counts_ids_commands_timeout_unreachable(self):
@@ -761,13 +870,22 @@ class OpenRgbContract(unittest.TestCase):
         client.close()
         daemon.close()
         fake.close()
-        absent = Daemon(Path(self.temporary.name) / "absent")
+        absent = Daemon(Path(self.temporary.name) / "absent", environment=self.environment)
         self.addCleanup(absent.close)
         client = absent.client()
         self.addCleanup(client.close)
         engine = self.wait_state(client, "absent")
         self.assertTrue(engine["reason"])
-        self.assertTrue(client.request("devices")["ok"])
+        self.assertEqual(client.request("devices")["result"], {"devices": []})
+        recovery = OpenRgbServer()
+        self.addCleanup(recovery.close)
+        self.subscribe_devices(client)
+        time.sleep(3.2)
+        self.assertEqual(recovery.accepted, 0)
+        self.assertEqual(client.request("devices")["result"], {"devices": []})
+        self.assertEqual(client.request("status")["result"]["engines"][0]["state"], "absent")
+        self.assertTrue(client.request("devices.rescan")["result"]["devices"])
+        self.assertEqual(recovery.accepted, 1)
 
 
 class ActivationAndLifetimeContract(unittest.TestCase):

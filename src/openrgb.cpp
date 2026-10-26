@@ -23,10 +23,6 @@ OpenRgbAdapter::OpenRgbAdapter(std::function<void()> changed) : changed(std::mov
     timeout.setSingleShot(true);
     timeout.setInterval(2000);
     timeout.setTimerType(Qt::PreciseTimer);
-    retry.setSingleShot(true);
-    retry.setTimerType(Qt::PreciseTimer);
-    rescan.setSingleShot(true);
-    rescan.setInterval(5000);
     connect(&socket, &QTcpSocket::connected, this, [this] {
         if (socket.peerAddress() != QHostAddress(QHostAddress::LocalHost)) {
             fail("unreachable", "OpenRGB peer is not numeric loopback");
@@ -49,8 +45,6 @@ OpenRgbAdapter::OpenRgbAdapter(std::function<void()> changed) : changed(std::mov
     connect(&timeout, &QTimer::timeout, this, [this] {
         fail("unreachable", "OpenRGB SDK response timed out");
     });
-    connect(&retry, &QTimer::timeout, this, [this] { connectServer(); });
-    connect(&rescan, &QTimer::timeout, this, [this] { refresh(); });
 }
 
 OpenRgbAdapter::~OpenRgbAdapter()
@@ -69,9 +63,10 @@ QByteArray OpenRgbAdapter::word(quint32 value)
 
 void OpenRgbAdapter::connectServer()
 {
-    if (!interested() || phase != Phase::Disconnected || retry.isActive()) {
+    if (phase != Phase::Disconnected) {
         return;
     }
+    lastScan.start();
     input.clear();
     pendingInventory.clear();
     pendingColors.clear();
@@ -82,9 +77,11 @@ void OpenRgbAdapter::connectServer()
 
 void OpenRgbAdapter::fail(const QString &newState, const QString &message)
 {
+    if (phase == Phase::Disconnected) {
+        return;
+    }
     phase = Phase::Disconnected;
     timeout.stop();
-    rescan.stop();
     socket.abort();
     input.clear();
     pendingInventory.clear();
@@ -93,24 +90,14 @@ void OpenRgbAdapter::fail(const QString &newState, const QString &message)
     colors.clear();
     state = newState;
     reason = message;
-    if (subscribed) {
-        retry.start(backoff.next());
-    }
     changed();
     settleRequests();
 }
 
 void OpenRgbAdapter::refresh()
 {
-    if (!interested() || phase != Phase::Ready) {
-        return;
-    }
-    rescan.stop();
-    // Protocol v1 indices can be reassigned after hotplug. Rebuild the entire map.
-    phase = Phase::Count;
-    pendingInventory.clear();
-    pendingColors.clear();
-    send(0, 0);
+    // Hotplug joins any scan already in progress; it never schedules a later retry.
+    connectServer();
 }
 
 void OpenRgbAdapter::send(quint32 device, quint32 command, const QByteArray &payload)
@@ -127,6 +114,9 @@ void OpenRgbAdapter::send(quint32 device, quint32 command, const QByteArray &pay
 
 void OpenRgbAdapter::receive()
 {
+    if (phase == Phase::Disconnected) {
+        return;
+    }
     const qsizetype room = MaxPacket + 16 - input.size();
     if (room <= 0) {
         fail("unreachable", "OpenRGB SDK receive buffer exceeded its limit");
@@ -156,6 +146,9 @@ void OpenRgbAdapter::receive()
             fail("unreachable", "OpenRGB SDK packet or descriptor is invalid");
             return;
         }
+        if (phase == Phase::Disconnected) {
+            return;
+        }
     }
     if (socket.bytesAvailable() > 0 || input.size() >= 16) {
         QTimer::singleShot(0, this, [this] { receive(); });
@@ -165,8 +158,8 @@ void OpenRgbAdapter::receive()
 bool OpenRgbAdapter::packet(quint32 device, quint32 command, const QByteArray &payload)
 {
     if (command == 100 && device == 0 && payload.isEmpty()) {
-        // Drop in-flight index replies and reconnect; no stale index can survive a rescan.
-        fail("unreachable", "OpenRGB device list changed; rebuilding identities");
+        // Indices changed mid-scan. Leave failure cached until the next explicit scan.
+        fail("unreachable", "OpenRGB device list changed during scan");
         return true;
     }
     if (phase == Phase::Version && command == 40 && device == 0 && payload.size() == 4) {
@@ -216,74 +209,45 @@ void OpenRgbAdapter::publish()
 {
     inventory = pendingInventory;
     colors = pendingColors;
-    phase = Phase::Ready;
-    timeout.stop();
-    backoff.reset();
-    if (subscribed) {
-        rescan.start();
-    }
-    state = inventory.isEmpty() ? "ready" : "blocked";
-    reason = inventory.isEmpty() ? "OpenRGB SDK connected; no devices" : WriteGate;
-    changed();
-    settleRequests();
-}
-
-bool OpenRgbAdapter::interested() const
-{
-    return subscribed || !pending.empty() || completing;
-}
-
-void OpenRgbAdapter::setInterested(bool interested)
-{
-    if (subscribed == interested) {
-        return;
-    }
-    subscribed = interested;
-    if (subscribed) {
-        connectServer();
-        if (phase == Phase::Ready) {
-            rescan.start();
-        }
-    } else {
-        release();
-    }
-}
-
-void OpenRgbAdapter::request(std::function<void()> ready)
-{
-    pending.push_back(std::move(ready));
-    if (phase == Phase::Ready || retry.isActive()) {
-        settleRequests();
-    } else {
-        connectServer();
-    }
-}
-
-void OpenRgbAdapter::settleRequests()
-{
-    completing = true;
-    auto callbacks = std::exchange(pending, {});
-    for (const auto &callback : callbacks) {
-        callback();
-    }
-    completing = false;
-    release();
-}
-
-void OpenRgbAdapter::release()
-{
-    if (interested()) {
-        return;
-    }
-    retry.stop();
-    rescan.stop();
-    timeout.stop();
     phase = Phase::Disconnected;
+    timeout.stop();
     socket.abort();
     input.clear();
     pendingInventory.clear();
     pendingColors.clear();
-    backoff.reset();
+    state = inventory.isEmpty() ? "ready" : "blocked";
+    reason = inventory.isEmpty() ? "OpenRGB scan completed; no devices" : WriteGate;
+    changed();
+    settleRequests();
+}
+
+void OpenRgbAdapter::request(std::function<void()> ready)
+{
+    if (phase == Phase::Disconnected && lastScan.isValid()) {
+        ready();
+        return;
+    }
+    pending.push_back(std::move(ready));
+    connectServer();
+}
+
+bool OpenRgbAdapter::rescan(std::function<void()> ready)
+{
+    // Concurrent callers share the running scan, including its eventual failure.
+    if (phase == Phase::Disconnected && lastScan.isValid() && lastScan.elapsed() < 2000) {
+        return false;
+    }
+    pending.push_back(std::move(ready));
+    connectServer();
+    return true;
+}
+
+void OpenRgbAdapter::settleRequests()
+{
+    auto callbacks = std::exchange(pending, {});
+    for (const auto &callback : callbacks) {
+        callback();
+    }
 }
 
 QJsonObject OpenRgbAdapter::engine() const
