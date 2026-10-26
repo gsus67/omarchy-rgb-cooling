@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "hwmon.hpp"
+#include "sensor_names.hpp"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QRegularExpression>
 #include <QSet>
+#include <algorithm>
 #include <cmath>
 #include <utility>
 
@@ -51,13 +53,53 @@ void Hwmon::sample(int intervalMilliseconds)
     const auto entries = directory.entryList({"hwmon*"}, QDir::Dirs | QDir::NoDotAndDotDot,
                                             QDir::Name);
     static const QRegularExpression channelPattern("^(temp|fan)[0-9]+_(input|label)$");
+    struct Node {
+        QString path;
+        QString name;
+        QString parent;
+        QString driver;
+    };
+    QVector<Node> nodes;
     for (const auto &entry : entries) {
         const QString path = directory.filePath(entry);
         const QString name = readText(path + "/name");
-        const QString device = devicePath(path);
-        if (name.isEmpty() || device.isEmpty()) {
+        const QString parent = devicePath(path);
+        if (name.isEmpty() || parent.isEmpty()) {
             continue;
         }
+        QString driver = QFileInfo(path + "/device/driver").symLinkTarget();
+        if (!driver.isEmpty()) {
+            driver = QFileInfo(driver).fileName();
+        }
+        nodes.push_back({path, name, parent, driver});
+    }
+    auto pciAddress = [](const QString &path) {
+        static const QRegularExpression pci("[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:"
+                                           "[0-9a-fA-F]{2}\\.[0-7]");
+        auto matches = pci.globalMatch(path);
+        QString address;
+        while (matches.hasNext()) {
+            address = matches.next().captured().toLower();
+        }
+        return address;
+    };
+    QVector<QString> nvmeAddresses;
+    for (const auto &node : nodes) {
+        if (node.name.startsWith("nvme") || node.driver == "nvme") {
+            nvmeAddresses.push_back(pciAddress(node.parent) + ":" + node.parent);
+        }
+    }
+    std::sort(nvmeAddresses.begin(), nvmeAddresses.end());
+    nvmeAddresses.erase(std::unique(nvmeAddresses.begin(), nvmeAddresses.end()),
+                        nvmeAddresses.end());
+    QString cpuVendor;
+    const QString cpuInfo = readText("/proc/cpuinfo");
+    static const QRegularExpression vendorPattern("^vendor_id\\s*:\\s*(\\S+)",
+                                                  QRegularExpression::MultilineOption);
+    cpuVendor = vendorPattern.match(cpuInfo).captured(1);
+    for (const auto &node : nodes) {
+        const QString &path = node.path;
+        const QString &name = node.name;
         const auto inputs = QDir(path).entryList(QDir::Files, QDir::Name);
         for (const auto &input : inputs) {
             const auto match = channelPattern.match(input);
@@ -65,18 +107,22 @@ void Hwmon::sample(int intervalMilliseconds)
                 continue;
             }
             const QString channel = input.left(input.lastIndexOf('_'));
-            const QString id = name + ":" + device + ":" + channel;
+            const QString id = name + ":" + node.parent + ":" + channel;
             if (!sensors.contains(id) && sensors.size() >= 4096) {
                 continue;
             }
             Sensor &sensor = sensors[id];
             sensor.id = id;
-            sensor.device = name + ":" + device;
-            sensor.kind = match.captured(1);
-            sensor.label = readText(path + "/" + channel + "_label");
-            if (sensor.label.isEmpty()) {
-                sensor.label = name + " " + channel;
+            int nvmeNumber = 0;
+            if (name.startsWith("nvme") || node.driver == "nvme") {
+                const QString key = pciAddress(node.parent) + ":" + node.parent;
+                nvmeNumber = nvmeAddresses.indexOf(key) + 1;
             }
+            sensor.device = SensorNames::device(name, node.parent, node.driver, cpuVendor,
+                                                nvmeNumber);
+            sensor.kind = match.captured(1);
+            sensor.label = SensorNames::label(name, channel,
+                                              readText(path + "/" + channel + "_label"));
             sensor.cpuPackage = name == "coretemp"
                 && sensor.label.contains("package", Qt::CaseInsensitive);
             sensor.path = path + "/" + channel + "_input";

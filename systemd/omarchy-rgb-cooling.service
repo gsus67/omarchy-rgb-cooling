@@ -24,8 +24,7 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-IPAddressDeny=any
-IPAddressAllow=localhost
+# The adapter code restricts network access to loopback.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug @cpu-emulation @obsolete
 SystemCallErrorNumber=EPERM

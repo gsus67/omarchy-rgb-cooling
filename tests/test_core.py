@@ -483,6 +483,43 @@ class HwmonContract(unittest.TestCase):
         self.assertTrue(any(mask & 1 for mask in watch.drain()))
         self.assertEqual(before, self.daemon.tree.snapshot())
 
+    def test_contract_sensor_human_names_with_fake_hwmon_tree(self):
+        devices = (
+            ("hwmon21", "nvme", "pci0000:00/0000:00:1c.0/0000:05:00.0",
+             {"temp1_input": "42000"}),
+            ("hwmon22", "nvme", "pci0000:00/0000:00:1c.1/0000:02:00.0",
+             {"temp1_input": "43000"}),
+            ("hwmon23", "spd5118", "platform/i2c-0/0-0050", {"temp1_input": "44000"}),
+            ("hwmon24", "spd5118", "platform/i2c-0/0-0051", {"temp1_input": "45000"}),
+            ("hwmon25", "iwlwifi_1", "pci0000:00/0000:06:00.0", {"temp1_input": "46000"}),
+            ("hwmon26", "r8169-0000:04:00.0", "pci0000:00/0000:04:00.0",
+             {"temp1_input": "47000"}),
+            ("hwmon27", "acpitz", "virtual/thermal/thermal_zone0", {"temp1_input": "48000"}),
+        )
+        for number, name, parent, files in devices:
+            self.daemon.tree.add(number, name, parent, files)
+        data = self.client.request("sensors")["result"]
+        sensors = {sensor["id"]: sensor for sensor in data["sensors"]}
+        expected = {
+            "amdgpu:pci0000:00/0000:03:00.0:temp1": ("AMD GPU", "edge"),
+            "nvme:pci0000:00/0000:00:1c.0/0000:05:00.0:temp1":
+                ("NVMe 2", "Temperature"),
+            "nvme:pci0000:00/0000:00:1c.1/0000:02:00.0:temp1":
+                ("NVMe 1", "Temperature"),
+            "spd5118:platform/i2c-0/0-0050:temp1": ("RAM", "Temperature"),
+            "spd5118:platform/i2c-0/0-0051:temp1": ("RAM", "Temperature"),
+            "iwlwifi_1:pci0000:00/0000:06:00.0:temp1": ("Wi-Fi", "Temperature"),
+            "r8169-0000:04:00.0:pci0000:00/0000:04:00.0:temp1":
+                ("Ethernet", "Temperature"),
+            "acpitz:virtual/thermal/thermal_zone0:temp1": ("ACPI", "Temperature"),
+        }
+        for sensor_id, (device, label) in expected.items():
+            with self.subTest(sensor_id=sensor_id):
+                self.assertEqual(sensors[sensor_id]["device"], device)
+                self.assertEqual(sensors[sensor_id]["label"], label)
+        self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["device"], "Intel CPU")
+        self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["label"], "Package id 0")
+
     def test_contract_hwmon_blocked_read_does_not_block_other_connections(self):
         path = self.daemon.tree.cpu / "temp1_input"
         path.unlink()

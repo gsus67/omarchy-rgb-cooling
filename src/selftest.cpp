@@ -6,6 +6,7 @@
 #include "protocol.hpp"
 #include "sdk_reader.hpp"
 #include "server.hpp"
+#include "sensor_names.hpp"
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -206,6 +207,32 @@ void testHwmon(Checks &checks)
                   "hwmon leaves PWM bytes unchanged");
 }
 
+void testSensorNames(Checks &checks)
+{
+    checks.verify(SensorNames::device("coretemp", "platform/coretemp.0", "", "")
+                  == "Intel CPU", "coretemp names the Intel CPU");
+    checks.verify(SensorNames::device("k10temp", "platform/k10temp.0", "", "")
+                  == "AMD CPU"
+                  && SensorNames::device("cpu_thermal", "", "", "AuthenticAMD") == "AMD CPU",
+                  "AMD CPU name uses hwmon driver or cpuinfo vendor");
+    checks.verify(SensorNames::device("amdgpu", "", "amdgpu", "") == "AMD GPU"
+                  && SensorNames::device("gpu", "", "nouveau", "") == "NVIDIA GPU"
+                  && SensorNames::device("xe", "", "xe", "") == "Intel GPU",
+                  "GPU names follow their kernel driver");
+    checks.verify(SensorNames::device("nvme", "", "", "", 2) == "NVMe 2"
+                  && SensorNames::device("spd5118", "", "", "") == "RAM"
+                  && SensorNames::device("iwlwifi_1", "", "", "") == "Wi-Fi"
+                  && SensorNames::device("r8169", "", "", "") == "Ethernet"
+                  && SensorNames::device("acpitz", "", "", "") == "ACPI",
+                  "storage, memory, network and ACPI names follow the contract");
+    checks.verify(SensorNames::label("", "temp1", "") == "Temperature"
+                  && SensorNames::label("", "temp2", "") == "Temperature 2"
+                  && SensorNames::label("", "fan1", "") == "Fan"
+                  && SensorNames::label("", "fan2", "") == "Fan 2"
+                  && SensorNames::label("", "temp1", "Package id 0") == "Package id 0",
+                  "sensor labels use hwmon labels or human channel names");
+}
+
 void testDemo(Checks &checks)
 {
     DemoAdapter demo;
@@ -222,6 +249,7 @@ int runSelfTests()
     Checks checks;
     testProtocol(checks);
     testSdk(checks);
+    testSensorNames(checks);
     testHwmon(checks);
     testDemo(checks);
     checks.verify(!Server::peerAllowed(-1, ::getuid()), "SO_PEERCRED rejects invalid descriptors");
