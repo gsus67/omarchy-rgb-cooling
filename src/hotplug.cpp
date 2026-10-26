@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "hotplug.hpp"
+#include <libudev.h>
+
+Hotplug::Hotplug(std::function<void()> reconcile)
+{
+    context = udev_new();
+    if (context == nullptr) {
+        return;
+    }
+    // The processed udev channel includes resolved parents; kernel events do not.
+    monitor = udev_monitor_new_from_netlink(context, "udev");
+    if (monitor == nullptr
+        || udev_monitor_filter_add_match_subsystem_devtype(monitor, "hwmon", nullptr) < 0
+        || udev_monitor_filter_add_match_subsystem_devtype(monitor, "usb", nullptr) < 0
+        || udev_monitor_enable_receiving(monitor) < 0) {
+        return;
+    }
+    notifier = std::make_unique<QSocketNotifier>(udev_monitor_get_fd(monitor),
+                                                 QSocketNotifier::Read);
+    connect(notifier.get(), &QSocketNotifier::activated, this,
+            [this, reconcile] { drain(reconcile); });
+}
+
+Hotplug::~Hotplug()
+{
+    notifier.reset();
+    if (monitor != nullptr) {
+        udev_monitor_unref(monitor);
+    }
+    if (context != nullptr) {
+        udev_unref(context);
+    }
+}
+
+bool Hotplug::active() const
+{
+    return notifier != nullptr;
+}
+
+void Hotplug::drain(const std::function<void()> &reconcile)
+{
+    // Reconcile the complete inventory instead of treating event payloads as paths.
+    bool received = false;
+    for (int count = 0; count < 256; ++count) {
+        udev_device *device = udev_monitor_receive_device(monitor);
+        if (device == nullptr) {
+            break;
+        }
+        received = true;
+        udev_device_unref(device);
+    }
+    if (received) {
+        reconcile();
+    }
+}
