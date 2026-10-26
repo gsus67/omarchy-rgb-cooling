@@ -88,6 +88,12 @@ Device   {id: string, name: string, vendor: string, engine: string,
 Lighting {device: string, color: "#rrggbb", brightness: 0-100, brightness_emulated: bool}
 ```
 
+- `device` is a short human name for the physical device, never a sysfs path:
+  `CPU` (with the vendor when known, e.g. `Intel CPU`), `AMD GPU` / `NVIDIA GPU` /
+  `Intel GPU`, `NVMe 1`, `NVMe 2`… (numbered by PCI address order), `RAM`, `Wi-Fi`,
+  `Ethernet`, `ACPI`; anything else uses the hwmon `name`. `label` is the hwmon
+  `*_label` when present (e.g. `Package id 0`, `edge`), otherwise `Temperature`,
+  `Temperature 2`… or `Fan`, `Fan 2`… Both are plain text.
 - Sensor ids are stable: `<hwmon name>:<canonical parent device path>:<channel>`
   (for example `coretemp:platform/coretemp.0:temp1`), never `hwmonN`.
 - `value` is `null` when the reading is missing, non-finite or failed; `stale`
