@@ -1,0 +1,11 @@
+[Unit]
+Description=Omarchy RGB and Cooling local API socket
+
+[Socket]
+ListenStream=%t/omarchy-rgb-cooling.sock
+SocketMode=0600
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
