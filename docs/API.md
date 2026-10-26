@@ -99,6 +99,9 @@ Demo data never touches real hardware or engines.
 - `$XDG_CONFIG_HOME/systemd/user/omarchy-rgb-cooling.socket`
 - `$XDG_CONFIG_HOME/systemd/user/omarchy-rgb-cooling.service`
 - the enablement symlink `systemctl --user enable` creates for the socket
+- each of these directories that did not exist before, recorded with a
+  trailing `/` (for example `$XDG_CONFIG_HOME/systemd/user/sockets.target.wants/`),
+  so uninstall removes it again only if it is empty
 
 It runs `systemctl --user daemon-reload` and `enable --now omarchy-rgb-cooling.socket`
 (never the service). It prints one JSON line: `{"ok": true}` or
