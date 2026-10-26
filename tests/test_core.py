@@ -1,5 +1,6 @@
 """API.md contract regressions; stdlib-only and isolated from the user's hardware."""
 # SPDX-License-Identifier: GPL-3.0-or-later
+import errno
 import json
 import os
 from pathlib import Path
@@ -85,14 +86,17 @@ class Client:
                 raise AssertionError(response)
             return response
 
-    def event(self, topic):
+    def event(self, topic, timeout=4):
         for index, event in enumerate(self.events):
             if event["event"] == topic:
                 return self.events.pop(index)
+        deadline = time.monotonic() + timeout
         while True:
-            event = self.read()
+            event = self.read(max(0.001, deadline - time.monotonic()))
             if event.get("event") == topic:
                 return event
+            if "event" in event:
+                self.events.append(event)
 
     def close(self):
         self.socket.close()
@@ -192,11 +196,16 @@ class CoreContract(unittest.TestCase):
             self.assert_error(self.client.request(operation), "unknown_op")
 
     def test_contract_positive_integer_ids_echo_without_an_arbitrary_32bit_limit(self):
-        for identifier in (1, 2**32, 2**53 + 1, 2**63 - 1, 2**64):
-            self.client.send({"v": 1, "id": identifier, "op": "hello"})
-            response = self.client.read()
-            self.assertTrue(response["ok"])
-            self.assertEqual(response["id"], identifier)
+        for identifier in (1, 2**32, 2**53 - 1, 2**53, 0, -1, 1.5, "1"):
+            with self.subTest(identifier=identifier):
+                self.client.send({"v": 1, "id": identifier, "op": "hello"})
+                response = self.client.read()
+                if isinstance(identifier, int) and 1 <= identifier <= 2**53 - 1:
+                    self.assertTrue(response["ok"])
+                    self.assertEqual(response["id"], identifier)
+                else:
+                    self.assert_error(response, "bad_request")
+                    self.assertIsNone(response["id"])
 
     def test_contract_bad_request_wrong_envelope_types_and_utf8(self):
         valid = {"v": 1, "id": 7, "op": "hello", "params": {}}
@@ -235,6 +244,62 @@ class CoreContract(unittest.TestCase):
                        {"topics": ["unknown"]}, {"topics": [], "interval_ms": True},
                        {"topics": [], "interval_ms": 1.5}):
             self.assert_error(self.client.request("subscribe", params), "bad_request")
+
+    def test_contract_each_operation_parameter_schema_rejects_wrong_types(self):
+        valid = {"device": "demo:rgb0", "color": "#112233", "brightness": 50}
+        cases = []
+        for value in (None, True, 3, [], {}):
+            cases.append(("lighting.get", {"device": value}))
+            cases.append(("lighting.set", {**valid, "device": value}))
+        for value in (None, True, 3, [], {}, "red", "#12345g", "#123456\n"):
+            cases.append(("lighting.set", {**valid, "color": value}))
+        for value in (None, True, "50", [], {}, -1, 101, 1.5):
+            cases.append(("lighting.set", {**valid, "brightness": value}))
+        for value in (None, True, "sensors", 3, {}, [1], [None], ["sensors", False]):
+            cases.append(("subscribe", {"topics": value}))
+        for value in (None, True, "500", [], {}, 1.5):
+            cases.append(("subscribe", {"topics": ["sensors"], "interval_ms": value}))
+        for operation in ("lighting.set", "lighting.get", "subscribe"):
+            cases.append((operation, {}))
+        for operation, params in cases:
+            with self.subTest(operation=operation, params=params):
+                reply = self.client.request(operation, params)
+                self.assert_error(reply, "bad_request")
+                self.assertEqual(reply["id"], self.client.sequence)
+        # No-parameter operations still require params to be an object.
+        for operation in ("hello", "status", "sensors", "devices", "unsubscribe"):
+            self.client.send({"v": 1, "id": 800, "op": operation, "params": []})
+            self.assert_error(self.client.read(), "bad_request")
+        self.assertEqual(self.client.request("lighting.set", {
+            **valid, "color": "#ABCDEF", "unknown": [],
+        })["result"]["color"], "#abcdef")
+
+    def test_contract_subscription_timer_sleeps_until_earliest_connection_deadline(self):
+        self.client.request("subscribe", {"topics": ["sensors"], "interval_ms": 10000})
+        self.client.event("sensors")
+        status = Path(f"/proc/{self.daemon.process.pid}/status")
+
+        def wakeups():
+            return int(next(line.split()[1] for line in status.read_text().splitlines()
+                            if line.startswith("voluntary_ctxt_switches:")))
+
+        before = wakeups()
+        time.sleep(1.2)
+        # A 50 ms polling timer wakes about 24 times here; a deadline timer sleeps.
+        self.assertLess(wakeups() - before, 10)
+        peer = self.daemon.client()
+        self.addCleanup(peer.close)
+        peer.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
+        peer.event("sensors")
+        started = time.monotonic()
+        peer.event("sensors")
+        self.assertGreaterEqual(time.monotonic() - started, 0.35)
+        self.assertLess(time.monotonic() - started, 1.5)
+        peer.request("unsubscribe")
+        self.client.request("unsubscribe")
+        before = wakeups()
+        time.sleep(0.7)
+        self.assertLess(wakeups() - before, 5)
 
     def test_contract_framing_fragmentation_pipelining_and_64kib_boundary(self):
         line = json.dumps({"v": 1, "id": 101, "op": "hello"}).encode()
@@ -347,7 +412,7 @@ class CoreContract(unittest.TestCase):
         self.client.request("subscribe", {"topics": ["sensors"], "interval_ms": 999999999})
         self.client.event("sensors")
         started = time.monotonic()
-        self.client.event("sensors")
+        self.client.event("sensors", timeout=12)
         elapsed = time.monotonic() - started
         self.assertGreaterEqual(elapsed, 9.5)
         self.assertLess(elapsed, 12)
@@ -370,15 +435,21 @@ class HwmonContract(unittest.TestCase):
         })["ok"])
         return self.client.event("sensors")["data"]
 
-    def test_contract_hwmon_read_only_only_with_sensor_subscribers_primary_cpu_and_units(self):
+    def test_contract_hwmon_on_demand_cache_read_only_primary_cpu_and_units(self):
         watch = FileWatch(self.daemon.tree.cpu / "temp1_input")
         self.addCleanup(watch.close)
         before = self.daemon.tree.snapshot()
         watch.drain()
-        self.assertEqual(self.client.request("sensors")["result"], {"sensors": [], "primary": ""})
         self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 500})
         self.client.event("devices")
         self.assertEqual(watch.drain(), [])
+        self.client.request("unsubscribe")
+        data = self.client.request("sensors")["result"]
+        self.assertTrue(any(mask & 1 for mask in watch.drain()))
+        cached = self.client.request("sensors")["result"]
+        self.assertEqual(cached, data)
+        self.assertEqual(watch.drain(), [])
+        time.sleep(0.55)
         data = self.subscribe()
         self.assertEqual(data["primary"], "coretemp:platform/coretemp.0:temp1")
         sensors = {sensor["id"]: sensor for sensor in data["sensors"]}
@@ -396,9 +467,44 @@ class HwmonContract(unittest.TestCase):
         self.client.request("unsubscribe")
         watch.drain()
         time.sleep(0.7)
-        self.client.request("sensors")
         self.assertEqual(watch.drain(), [])
+        self.client.request("sensors")
+        self.assertTrue(any(mask & 1 for mask in watch.drain()))
         self.assertEqual(before, self.daemon.tree.snapshot())
+
+    def test_contract_hwmon_blocked_read_does_not_block_other_connections(self):
+        path = self.daemon.tree.cpu / "temp1_input"
+        path.unlink()
+        os.mkfifo(path)
+        self.client.send({"v": 1, "id": 100, "op": "sensors"})
+        # Opening the write end proves the worker has reached the blocking read.
+        deadline = time.monotonic() + 3
+        writer = None
+        while writer is None:
+            try:
+                writer = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+        try:
+            peer = self.daemon.client()
+            self.addCleanup(peer.close)
+            started = time.monotonic()
+            self.assertTrue(peer.request("hello")["ok"])
+            self.assertLess(time.monotonic() - started, 0.5)
+            # Coalesce a second sensor request while the first read is still pending.
+            peer.send({"v": 1, "id": 200, "op": "sensors"})
+            os.write(writer, b"42500\n")
+        finally:
+            os.close(writer)
+        first = self.client.read()
+        second = peer.read()
+        self.assertEqual(first["id"], 100)
+        self.assertEqual(second["id"], 200)
+        self.assertEqual(first["result"], second["result"])
+        self.assertTrue(first["result"]["sensors"])
 
     def test_contract_hwmon_stable_ids_never_hwmon_number_and_rescan_hotplug(self):
         initial = self.subscribe()
@@ -454,7 +560,7 @@ class OpenRgbContract(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.counter = 0
 
-    def launch(self, **options):
+    def launch(self, *, interested=True, **options):
         fake = OpenRgbServer(**options)
         self.addCleanup(fake.close)
         self.counter += 1
@@ -462,6 +568,10 @@ class OpenRgbContract(unittest.TestCase):
         self.addCleanup(daemon.close)
         client = daemon.client()
         self.addCleanup(client.close)
+        if interested:
+            self.assertTrue(client.request("subscribe", {
+                "topics": ["devices"], "interval_ms": 10000,
+            })["ok"])
         return fake, daemon, client
 
     def wait_state(self, client, expected, timeout=5):
@@ -472,6 +582,93 @@ class OpenRgbContract(unittest.TestCase):
                 return engine
             time.sleep(0.03)
         self.fail(f"Expected {expected}, got {engine}")
+
+    def test_contract_openrgb_interest_gates_connection_rescan_and_disconnect(self):
+        fake, daemon, client = self.launch(interested=False)
+        client.request("hello")
+        client.request("status")
+        client.request("sensors")
+        client.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
+        client.event("sensors")
+        time.sleep(2.2)
+        self.assertEqual(fake.accepted, 0)
+        self.assertEqual(fake.commands, [])
+        client.request("unsubscribe")
+        device = client.request("devices")["result"]["devices"][0]
+        self.assertTrue(fake.disconnected.wait(1))
+        accepted = fake.accepted
+        response = client.request("lighting.get", {"device": device["id"]})
+        self.assertTrue(response["ok"])
+        self.assertTrue(fake.disconnected.wait(1))
+        self.assertEqual(fake.accepted, accepted + 1)
+        response = client.request("lighting.set", {
+            "device": device["id"], "color": "#ABCDEF", "brightness": 50,
+        })
+        self.assertEqual(response["error"]["code"], "blocked")
+        self.assertTrue(fake.disconnected.wait(1))
+        self.assertTrue(self.subscribe_devices(client)["ok"])
+        second = daemon.client()
+        self.addCleanup(second.close)
+        self.subscribe_devices(second)
+        self.wait_state(client, "blocked")
+        client.request("unsubscribe")
+        self.assertFalse(fake.disconnected.wait(0.2))
+        # Only interested subscribers permit the five-second reconciliation scan.
+        counts = sum(command == 0 for _device, command, _payload in fake.commands)
+        deadline = time.monotonic() + 6
+        while sum(command == 0 for _device, command, _payload in fake.commands) == counts:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        second.close()
+        self.assertTrue(fake.disconnected.wait(1))
+        commands = list(fake.commands)
+        accepted = fake.accepted
+        fake.hotplug([controller("Other")])
+        time.sleep(5.3)
+        self.assertEqual(fake.commands, commands)
+        self.assertEqual(fake.accepted, accepted)
+
+    def subscribe_devices(self, client):
+        return client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
+
+    def test_contract_openrgb_retry_backoff_and_cancellation_without_interests(self):
+        fake, _daemon, client = self.launch(behavior="magic")
+        deadline = time.monotonic() + 9
+        while len(fake.command_times) < 3:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        times = [stamp for command, stamp in fake.command_times if command == 40]
+        self.assertGreaterEqual(times[1] - times[0], 1.8)
+        self.assertLess(times[1] - times[0], 3)
+        self.assertGreaterEqual(times[2] - times[1], 3.8)
+        self.assertLess(times[2] - times[1], 5)
+        client.request("unsubscribe")
+        count = fake.accepted
+        time.sleep(8.3)
+        self.assertEqual(fake.accepted, count)
+        # A fresh interest after cancellation starts immediately with a reset backoff.
+        self.subscribe_devices(client)
+        self.wait_state(client, "unreachable")
+        deadline = time.monotonic() + 3
+        while fake.accepted == count:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+
+    def test_contract_openrgb_pending_request_keeps_loop_responsive_and_releases_interest(self):
+        fake, daemon, client = self.launch(interested=False, behavior="timeout")
+        client.send({"v": 1, "id": 100, "op": "devices"})
+        other = daemon.client()
+        self.addCleanup(other.close)
+        started = time.monotonic()
+        self.assertTrue(other.request("hello")["ok"])
+        self.assertLess(time.monotonic() - started, 0.5)
+        reply = client.read()
+        self.assertEqual(reply["id"], 100)
+        self.assertEqual(reply["result"], {"devices": []})
+        self.assertTrue(fake.disconnected.wait(1))
+        accepted = fake.accepted
+        time.sleep(2.3)
+        self.assertEqual(fake.accepted, accepted)
 
     def test_contract_openrgb_negotiates_version_fragments_and_blocks_all_real_writes(self):
         fake, daemon, client = self.launch(fragment=True)
@@ -641,11 +838,14 @@ class ActivationAndLifetimeContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_contract_so_peercred_other_uid_closed_before_any_json_is_read(self):
-        daemon = Daemon(self.directory / "alien-uid", demo=True, alien_uid=True)
-        self.addCleanup(daemon.close)
-        client = daemon.client()
+        listener = self.listener("alien.sock")
+        # Queue bytes before starting rgbcd: send cannot race the credential rejection.
+        client = Client(listener.getsockname())
         self.addCleanup(client.close)
         client.socket.sendall(b'not JSON and must not receive a bad_request reply\n')
+        daemon = Daemon(self.directory / "alien-uid", demo=True, alien_uid=True,
+                        activation=listener)
+        self.addCleanup(daemon.close)
         try:
             data = client.socket.recv(4096)
         except ConnectionResetError:
@@ -656,6 +856,8 @@ class ActivationAndLifetimeContract(unittest.TestCase):
     def test_contract_idle_30s_exit_60s_subscription_survival_and_socket_reactivation(self):
         listener = self.listener("lifetime.sock")
         inode = Path(listener.getsockname()).stat().st_ino
+        private = Daemon(self.directory / "private", demo=True)
+        self.addCleanup(private.close)
         empty = Daemon(self.directory / "empty", demo=True, activation=listener)
         self.addCleanup(empty.close)
         idle = Daemon(self.directory / "idle", demo=True)
@@ -684,6 +886,8 @@ class ActivationAndLifetimeContract(unittest.TestCase):
             time.sleep(0.1)
         self.assertTrue(idle_closed)
         self.assertEqual(empty.process.poll(), 0)
+        self.assertEqual(private.process.wait(timeout=3), 0)
+        self.assertFalse(private.path.exists())
         elapsed = time.monotonic() - started
         self.assertGreaterEqual(elapsed, 59)
         self.assertLess(elapsed, 63)

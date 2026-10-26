@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
+#include <QMap>
 #include <QRegularExpression>
 #include <QStringDecoder>
 #include <cmath>
@@ -27,8 +28,71 @@ bool integer(const QJsonValue &value)
     return std::isfinite(number) && std::trunc(number) == number;
 }
 
+namespace {
+enum class Type { Device, Color, Brightness, Topics, Interval };
+struct Field {
+    const char *name;
+    Type type;
+    bool required = true;
+};
+
+bool matches(const QJsonValue &value, Type type)
+{
+    switch (type) {
+    case Type::Device:
+        return value.isString() && !value.toString().isEmpty();
+    case Type::Color: {
+        static const QRegularExpression pattern("\\A#[0-9a-fA-F]{6}\\z");
+        return value.isString() && pattern.match(value.toString()).hasMatch();
+    }
+    case Type::Brightness:
+        return integer(value) && value.toDouble() >= 0 && value.toDouble() <= 100;
+    case Type::Topics:
+        if (!value.isArray()) {
+            return false;
+        }
+        for (const auto &topic : value.toArray()) {
+            if (!topic.isString() || (topic != "sensors" && topic != "devices")) {
+                return false;
+            }
+        }
+        return true;
+    case Type::Interval:
+        return integer(value);
+    }
+    return false;
+}
+
+Reply validate(const QString &operation, const QJsonObject &params)
+{
+    // Closed operation set with an explicit parameter schema for every operation.
+    static const QMap<QString, QList<Field>> schemas{
+        {"hello", {}}, {"status", {}}, {"sensors", {}}, {"devices", {}},
+        {"unsubscribe", {}},
+        {"subscribe", {{"topics", Type::Topics}, {"interval_ms", Type::Interval, false}}},
+        {"lighting.get", {{"device", Type::Device}}},
+        {"lighting.set", {{"device", Type::Device}, {"color", Type::Color},
+                          {"brightness", Type::Brightness}}}
+    };
+    const auto schema = schemas.constFind(operation);
+    if (schema == schemas.cend()) {
+        return Reply::failure("unknown_op", "Operation is not supported by API v1");
+    }
+    for (const auto &field : *schema) {
+        if (!field.required && !params.contains(field.name)) {
+            continue;
+        }
+        if (!matches(params.value(field.name), field.type)) {
+            return Reply::failure("bad_request", QString("Invalid parameter: %1").arg(field.name));
+        }
+    }
+    return {};
+}
+} // namespace
+
 Reply parse(const QByteArray &line, Request &request)
 {
+    request = {};
     auto invalid = [](const QString &message) {
         return Reply::failure("bad_request", message);
     };
@@ -45,49 +109,23 @@ Reply parse(const QByteArray &line, Request &request)
     }
     const auto object = document.object();
     const auto id = object.value("id");
-    if (integer(id) && id.toDouble() > 0) {
+    if (integer(id) && id.toDouble() >= 1 && id.toDouble() <= 9007199254740991.0) {
         request.id = id;
     }
     if (!integer(object.value("v")) || object.value("v").toDouble() != 1
         || request.id.isNull() || !object.value("op").isString()) {
-        return invalid("Expected API v=1, a positive integer id and a string op");
+        return invalid("Expected API v=1, an integer id in 1..2^53-1 and a string op");
     }
     if (object.contains("params") && !object.value("params").isObject()) {
         return invalid("params must be an object");
     }
     request.operation = object.value("op").toString();
     request.params = object.value("params").toObject();
-    const auto &params = request.params;
-    if (request.operation == "subscribe") {
-        if (!params.value("topics").isArray()) {
-            return invalid("topics must be an array");
-        }
-        for (const auto &topic : params.value("topics").toArray()) {
-            if (!topic.isString()
-                || (topic.toString() != "sensors" && topic.toString() != "devices")) {
-                return invalid("Supported topics are sensors and devices");
-            }
-        }
-        if (params.contains("interval_ms") && !integer(params.value("interval_ms"))) {
-            return invalid("interval_ms must be an integer");
-        }
+    const auto validation = validate(request.operation, request.params);
+    if (validation.ok() && request.operation == "lighting.set") {
+        request.params.insert("color", request.params.value("color").toString().toLower());
     }
-    if (request.operation == "lighting.get" || request.operation == "lighting.set") {
-        if (!params.value("device").isString() || params.value("device").toString().isEmpty()) {
-            return invalid("device must be a nonempty string");
-        }
-    }
-    if (request.operation == "lighting.set") {
-        static const QRegularExpression color("\\A#[0-9a-fA-F]{6}\\z");
-        if (!params.value("color").isString()
-            || !color.match(params.value("color").toString()).hasMatch()
-            || !integer(params.value("brightness"))
-            || params.value("brightness").toDouble() < 0
-            || params.value("brightness").toDouble() > 100) {
-            return invalid("Expected #rrggbb color and integer brightness from 0 to 100");
-        }
-    }
-    return {};
+    return validation;
 }
 
 QJsonObject response(const QJsonValue &id, const Reply &reply)

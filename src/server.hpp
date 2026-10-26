@@ -4,22 +4,14 @@
 #include "connection.hpp"
 #include "demo.hpp"
 #include "hotplug.hpp"
-#include "hwmon.hpp"
+#include "listener.hpp"
+#include "sensor_source.hpp"
 #include <QElapsedTimer>
-#include <QLocalServer>
 #include <QSet>
 #include <QTimer>
 #include <functional>
 #include <memory>
 #include <sys/types.h>
-
-class PeerServer final : public QLocalServer {
-public:
-    std::function<void(qintptr)> accepted;
-
-protected:
-    void incomingConnection(quintptr descriptor) override;
-};
 
 class Server final : public QObject {
 public:
@@ -30,16 +22,15 @@ public:
     static bool peerAllowed(qintptr descriptor, uid_t owner);
 
 private:
-    PeerServer socket;
+    Listener socket;
     bool demo;
-    Hwmon hwmon;
+    SensorSource sensorSource;
     std::unique_ptr<LightingAdapter> adapter;
     std::unique_ptr<Hotplug> hotplug;
     QSet<Connection *> clients;
     QElapsedTimer clock;
     QTimer events;
     QTimer idleExit;
-    qint64 nextSample = 0;
     int sampleInterval = 2000;
     void initializeAdapters();
     void accept(qintptr descriptor);
@@ -47,5 +38,6 @@ private:
     void subscriptionsChanged();
     void tick();
     void devicesChanged();
-    QJsonObject sensors() const;
+    void scheduleEvents();
+    void readSensors(SensorSource::Callback ready);
 };

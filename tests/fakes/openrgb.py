@@ -2,6 +2,7 @@
 import socket
 import struct
 import threading
+import time
 
 
 def word(value):
@@ -46,6 +47,9 @@ class OpenRgbServer:
         self.advertised = advertised
         self.fragment = fragment
         self.commands = []
+        self.command_times = []
+        self.accepted = 0
+        self.disconnected = threading.Event()
         self.stop_event = threading.Event()
         self.ready = threading.Event()
         self.client = None
@@ -78,6 +82,8 @@ class OpenRgbServer:
             except OSError:
                 break
             self.client = client
+            self.accepted += 1
+            self.disconnected.clear()
             client.settimeout(0.1)
             data = b""
             try:
@@ -98,6 +104,7 @@ class OpenRgbServer:
                         payload = data[16:16 + length]
                         data = data[16 + length:]
                         self.commands.append((device, command, payload))
+                        self.command_times.append((command, time.monotonic()))
                         if self.behavior == "timeout":
                             continue
                         if self.behavior == "huge":
@@ -127,6 +134,7 @@ class OpenRgbServer:
             finally:
                 client.close()
                 self.client = None
+                self.disconnected.set()
 
     def hotplug(self, descriptors):
         self.descriptors = descriptors

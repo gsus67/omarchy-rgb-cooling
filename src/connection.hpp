@@ -16,6 +16,7 @@ public:
     QSet<QString> topics;
     int intervalMilliseconds = 2000;
     qint64 nextEvent = 0;
+    quint64 subscriptionRevision = 0;
     std::function<void(Connection *, const Protocol::Request &)> requestReceived;
     std::function<void(Connection *)> closed;
     void send(const QJsonObject &object);

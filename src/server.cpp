@@ -2,37 +2,24 @@
 #include "server.hpp"
 #include "openrgb.hpp"
 #include <QCoreApplication>
-#include <QFile>
 #include <QJsonArray>
+#include <QPointer>
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
+#include <limits>
+#include <utility>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>
 
-void PeerServer::incomingConnection(quintptr descriptor)
-{
-    if (accepted) {
-        accepted(descriptor);
-    } else {
-        ::close(static_cast<int>(descriptor));
-    }
-}
-
-Server::Server(bool demo, const QString &hwmonRoot) : demo(demo), hwmon(hwmonRoot)
+Server::Server(bool demo, const QString &hwmonRoot) : demo(demo), sensorSource(hwmonRoot)
 {
     clock.start();
     socket.accepted = [this](qintptr descriptor) { accept(descriptor); };
-    socket.setMaxPendingConnections(Protocol::MaxConnections);
     idleExit.setSingleShot(true);
     idleExit.setInterval(Protocol::ExitMilliseconds);
     idleExit.setTimerType(Qt::PreciseTimer);
     connect(&idleExit, &QTimer::timeout, qApp, &QCoreApplication::quit);
     idleExit.start();
-    events.setInterval(50);
+    events.setSingleShot(true);
     events.setTimerType(Qt::PreciseTimer);
     connect(&events, &QTimer::timeout, this, [this] { tick(); });
 }
@@ -45,9 +32,7 @@ void Server::initializeAdapters()
     } else {
         adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); });
         hotplug = std::make_unique<Hotplug>([this] {
-            if (events.isActive()) {
-                nextSample = 0;
-            }
+            sensorSource.invalidate();
             static_cast<OpenRgbAdapter *>(adapter.get())->refresh();
         });
     }
@@ -66,26 +51,7 @@ Server::~Server()
 
 bool Server::listen(const QString &path, QString &error)
 {
-    const auto encoded = QFile::encodeName(path);
-    struct stat metadata {};
-    if (::lstat(encoded.constData(), &metadata) == 0) {
-        error = S_ISSOCK(metadata.st_mode) ? "Socket path already exists"
-                                         : "Refusing to replace a non-socket file";
-        return false;
-    }
-    if (errno != ENOENT) {
-        error = QString::fromLocal8Bit(std::strerror(errno));
-        return false;
-    }
-    // umask is set to 0077 in main before Qt creates any socket.
-    socket.setSocketOptions(QLocalServer::UserAccessOption);
-    if (!socket.listen(path)) {
-        error = socket.errorString();
-        return false;
-    }
-    if (::chmod(encoded.constData(), 0600) != 0) {
-        error = "Could not restrict socket permissions";
-        socket.close();
+    if (!socket.listen(path, error)) {
         return false;
     }
     initializeAdapters();
@@ -94,23 +60,7 @@ bool Server::listen(const QString &path, QString &error)
 
 bool Server::adopt(qintptr descriptor, QString &error)
 {
-    const int fd = static_cast<int>(descriptor);
-    int type = 0;
-    int accepting = 0;
-    socklen_t length = sizeof(type);
-    sockaddr_un address {};
-    socklen_t addressLength = sizeof(address);
-    if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0 || type != SOCK_STREAM
-        || ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &length) != 0 || !accepting
-        || ::getsockname(fd, reinterpret_cast<sockaddr *>(&address), &addressLength) != 0
-        || address.sun_family != AF_UNIX) {
-        error = "Activation descriptor must be a listening Unix stream socket";
-        return false;
-    }
-    const int flags = ::fcntl(fd, F_GETFD);
-    if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0
-        || !socket.listen(descriptor)) {
-        error = "Could not adopt activation socket";
+    if (!socket.adopt(descriptor, error)) {
         return false;
     }
     initializeAdapters();
@@ -149,10 +99,13 @@ void Server::accept(qintptr descriptor)
     connection->start();
 }
 
-QJsonObject Server::sensors() const
+void Server::readSensors(SensorSource::Callback ready)
 {
-    return demo ? static_cast<DemoAdapter *>(adapter.get())->sensors()
-                : hwmon.snapshot(sampleInterval);
+    if (demo) {
+        ready(static_cast<DemoAdapter *>(adapter.get())->sensors());
+    } else {
+        sensorSource.request(sampleInterval, std::move(ready));
+    }
 }
 
 void Server::dispatch(Connection *connection, const Protocol::Request &request)
@@ -166,11 +119,14 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
         reply.result = {{"engines", QJsonArray{adapter->engine()}},
                         {"uptime_s", clock.elapsed() / 1000}};
     } else if (op == "sensors") {
-        // With no sensor subscription this returns the cache, never a hidden polling read.
-        reply.result = sensors();
-    } else if (op == "devices") {
-        reply.result = {{"devices", adapter->devices()}};
+        readSensors([peer = QPointer(connection), id = request.id](const auto &data) {
+            if (peer) {
+                peer->send(Protocol::response(id, {data, {}, {}}));
+            }
+        });
+        return;
     } else if (op == "subscribe") {
+        ++connection->subscriptionRevision;
         connection->topics.clear();
         for (const auto &topic : params.value("topics").toArray()) {
             connection->topics.insert(topic.toString());
@@ -181,19 +137,37 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
         connection->subscriptionChanged();
         subscriptionsChanged();
     } else if (op == "unsubscribe") {
+        ++connection->subscriptionRevision;
         connection->topics.clear();
         connection->subscriptionChanged();
         subscriptionsChanged();
-    } else if (op == "lighting.get") {
-        reply = adapter->lighting(params.value("device").toString());
-    } else if (op == "lighting.set") {
-        if (!connection->allowLightingWrite()) {
+    } else if (op == "devices" || op == "lighting.get" || op == "lighting.set") {
+        if (op == "lighting.set" && !connection->allowLightingWrite()) {
             reply = Protocol::Reply::failure(
                 "rate_limited", "At most 10 lighting.set requests per second");
         } else {
-            reply = adapter->setLighting(params.value("device").toString(),
-                                         params.value("color").toString(),
-                                         params.value("brightness").toInt());
+            auto ready = [this, peer = QPointer(connection), request] {
+                if (!peer || !clients.contains(peer)) {
+                    return;
+                }
+                Protocol::Reply result;
+                const auto &params = request.params;
+                if (request.operation == "devices") {
+                    result.result = {{"devices", adapter->devices()}};
+                } else if (request.operation == "lighting.get") {
+                    result = adapter->lighting(params.value("device").toString());
+                } else {
+                    result = adapter->setLighting(params.value("device").toString(),
+                        params.value("color").toString(), params.value("brightness").toInt());
+                }
+                peer->send(Protocol::response(request.id, result));
+            };
+            if (demo) {
+                ready();
+            } else {
+                static_cast<OpenRgbAdapter *>(adapter.get())->request(std::move(ready));
+            }
+            return;
         }
     } else {
         reply = Protocol::Reply::failure("unknown_op", "Operation is not supported by API v1");
@@ -203,52 +177,59 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
 
 void Server::subscriptionsChanged()
 {
-    bool subscribed = false;
-    int minimumInterval = 10000;
-    bool sensorSubscriber = false;
+    sampleInterval = 10000;
+    bool deviceSubscriber = false;
     for (const auto *connection : clients) {
-        subscribed = subscribed || !connection->topics.isEmpty();
         if (connection->topics.contains("sensors")) {
-            minimumInterval = std::min(minimumInterval, connection->intervalMilliseconds);
-            sensorSubscriber = true;
+            sampleInterval = std::min(sampleInterval, connection->intervalMilliseconds);
+        }
+        deviceSubscriber = deviceSubscriber || connection->topics.contains("devices");
+    }
+    if (!demo) {
+        static_cast<OpenRgbAdapter *>(adapter.get())->setInterested(deviceSubscriber);
+    }
+    scheduleEvents();
+}
+
+void Server::scheduleEvents()
+{
+    events.stop();
+    qint64 earliest = std::numeric_limits<qint64>::max();
+    for (const auto *connection : clients) {
+        if (!connection->topics.isEmpty()) {
+            earliest = std::min(earliest, connection->nextEvent);
         }
     }
-    if (sensorSubscriber) {
-        sampleInterval = minimumInterval;
-        nextSample = 0;
-    }
-    if (subscribed) {
-        events.start();
-    } else {
-        events.stop();
+    if (earliest != std::numeric_limits<qint64>::max()) {
+        events.start(static_cast<int>(std::max(qint64(0), earliest - clock.elapsed())));
     }
 }
 
 void Server::tick()
 {
-    bool sensorSubscriber = false;
-    for (const auto *connection : clients) {
-        sensorSubscriber = sensorSubscriber || connection->topics.contains("sensors");
-    }
     const qint64 now = clock.elapsed();
-    if (!demo && sensorSubscriber && now >= nextSample) {
-        hwmon.sample(sampleInterval);
-        nextSample = now + sampleInterval;
-    }
     // Copy the set: sending to a stalled peer may synchronously disconnect it.
     const auto peers = clients;
     for (auto *connection : peers) {
-        if (!clients.contains(connection) || connection->nextEvent > now) {
+        if (!clients.contains(connection) || connection->topics.isEmpty()
+            || connection->nextEvent > now) {
             continue;
         }
         connection->nextEvent = now + connection->intervalMilliseconds;
         if (connection->topics.contains("sensors")) {
-            connection->send(Protocol::event("sensors", sensors()));
+            const auto revision = connection->subscriptionRevision;
+            readSensors([this, peer = QPointer(connection), revision](const auto &data) {
+                if (peer && clients.contains(peer) && peer->topics.contains("sensors")
+                    && peer->subscriptionRevision == revision) {
+                    peer->send(Protocol::event("sensors", data));
+                }
+            });
         }
-        if (connection->topics.contains("devices")) {
+        if (clients.contains(connection) && connection->topics.contains("devices")) {
             connection->send(Protocol::event("devices", {{"devices", adapter->devices()}}));
         }
     }
+    scheduleEvents();
 }
 
 void Server::devicesChanged()
