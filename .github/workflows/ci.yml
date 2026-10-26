@@ -1,0 +1,222 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+# Every job is a required check on main. While a phase has not added the code a
+# job covers yet, the job reports "nothing to check" and passes; as soon as the
+# code exists the same job enforces it.
+
+jobs:
+  test:
+    name: Tests (Arch, like Omarchy)
+    runs-on: ubuntu-latest
+    # Pinned by digest like the actions; pacman -Syu still brings current packages.
+    container: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    steps:
+      - name: Install build tools
+        # Arch mirrors sometimes drop a download; retry before failing.
+        run: |
+          for attempt in 1 2 3; do
+            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs python && exit 0
+            sleep 15
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plugin manifest
+        run: |
+          if [ -f manifest.json ]; then python -c "import json; json.load(open('manifest.json'))"
+          else echo "No manifest.json yet"; fi
+      - name: Python tests and QML security checks
+        run: |
+          if [ -d tests ]; then python -m unittest discover -s tests -v
+          else echo "No tests yet"; fi
+      - name: Native build and self-tests
+        run: |
+          if [ -f native_build.py ]; then python native_build.py --test
+          else echo "No native core yet"; fi
+
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    container: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    steps:
+      - name: Install build tools
+        run: |
+          for attempt in 1 2 3; do
+            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs python && exit 0
+            sleep 15
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rgbcd parses socket requests, sysfs and engine replies: memory errors,
+      # leaks or undefined behaviour in the self-tests fail the job.
+      - name: Native self-tests under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          if [ -f native_build.py ]; then python native_build.py --test --sanitize
+          else echo "No native core yet"; fi
+
+  clean-uninstall:
+    name: Clean uninstall
+    runs-on: ubuntu-latest
+    container: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    steps:
+      - name: Install build tools
+        run: |
+          for attempt in 1 2 3; do
+            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs python && exit 0
+            sleep 15
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs into a throwaway HOME, uninstalls, and fails if any file, unit,
+      # socket or state directory the project created is left behind.
+      - name: Install, uninstall and compare the filesystem
+        run: |
+          if [ -f tests/clean_uninstall.py ]; then python tests/clean_uninstall.py
+          else echo "No installer yet"; fi
+
+  service-hardening:
+    name: Service hardening
+    runs-on: ubuntu-latest
+    container: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    steps:
+      - name: Install systemd tools
+        run: |
+          for attempt in 1 2 3; do
+            pacman -Syu --noconfirm --needed systemd && exit 0
+            sleep 15
+          done
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Every unit in systemd/ must verify and keep its sandbox; exposure is
+      # 0-100 (systemd shows it /10).
+      - name: Verify and score the systemd units
+        run: |
+          shopt -s nullglob
+          units=(systemd/*.service systemd/*.socket)
+          if [ ${#units[@]} -eq 0 ]; then echo "No systemd units yet"; exit 0; fi
+          mkdir -p /tmp/unit
+          for unit in "${units[@]}"; do
+            sed 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$unit" > "/tmp/unit/${unit##*/}"
+          done
+          systemd-analyze verify /tmp/unit/*
+          for service in /tmp/unit/*.service; do
+            systemd-analyze security --offline=yes --threshold=30 --no-pager "$service"
+          done
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ShellCheck (warnings and errors)
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh'; git grep -lE '^#!.*\b(ba)?sh\b' -- ':!*.sh' ':!.github' || true)
+          if [ ${#scripts[@]} -eq 0 ]; then echo "No shell scripts yet"; exit 0; fi
+          shellcheck --severity=warning "${scripts[@]}"
+
+  zizmor:
+    name: zizmor (workflow security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit GitHub Actions workflows
+        run: pipx run zizmor==1.31.1 --offline --min-severity=medium .github/workflows
+
+  codeql-cpp:
+    name: CodeQL (c-cpp)
+    runs-on: ubuntu-latest
+    # Built in Arch, like Omarchy, so the analysis sees the real Qt 6 build.
+    container: archlinux:base-20261018.0.612668@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for C++ sources
+        id: sources
+        run: |
+          if [ -f native_build.py ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "No native core yet"; fi
+      - name: Install build tools
+        if: steps.sources.outputs.present == 'true'
+        run: |
+          for attempt in 1 2 3; do
+            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs python git && exit 0
+            sleep 15
+          done
+          exit 1
+      - name: Trust the checkout inside the container
+        if: steps.sources.outputs.present == 'true'
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+      - name: Build rgbcd
+        if: steps.sources.outputs.present == 'true'
+        run: python native_build.py --output build
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          category: /language:c-cpp
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            pattern: "*.py"
+          - language: actions
+            pattern: ".github/workflows/*.yml"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for sources
+        id: sources
+        env:
+          PATTERN: ${{ matrix.pattern }}
+        run: |
+          if [ -n "$(git ls-files "$PATTERN")" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "Nothing to analyze yet"; fi
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          category: /language:${{ matrix.language }}
