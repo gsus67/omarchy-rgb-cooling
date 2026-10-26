@@ -56,10 +56,24 @@ Events (only on a subscribed connection; no `id`):
 | `devices` | — | `{"devices": [Device]}` |
 | `subscribe` | `{"topics": ["sensors", "devices"], "interval_ms": 2000}` | `{}`; `interval_ms` is clamped to 500–10000 |
 | `unsubscribe` | — | `{}` |
+| `devices.rescan` | — | `{"devices": [Device]}` after one fresh scan of every engine; `rate_limited` if the last scan was under 2 s ago |
 | `lighting.get` | `{"device": "<id>"}` | `Lighting` |
 | `lighting.set` | `{"device": "<id>", "color": "#rrggbb", "brightness": 0-100}` | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
 
 `lighting.set` is rate limited to 10 per second per connection.
+
+### Engine scans (no background polling)
+
+rgbcd never polls engines on its own. An engine is contacted only by:
+
+- the first `devices`, `lighting.get` or `lighting.set` after start (one scan,
+  then the result is reused);
+- `devices.rescan` (the panel's Scan button, and once each time the panel opens);
+- a udev hotplug event while some connection is subscribed to `devices`.
+
+A failed scan leaves the engine `absent` or `unreachable` until the next one;
+there are no automatic retries. The UI subscribes to `devices` only while the
+panel is open, so with the panel closed nothing contacts OpenRGB.
 
 ### Types
 
