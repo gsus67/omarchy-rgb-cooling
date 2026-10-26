@@ -63,5 +63,13 @@ extern "C" udev_device *udev_monitor_receive_device(udev_monitor *monitor)
 
 extern "C" udev_device *udev_device_unref(udev_device *)
 {
+    if (const char *path = std::getenv("CORE_TEST_UDEV_ACK_FIFO")) {
+        const int fd = ::open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) {
+            const char byte = '+';
+            ::write(fd, &byte, 1);
+            ::close(fd);
+        }
+    }
     return nullptr;
 }
