@@ -13,18 +13,20 @@ bool startsWithAny(const QString &value, const QStringList &prefixes)
     return false;
 }
 
+// The hwmon driver identifies the sensor's own CPU; /proc/cpuinfo is only a
+// fallback for drivers that do not imply a vendor.
 QString cpuName(const QString &driver, const QString &vendor)
 {
-    if (vendor == "GenuineIntel") {
-        return "Intel CPU";
-    }
-    if (vendor == "AuthenticAMD") {
-        return "AMD CPU";
-    }
     if (driver == "coretemp") {
         return "Intel CPU";
     }
     if (driver == "k10temp" || driver == "zenpower") {
+        return "AMD CPU";
+    }
+    if (vendor == "GenuineIntel") {
+        return "Intel CPU";
+    }
+    if (vendor == "AuthenticAMD") {
         return "AMD CPU";
     }
     return "CPU";

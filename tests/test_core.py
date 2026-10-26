@@ -8,6 +8,7 @@ import select
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,11 +24,67 @@ BUILD_DIRECTORY = None
 BINARY = None
 PEERCRED_LIBRARY = None
 UDEV_LIBRARY = None
+RUNTIME_LIBRARY = None
+WAIT_TIMEOUT = 30
+
+
+def wait_until(predicate, timeout=WAIT_TIMEOUT, *, message):
+    """Return the first truthy observation, or fail with the condition and last value."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = predicate()
+        if value:
+            return value
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"Timed out after {timeout}s: {message}; last value: {value!r}")
+        time.sleep(min(0.02, remaining))
+
+
+def wait_event(client, topic, predicate, *, message, timeout=WAIT_TIMEOUT):
+    deadline = time.monotonic() + timeout
+
+    def matching_event():
+        try:
+            event = client.event(topic, timeout=max(0.001, deadline - time.monotonic()))
+        except AssertionError as error:
+            raise AssertionError(f"Timed out: {message}") from error
+        return event if predicate(event["data"]) else None
+
+    return wait_until(matching_event, timeout, message=message)["data"]
+
+
+class TestClock:
+    """Freeze only the daemon clock; client deadlines always use real monotonic time."""
+    def __init__(self, directory):
+        self.path = Path(directory) / "clock"
+        self.nanoseconds = 100_000_000_000
+        self.real_started = 0
+        self.write()
+
+    def write(self):
+        temporary = self.path.with_suffix(".new")
+        temporary.write_bytes(struct.pack("qq", self.nanoseconds, self.real_started))
+        temporary.replace(self.path)
+
+    def advance(self, seconds):
+        assert not self.real_started, "Pause the clock before advancing it"
+        self.nanoseconds += round(seconds * 1_000_000_000)
+        self.write()
+
+    def resume(self):
+        self.real_started = time.monotonic_ns()
+        self.write()
+
+    def pause(self):
+        self.nanoseconds += time.monotonic_ns() - self.real_started
+        self.real_started = 0
+        self.write()
 
 
 def setUpModule():
     """Compile exactly once for this module, in a disposable directory."""
-    global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY, UDEV_LIBRARY
+    global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY, UDEV_LIBRARY, RUNTIME_LIBRARY
     BUILD_DIRECTORY = tempfile.TemporaryDirectory(prefix="rgbcd-contract-")
     result = subprocess.run(
         [sys.executable, str(REPO / "native_build.py"), "--output", BUILD_DIRECTORY.name],
@@ -40,7 +97,9 @@ def setUpModule():
     PEERCRED_LIBRARY = Path(BUILD_DIRECTORY.name) / "peercred.so"
     compiler = shutil.which(os.environ.get("CXX", "g++"))
     UDEV_LIBRARY = Path(BUILD_DIRECTORY.name) / "udev.so"
-    for name, library in (("peercred", PEERCRED_LIBRARY), ("udev", UDEV_LIBRARY)):
+    RUNTIME_LIBRARY = Path(BUILD_DIRECTORY.name) / "runtime.so"
+    for name, library in (("peercred", PEERCRED_LIBRARY), ("udev", UDEV_LIBRARY),
+                          ("runtime", RUNTIME_LIBRARY)):
         result = subprocess.run([
             compiler, "-std=c++20", "-shared", "-fPIC", str(REPO / f"tests/fakes/{name}.cpp"),
             "-ldl", "-o", str(library),
@@ -57,8 +116,12 @@ def tearDownModule():
 class Client:
     def __init__(self, path):
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(4)
-        self.socket.connect(str(path))
+        self.socket.settimeout(WAIT_TIMEOUT)
+        try:
+            self.socket.connect(str(path))
+        except OSError:
+            self.socket.close()
+            raise
         self.input = b""
         self.sequence = 0
         self.events = []
@@ -66,11 +129,15 @@ class Client:
     def send(self, value):
         self.socket.sendall(json.dumps(value).encode() + b"\n")
 
-    def read(self, timeout=4):
+    def read(self, timeout=WAIT_TIMEOUT):
         deadline = time.monotonic() + timeout
         while b"\n" not in self.input:
             self.socket.settimeout(max(0.001, deadline - time.monotonic()))
-            chunk = self.socket.recv(65536)
+            try:
+                chunk = self.socket.recv(65536)
+            except TimeoutError as error:
+                message = f"Timed out waiting for a JSON line after {timeout}s"
+                raise AssertionError(message) from error
             if not chunk:
                 raise EOFError("Core closed the connection")
             self.input += chunk
@@ -89,7 +156,7 @@ class Client:
                 raise AssertionError(response)
             return response
 
-    def event(self, topic, timeout=4):
+    def event(self, topic, timeout=WAIT_TIMEOUT):
         for index, event in enumerate(self.events):
             if event["event"] == topic:
                 return self.events.pop(index)
@@ -101,22 +168,35 @@ class Client:
             if "event" in event:
                 self.events.append(event)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exception):
+        self.close()
+
     def close(self):
         self.socket.close()
 
 
 class Daemon:
     def __init__(self, directory, *, demo=False, activation=None, extra=None,
-                 alien_uid=False, environment=None):
+                 alien_uid=False, environment=None, clock=False):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tree = HwmonTree(self.directory / "hwmon")
         self.path = self.directory / "core.sock"
         environment = {**os.environ, **(environment or {})}
-        for variable in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"):
+        for variable in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES", "CORE_TEST_CLOCK"):
             environment.pop(variable, None)
+        libraries = [str(RUNTIME_LIBRARY), str(UDEV_LIBRARY)]
+        if environment.get("LD_PRELOAD"):
+            libraries.append(environment["LD_PRELOAD"])
         if alien_uid:
-            environment["LD_PRELOAD"] = str(PEERCRED_LIBRARY)
+            libraries.append(str(PEERCRED_LIBRARY))
+        environment["LD_PRELOAD"] = ":".join(libraries)
+        self.clock = TestClock(self.directory) if clock else None
+        if self.clock:
+            environment["CORE_TEST_CLOCK"] = str(self.clock.path)
         arguments = [str(BINARY), "--hwmon-root", str(self.tree.root)]
         if demo:
             arguments.append("--demo")
@@ -136,13 +216,35 @@ class Daemon:
             pass_fds = (activation.fileno(),)
         self.process = subprocess.Popen(arguments, env=environment, pass_fds=pass_fds,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.monotonic() + 10
-        while not self.path.exists():
-            if self.process.poll() is not None or time.monotonic() >= deadline:
-                self.close()
-                raise RuntimeError("rgbcd did not create its socket: " + self.stderr)
-            time.sleep(0.02)
         self.stderr = ""
+
+        def listening():
+            if self.process.poll() is not None:
+                self.close()
+                raise RuntimeError("rgbcd exited before listening: " + self.stderr)
+            if not self.path.is_socket():
+                return False
+            if alien_uid:
+                return True
+            # Activation sockets already exist; binding a private socket also precedes listen.
+            try:
+                with self.client() as client:
+                    if not client.request("hello")["ok"]:
+                        raise AssertionError("rgbcd startup hello failed")
+            except (FileNotFoundError, ConnectionRefusedError):
+                return False
+            return True
+
+        try:
+            wait_until(listening, message=f"rgbcd to answer hello on {self.path}")
+        except Exception:
+            self.close()
+            raise
+
+    def advance(self, seconds, client):
+        self.clock.advance(seconds)
+        # Wake Qt's event dispatcher so it re-evaluates virtual timer deadlines.
+        client.request("hello")
 
     def client(self):
         return Client(self.path)
@@ -151,7 +253,7 @@ class Daemon:
         if self.process.poll() is None:
             self.process.terminate()
         try:
-            _stdout, stderr = self.process.communicate(timeout=5)
+            _stdout, stderr = self.process.communicate(timeout=WAIT_TIMEOUT)
         except subprocess.TimeoutExpired:
             self.process.kill()
             _stdout, stderr = self.process.communicate()
@@ -162,7 +264,7 @@ class CoreContract(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="rgbcd-api-")
         self.addCleanup(self.temporary.cleanup)
-        self.daemon = Daemon(self.temporary.name, demo=True)
+        self.daemon = Daemon(self.temporary.name, demo=True, clock=True)
         self.addCleanup(self.daemon.close)
         self.client = self.daemon.client()
         self.addCleanup(self.client.close)
@@ -187,7 +289,7 @@ class CoreContract(unittest.TestCase):
         devices = self.client.request("devices.rescan")["result"]
         self.assertEqual(devices["devices"][0]["id"], "demo:rgb0")
         self.assert_error(self.client.request("devices.rescan"), "rate_limited")
-        time.sleep(2.05)
+        self.daemon.advance(2.3, self.client)
         self.assertEqual(self.client.request("devices.rescan")["result"], devices)
 
     def test_contract_status_engine_schema_and_uptime(self):
@@ -294,23 +396,31 @@ class CoreContract(unittest.TestCase):
             return int(next(line.split()[1] for line in status.read_text().splitlines()
                             if line.startswith("voluntary_ctxt_switches:")))
 
+        # Real time must run during wakeup observations to expose periodic polling timers.
+        self.daemon.clock.resume()
         before = wakeups()
+        started = time.monotonic()
         time.sleep(1.2)
-        # A 50 ms polling timer wakes about 24 times here; a deadline timer sleeps.
-        self.assertLess(wakeups() - before, 10)
+        # Scale the budget to the actual observation window after scheduler delays.
+        # A 50 ms polling timer still exceeds this by an order of magnitude.
+        self.assertLess(wakeups() - before, max(10, 2 * (time.monotonic() - started)))
+        self.daemon.clock.pause()
         peer = self.daemon.client()
         self.addCleanup(peer.close)
         peer.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
         peer.event("sensors")
-        started = time.monotonic()
+        self.daemon.advance(0.4, peer)
+        self.assertEqual(peer.events, [])
+        self.assertEqual(select.select([peer.socket], [], [], 0.1)[0], [])
+        self.daemon.advance(0.2, peer)
         peer.event("sensors")
-        self.assertGreaterEqual(time.monotonic() - started, 0.35)
-        self.assertLess(time.monotonic() - started, 1.5)
         peer.request("unsubscribe")
         self.client.request("unsubscribe")
+        self.daemon.clock.resume()
         before = wakeups()
+        started = time.monotonic()
         time.sleep(0.7)
-        self.assertLess(wakeups() - before, 5)
+        self.assertLess(wakeups() - before, max(5, 2 * (time.monotonic() - started)))
 
     def test_contract_framing_fragmentation_pipelining_and_64kib_boundary(self):
         line = json.dumps({"v": 1, "id": 101, "op": "hello"}).encode()
@@ -341,7 +451,7 @@ class CoreContract(unittest.TestCase):
         sentinel.write_text("keep")
         for path in (sentinel, self.daemon.path):
             result = subprocess.run([str(BINARY), "--demo", "--listen", str(path)],
-                                    capture_output=True, text=True, timeout=5)
+                                    capture_output=True, text=True, timeout=WAIT_TIMEOUT)
             self.assertNotEqual(result.returncode, 0)
         self.assertEqual(sentinel.read_text(), "keep")
         self.assertTrue(self.client.request("hello")["ok"])
@@ -400,7 +510,7 @@ class CoreContract(unittest.TestCase):
         self.assertTrue(peer.request("lighting.set", {
             "device": "demo:rgb0", "color": "#123456", "brightness": 100,
         })["ok"])
-        time.sleep(1.05)
+        self.daemon.advance(1.3, self.client)
         self.assertTrue(self.client.request("lighting.set", {
             "device": "demo:rgb0", "color": "#123456", "brightness": 100,
         })["ok"])
@@ -413,20 +523,23 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(set(first), {"v", "event", "data"})
         self.assertEqual(first["v"], 1)
         self.assertEqual(set(self.client.event("devices")["data"]), {"devices"})
-        started = time.monotonic()
+        self.daemon.advance(0.4, self.client)
+        self.assertEqual(self.client.events, [])
+        self.assertEqual(select.select([self.client.socket], [], [], 0.1)[0], [])
+        self.daemon.advance(0.2, self.client)
         self.client.event("sensors")
-        self.assertGreaterEqual(time.monotonic() - started, 0.35)
+        self.client.event("devices")
         self.assertEqual(self.client.request("unsubscribe")["result"], {})
         self.client.events.clear()
         self.assertEqual(self.client.input, b"")
         self.assertEqual(select.select([self.client.socket], [], [], 0.6)[0], [])
         self.client.request("subscribe", {"topics": ["sensors"], "interval_ms": 999999999})
         self.client.event("sensors")
-        started = time.monotonic()
-        self.client.event("sensors", timeout=12)
-        elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 9.5)
-        self.assertLess(elapsed, 12)
+        self.daemon.advance(9.4, self.client)
+        self.assertEqual(self.client.events, [])
+        self.assertEqual(select.select([self.client.socket], [], [], 0.1)[0], [])
+        self.daemon.advance(0.9, self.client)
+        self.client.event("sensors")
 
 
 class HwmonContract(unittest.TestCase):
@@ -435,7 +548,13 @@ class HwmonContract(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.fake = OpenRgbServer(descriptors=[])
         self.addCleanup(self.fake.close)
-        self.daemon = Daemon(self.temporary.name)
+        controlled = self._testMethodName in (
+            "test_contract_hwmon_on_demand_cache_read_only_primary_cpu_and_units",
+            "test_contract_hwmon_blocked_read_does_not_block_other_connections",
+        )
+        self.daemon = Daemon(self.temporary.name, clock=controlled, environment={
+            "CORE_TEST_OPENRGB_PORT": str(self.fake.port),
+        })
         self.addCleanup(self.daemon.close)
         self.client = self.daemon.client()
         self.addCleanup(self.client.close)
@@ -460,7 +579,7 @@ class HwmonContract(unittest.TestCase):
         cached = self.client.request("sensors")["result"]
         self.assertEqual(cached, data)
         self.assertEqual(watch.drain(), [])
-        time.sleep(0.55)
+        self.daemon.advance(0.8, self.client)
         data = self.subscribe()
         self.assertEqual(data["primary"], "coretemp:platform/coretemp.0:temp1")
         sensors = {sensor["id"]: sensor for sensor in data["sensors"]}
@@ -477,6 +596,8 @@ class HwmonContract(unittest.TestCase):
         self.assertFalse(any(mask & (2 | 8) for mask in masks), masks)
         self.client.request("unsubscribe")
         watch.drain()
+        self.daemon.advance(0.8, self.client)
+        # Absence observation: extra real waiting is safe, even on a loaded runner.
         time.sleep(0.7)
         self.assertEqual(watch.drain(), [])
         self.client.request("sensors")
@@ -526,24 +647,23 @@ class HwmonContract(unittest.TestCase):
         os.mkfifo(path)
         self.client.send({"v": 1, "id": 100, "op": "sensors"})
         # Opening the write end proves the worker has reached the blocking read.
-        deadline = time.monotonic() + 3
-        writer = None
-        while writer is None:
+        def open_writer():
             try:
-                writer = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                return (os.open(path, os.O_WRONLY | os.O_NONBLOCK),)
             except OSError as error:
                 if error.errno != errno.ENXIO:
                     raise
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.01)
+                return None
+
+        writer = wait_until(open_writer, message="hwmon worker to open its FIFO for reading")[0]
         try:
             peer = self.daemon.client()
             self.addCleanup(peer.close)
-            started = time.monotonic()
+            # The FIFO remains blocked: hello must complete before the worker can finish.
             self.assertTrue(peer.request("hello")["ok"])
-            self.assertLess(time.monotonic() - started, 0.5)
             # Coalesce a second sensor request while the first read is still pending.
             peer.send({"v": 1, "id": 200, "op": "sensors"})
+            self.assertTrue(peer.request("hello")["ok"])
             os.write(writer, b"42500\n")
         finally:
             os.close(writer)
@@ -562,33 +682,39 @@ class HwmonContract(unittest.TestCase):
         (replacement / "temp1_input").write_text("43000")
         (self.daemon.tree.root / "hwmon8").unlink()
         (self.daemon.tree.root / "hwmon99").symlink_to(replacement, target_is_directory=True)
-        deadline = time.monotonic() + 3
-        while True:
-            data = self.client.event("sensors")["data"]
-            sensor = next(item for item in data["sensors"] if item["id"] == initial["primary"])
-            if sensor["value"] == 43:
-                break
-            self.assertLess(time.monotonic(), deadline)
+        data = wait_event(self.client, "sensors", lambda data: any(
+            item["id"] == initial["primary"] and item["value"] == 43
+            for item in data["sensors"]
+        ), message="renumbered hwmon primary to report 43 C")
         self.assertEqual(data["primary"], initial["primary"])
         self.assertFalse(any("hwmon" in item["id"] for item in data["sensors"]))
+
+    def wait_for_primary(self, primary, predicate, *, message, timeout=WAIT_TIMEOUT):
+        """Ignore events sampled before the fixture change, including buffered events."""
+        data = wait_event(self.client, "sensors", lambda data: any(
+            item["id"] == primary and predicate(item) for item in data["sensors"]
+        ), timeout=timeout, message=f"primary sensor {primary}: {message}")
+        return next(item for item in data["sensors"] if item["id"] == primary)
 
     def test_contract_hwmon_nan_missing_failed_read_null_and_stale_after_three_intervals(self):
         data = self.subscribe()
         primary = data["primary"]
         for invalid in ("NaN", "inf", "-inf", "not a number", ""):
+            # Restore a valid reading first so each invalid value is observed on its own.
+            (self.daemon.tree.cpu / "temp1_input").write_text("42500")
+            self.wait_for_primary(primary, lambda sensor: sensor["value"] is not None,
+                                  message="valid reading to be restored")
             (self.daemon.tree.cpu / "temp1_input").write_text(invalid)
-            data = self.client.event("sensors")["data"]
-            sensor = next(item for item in data["sensors"] if item["id"] == primary)
-            self.assertIsNone(sensor["value"])
+            # An event sampled before the write may already be in flight: wait for the change.
+            self.wait_for_primary(primary, lambda sensor: sensor["value"] is None,
+                                  message=f"{invalid!r} to produce null")
         (self.daemon.tree.cpu / "temp1_input").unlink()
-        deadline = time.monotonic() + 3
-        while True:
-            data = self.client.event("sensors")["data"]
-            sensor = next(item for item in data["sensors"] if item["id"] == primary)
+        def missing_and_stale(sensor):
             self.assertIsNone(sensor["value"])
-            if sensor["stale"]:
-                break
-            self.assertLess(time.monotonic(), deadline)
+            return sensor["stale"]
+
+        self.wait_for_primary(primary, missing_and_stale,
+                              message="missing input to become stale")
         shutil.rmtree(self.daemon.tree.cpu)
         data = self.client.event("sensors")["data"]
         sensor = next(item for item in data["sensors"] if item["id"] == primary)
@@ -611,16 +737,22 @@ class OpenRgbContract(unittest.TestCase):
         os.mkfifo(self.udev_fifo)
         self.udev_fd = os.open(self.udev_fifo, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, self.udev_fd)
+        self.udev_ack_fifo = Path(self.temporary.name) / "udev-ack.fifo"
+        os.mkfifo(self.udev_ack_fifo)
+        self.udev_ack_fd = os.open(self.udev_ack_fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, self.udev_ack_fd)
         self.environment = {
-            "LD_PRELOAD": str(UDEV_LIBRARY), "CORE_TEST_UDEV_FIFO": str(self.udev_fifo),
+            "CORE_TEST_UDEV_FIFO": str(self.udev_fifo),
+            "CORE_TEST_UDEV_ACK_FIFO": str(self.udev_ack_fifo),
         }
 
-    def launch(self, *, interested=True, **options):
+    def launch(self, *, interested=True, clock=True, **options):
         fake = OpenRgbServer(**options)
         self.addCleanup(fake.close)
         self.counter += 1
         daemon = Daemon(Path(self.temporary.name) / str(self.counter),
-                        environment=self.environment)
+                        environment={**self.environment, "CORE_TEST_OPENRGB_PORT": str(fake.port)},
+                        clock=clock)
         self.addCleanup(daemon.close)
         client = daemon.client()
         self.addCleanup(client.close)
@@ -631,41 +763,54 @@ class OpenRgbContract(unittest.TestCase):
             client.request("devices")
         return fake, daemon, client
 
-    def wait_state(self, client, expected, timeout=5):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+    def wait_state(self, client, expected, timeout=WAIT_TIMEOUT):
+        def matching_state():
             engine = client.request("status")["result"]["engines"][0]
-            if engine["state"] == expected:
-                return engine
-            time.sleep(0.03)
-        self.fail(f"Expected {expected}, got {engine}")
+            return engine if engine["state"] == expected else None
+
+        return wait_until(matching_state, timeout, message=f"OpenRGB state to become {expected}")
+
+    def wait_disconnected(self, fake):
+        wait_until(fake.disconnected.is_set, message="fake OpenRGB peer to disconnect")
 
     def subscribe_devices(self, client):
         return client.request("subscribe", {"topics": ["devices"], "interval_ms": 500})
 
-    def hotplug(self):
+    def hotplug(self, client):
         os.write(self.udev_fd, b"+")
 
+        def acknowledged():
+            try:
+                return os.read(self.udev_ack_fd, 1) == b"+"
+            except BlockingIOError:
+                return False
+
+        wait_until(acknowledged, message="fake udev notification to be consumed")
+        # The daemon finishes the udev callback before dispatching this request.
+        self.assertTrue(client.request("hello")["ok"])
+
     def test_contract_openrgb_no_requests_or_subscriptions_start_engine_polling(self):
-        fake, _daemon, client = self.launch(interested=False)
-        # Longer than both the old initial retry and periodic reconciliation interval.
+        fake, daemon, client = self.launch(interested=False)
+        # Exercise virtual timer deadlines as well as a real absence observation window.
+        daemon.advance(5.6, client)
         time.sleep(5.3)
         self.assertEqual(fake.accepted, 0)
         for operation in ("hello", "status", "sensors"):
             self.assertTrue(client.request(operation)["ok"])
         client.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
         client.event("sensors")
-        self.hotplug()
+        self.hotplug(client)
         time.sleep(0.2)
         self.assertEqual(fake.accepted, 0)
         self.subscribe_devices(client)
         client.event("devices")
+        daemon.advance(5.6, client)
         time.sleep(5.3)
         self.assertEqual(fake.accepted, 0)
         self.assertEqual(fake.commands, [])
 
     def test_contract_openrgb_first_devices_then_lighting_and_devices_use_cache(self):
-        fake, _daemon, client = self.launch(interested=False)
+        fake, daemon, client = self.launch(interested=False, clock=True)
         devices = client.request("devices")["result"]
         self.assertEqual(client.request("devices")["result"], devices)
         self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
@@ -676,8 +821,9 @@ class OpenRgbContract(unittest.TestCase):
         })
         self.assertEqual(response["error"]["code"], "blocked")
         self.assertEqual(fake.accepted, 1)
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         self.subscribe_devices(client)
+        daemon.advance(5.6, client)
         time.sleep(5.3)
         self.assertEqual(fake.accepted, 1)
 
@@ -696,26 +842,21 @@ class OpenRgbContract(unittest.TestCase):
                 fake.close()
 
     def test_contract_openrgb_rescan_fresh_list_global_rate_limit_and_deferred_response(self):
-        fake, daemon, client = self.launch(interested=False)
+        fake, daemon, client = self.launch(interested=False, clock=True)
         # devices.rescan may also be the very first scan.
         self.assertTrue(client.request("devices.rescan")["ok"])
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         other = daemon.client()
         self.addCleanup(other.close)
         response = other.request("devices.rescan")
         self.assertEqual(response["error"]["code"], "rate_limited")
         self.assertEqual(fake.accepted, 1)
-        time.sleep(2.05)
+        daemon.advance(2.3, client)
         fake.descriptors = [controller("Replacement")]
         fake.respond.clear()
         client.send({"v": 1, "id": 100, "op": "devices.rescan"})
-        deadline = time.monotonic() + 1
-        while fake.accepted < 2:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.01)
-        started = time.monotonic()
+        wait_until(lambda: fake.accepted >= 2, message="second OpenRGB scan to connect")
         self.assertTrue(other.request("hello")["ok"])
-        self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(select.select([client.socket], [], [], 0.1)[0], [])
         # Reads and manual scans on different peers share this scan, not stale cache.
         other.send({"v": 1, "id": 101, "op": "devices"})
@@ -740,16 +881,17 @@ class OpenRgbContract(unittest.TestCase):
             self.assertEqual(joined["id"], identifier)
             self.assertEqual(joined["error"]["code"], "unavailable")
         self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         self.assertEqual(fake.accepted, 2)
 
     def test_contract_openrgb_failed_scan_cached_without_automatic_retries(self):
-        fake, _daemon, client = self.launch(behavior="magic")
+        fake, daemon, client = self.launch(behavior="magic")
         self.wait_state(client, "unreachable")
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         fake.behavior = "normal"
         # Even a subscribed client and subsequent reads must not cause retries.
         self.assertEqual(client.request("devices")["result"], {"devices": []})
+        daemon.advance(6.6, client)
         time.sleep(6.3)
         self.assertEqual(fake.accepted, 1)
         self.wait_state(client, "unreachable")
@@ -757,41 +899,38 @@ class OpenRgbContract(unittest.TestCase):
         self.assertEqual(fake.accepted, 2)
 
     def test_contract_openrgb_udev_hotplug_requires_a_device_subscriber(self):
-        fake, daemon, client = self.launch(interested=False)
-        self.hotplug()
+        fake, daemon, client = self.launch(interested=False, clock=True)
+        self.hotplug(client)
         time.sleep(0.2)
         self.assertEqual(fake.accepted, 0)
         self.subscribe_devices(client)
-        self.hotplug()
+        self.hotplug(client)
         self.wait_state(client, "blocked")
         self.assertEqual(fake.accepted, 1)
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         # Only one of the two peers needs to subscribe to devices.
         other = daemon.client()
         self.addCleanup(other.close)
         self.subscribe_devices(other)
         client.request("unsubscribe")
         fake.descriptors = [controller("Hotplug replacement")]
-        self.hotplug()
-        deadline = time.monotonic() + 2
-        while True:
-            event = other.event("devices")
-            devices = event["data"]["devices"]
-            if devices and devices[0]["name"] == "Hotplug replacement":
-                break
-            self.assertLess(time.monotonic(), deadline)
+        self.hotplug(client)
+        wait_event(other, "devices", lambda data: data["devices"]
+                   and data["devices"][0]["name"] == "Hotplug replacement",
+                   message="udev replacement inventory to arrive")
         self.assertEqual(fake.accepted, 2)
         # Hotplug scans also count towards the manual scan rate limit.
         self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
+        # An explicit unsubscribe response proves there are no device subscribers.
+        other.request("unsubscribe")
         other.close()
         client.request("hello")
-        time.sleep(0.1)
-        self.hotplug()
+        self.hotplug(client)
         time.sleep(0.2)
         self.assertEqual(fake.accepted, 2)
 
     def test_contract_openrgb_initial_scan_shares_failures_and_keeps_loop_responsive(self):
-        fake, daemon, client = self.launch(interested=False, behavior="timeout")
+        fake, daemon, client = self.launch(interested=False, behavior="timeout", clock=True)
         client.send({"v": 1, "id": 100, "op": "devices"})
         other = daemon.client()
         self.addCleanup(other.close)
@@ -800,19 +939,20 @@ class OpenRgbContract(unittest.TestCase):
         abandoned = daemon.client()
         abandoned.send({"v": 1, "id": 200, "op": "devices"})
         abandoned.close()
-        started = time.monotonic()
+        wait_until(lambda: fake.commands, message="pending OpenRGB SDK request to arrive")
         self.assertTrue(other.request("hello")["ok"])
-        self.assertLess(time.monotonic() - started, 0.5)
+        daemon.advance(2.3, other)
         reply = client.read()
         self.assertEqual(reply["id"], 100)
         self.assertEqual(reply["result"], {"devices": []})
-        self.assertTrue(fake.disconnected.wait(1))
+        self.wait_disconnected(fake)
         for identifier in (101, 102):
             joined = other.read()
             self.assertEqual(joined["id"], identifier)
             self.assertEqual(joined["result"], {"devices": []})
         self.assertEqual(fake.accepted, 1)
         accepted = fake.accepted
+        daemon.advance(2.3, client)
         time.sleep(2.3)
         self.assertEqual(fake.accepted, accepted)
 
@@ -866,21 +1006,19 @@ class OpenRgbContract(unittest.TestCase):
     def test_contract_openrgb_stable_identity_across_reordered_protocol_indices(self):
         first = controller()
         second = controller("Other RGB", "USB:1234:abcd:port2", "other")
-        fake, _daemon, client = self.launch(descriptors=[first, second])
+        fake, daemon, client = self.launch(descriptors=[first, second])
         self.wait_state(client, "blocked")
         before = client.request("devices")["result"]
         fake.descriptors = [second, first]
-        time.sleep(2.05)
+        daemon.advance(2.3, client)
         self.assertEqual(client.request("devices.rescan")["result"], before)
         self.assertEqual(client.request("devices")["result"], before)
 
     def test_contract_openrgb_bad_magic_lengths_counts_ids_commands_timeout_unreachable(self):
         for behavior in ("magic", "huge", "huge_count", "wrong_id", "wrong_command", "timeout"):
             with self.subTest(behavior=behavior):
-                fake, daemon, client = self.launch(behavior=behavior)
-                started = time.monotonic()
+                fake, daemon, client = self.launch(behavior=behavior, clock=behavior != "timeout")
                 self.assertTrue(client.request("hello")["ok"])
-                self.assertLess(time.monotonic() - started, 0.5)
                 engine = self.wait_state(client, "unreachable")
                 self.assertTrue(engine["reason"])
                 self.assertEqual(client.request("devices")["result"], {"devices": []})
@@ -907,16 +1045,22 @@ class OpenRgbContract(unittest.TestCase):
         client.close()
         daemon.close()
         fake.close()
-        absent = Daemon(Path(self.temporary.name) / "absent", environment=self.environment)
+        reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(reserved.close)
+        reserved.bind(("127.0.0.1", 0))
+        absent = Daemon(Path(self.temporary.name) / "absent", clock=True, environment={
+            **self.environment, "CORE_TEST_OPENRGB_PORT": str(reserved.getsockname()[1]),
+        })
         self.addCleanup(absent.close)
         client = absent.client()
         self.addCleanup(client.close)
         engine = self.wait_state(client, "absent")
         self.assertTrue(engine["reason"])
         self.assertEqual(client.request("devices")["result"], {"devices": []})
-        recovery = OpenRgbServer()
+        recovery = OpenRgbServer(listener=reserved)
         self.addCleanup(recovery.close)
         self.subscribe_devices(client)
+        absent.advance(3.5, client)
         time.sleep(3.2)
         self.assertEqual(recovery.accepted, 0)
         self.assertEqual(client.request("devices")["result"], {"devices": []})
@@ -963,7 +1107,7 @@ class ActivationAndLifetimeContract(unittest.TestCase):
         for pid, count in (("1", "1"), ("garbage", "1"), ("", ""), ("1", "2")):
             environment = {**os.environ, "LISTEN_PID": pid, "LISTEN_FDS": count}
             result = subprocess.run([str(BINARY)], env=environment, capture_output=True,
-                                    text=True, timeout=5)
+                                    text=True, timeout=WAIT_TIMEOUT)
             self.assertNotEqual(result.returncode, 0)
         launcher = (
             "import os,sys; os.environ['LISTEN_PID']=str(os.getpid()); "
@@ -972,7 +1116,7 @@ class ActivationAndLifetimeContract(unittest.TestCase):
         )
         for count in ("0", "2", "1", "-1", "01", "99999999999999999999999"):
             result = subprocess.run([sys.executable, "-c", launcher, count, str(BINARY)],
-                                    capture_output=True, text=True, timeout=5)
+                                    capture_output=True, text=True, timeout=WAIT_TIMEOUT)
             self.assertNotEqual(result.returncode, 0)
 
     def test_contract_so_peercred_actual_uid_and_invalid_owner_gate_in_native_tests(self):
@@ -989,7 +1133,8 @@ class ActivationAndLifetimeContract(unittest.TestCase):
         # A real different-UID process requires privileges; the preload regression
         # below injects an alien UID at the kernel boundary without changing users.
         result = subprocess.run([str(BINARY), "--self-test"], capture_output=True,
-                                text=True, timeout=10)
+                                env={**os.environ, "LD_PRELOAD": str(RUNTIME_LIBRARY)},
+                                text=True, timeout=WAIT_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_contract_so_peercred_other_uid_closed_before_any_json_is_read(self):
@@ -1011,41 +1156,46 @@ class ActivationAndLifetimeContract(unittest.TestCase):
     def test_contract_idle_30s_exit_60s_subscription_survival_and_socket_reactivation(self):
         listener = self.listener("lifetime.sock")
         inode = Path(listener.getsockname()).stat().st_ino
+        private_started = time.monotonic()
         private = Daemon(self.directory / "private", demo=True)
         self.addCleanup(private.close)
+        empty_started = time.monotonic()
         empty = Daemon(self.directory / "empty", demo=True, activation=listener)
         self.addCleanup(empty.close)
         idle = Daemon(self.directory / "idle", demo=True)
         self.addCleanup(idle.close)
         idle_client = idle.client()
         self.addCleanup(idle_client.close)
+        idle_started = time.monotonic()
         self.assertTrue(idle_client.request("hello")["ok"])
         active = Daemon(self.directory / "active", demo=True)
         self.addCleanup(active.close)
         active_client = active.client()
         self.addCleanup(active_client.close)
         active_client.request("subscribe", {"topics": ["sensors"], "interval_ms": 10000})
-        started = time.monotonic()
-        idle_closed = False
-        while time.monotonic() - started < 62:
-            readable = select.select([idle_client.socket], [], [], 0.2)[0]
-            if readable and not idle_closed:
-                self.assertEqual(idle_client.socket.recv(1), b"")
-                elapsed = time.monotonic() - started
-                self.assertGreaterEqual(elapsed, 29)
-                self.assertLess(elapsed, 34)
-                idle_closed = True
+
+        def idle_closed():
             self.assertIsNone(active.process.poll())
-            if empty.process.poll() is not None:
-                break
-            time.sleep(0.1)
-        self.assertTrue(idle_closed)
-        self.assertEqual(empty.process.poll(), 0)
-        self.assertEqual(private.process.wait(timeout=3), 0)
+            if not select.select([idle_client.socket], [], [], 0)[0]:
+                return False
+            self.assertEqual(idle_client.socket.recv(1), b"")
+            return True
+
+        wait_until(idle_closed, timeout=90, message="idle connection to close after 30 s")
+        self.assertGreaterEqual(time.monotonic() - idle_started, 29)
+        def all_exited():
+            self.assertIsNone(active.process.poll())
+            done = True
+            for daemon, started in ((private, private_started), (empty, empty_started)):
+                if daemon.process.poll() is None:
+                    done = False
+                else:
+                    self.assertEqual(daemon.process.returncode, 0)
+                    self.assertGreaterEqual(time.monotonic() - started, 59)
+            return done
+
+        wait_until(all_exited, timeout=90, message="daemons without clients to exit after 60 s")
         self.assertFalse(private.path.exists())
-        elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 59)
-        self.assertLess(elapsed, 63)
         self.assertTrue(active_client.request("hello")["ok"])
         self.assertEqual(Path(listener.getsockname()).stat().st_ino, inode)
         replacement = Daemon(self.directory / "reactivated", demo=True, activation=listener)

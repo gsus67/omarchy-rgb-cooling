@@ -215,6 +215,12 @@ void testSensorNames(Checks &checks)
                   == "AMD CPU"
                   && SensorNames::device("cpu_thermal", "", "", "AuthenticAMD") == "AMD CPU",
                   "AMD CPU name uses hwmon driver or cpuinfo vendor");
+    // Regression: CI hosts with another CPU vendor renamed a fake coretemp sensor.
+    checks.verify(SensorNames::device("coretemp", "platform/coretemp.0", "", "AuthenticAMD")
+                  == "Intel CPU"
+                  && SensorNames::device("k10temp", "platform/k10temp.0", "", "GenuineIntel")
+                  == "AMD CPU",
+                  "the hwmon driver wins over the host cpuinfo vendor");
     checks.verify(SensorNames::device("amdgpu", "", "amdgpu", "") == "AMD GPU"
                   && SensorNames::device("gpu", "", "nouveau", "") == "NVIDIA GPU"
                   && SensorNames::device("xe", "", "xe", "") == "Intel GPU",

@@ -41,7 +41,8 @@ def controller(name="MSI RGB", location="USB:1462:7d98:port1", serial="unique", 
 
 
 class OpenRgbServer:
-    def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False):
+    def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False,
+                 listener=None):
         self.behavior = behavior
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
@@ -56,10 +57,10 @@ class OpenRgbServer:
         self.ready = threading.Event()
         self.client = None
         self.lock = threading.Lock()
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Fail rather than contact or replace an existing engine on this fixed contract port.
-        self.listener.bind(("127.0.0.1", 6742))
+        self.listener = listener or socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if listener is None:
+            self.listener.bind(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
         self.listener.listen(8)
         self.listener.settimeout(0.1)
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -155,4 +156,6 @@ class OpenRgbServer:
                 client.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        self.thread.join(timeout=3)
+        self.thread.join(timeout=30)
+        if self.thread.is_alive():
+            raise AssertionError("Fake OpenRGB thread did not stop within 30s")
