@@ -114,9 +114,11 @@ def scenario(name, prepare):
                          home / f".local/state/{NAME}/bin/rgbcd", units / f"sockets.target.wants/{NAME}.socket"):
             if not os.path.lexists(expected):
                 raise AssertionError(f"bootstrap did not create {expected}")
-        log = (home / "stubs/log").read_text()
-        if f"enable --now {NAME}.service" in log or f"start {NAME}.service" in log:
-            raise AssertionError("bootstrap must activate only the socket, never the service")
+        # try-restart is fine: it only restarts a service that is already running.
+        for line in (home / "stubs/log").read_text().splitlines():
+            words = line.split()
+            if f"{NAME}.service" in words and {"enable", "start", "restart"} & set(words):
+                raise AssertionError(f"bootstrap must activate only the socket, never the service: {line}")
 
         run(["bash", str(plugin / "uninstall.sh")], env)
         after = snapshot(home)

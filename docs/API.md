@@ -23,7 +23,9 @@ Request:
 {"v": 1, "id": 7, "op": "sensors", "params": {}}
 ```
 
-`id` is a positive integer chosen by the client and echoed back. Unknown
+`id` is an integer from 1 to 9007199254740991 (2^53 - 1, exact in JSON and
+QML) chosen by the client and echoed back; anything else is `bad_request`
+with `id: null`. Unknown
 fields are ignored; wrong types are `bad_request`.
 
 Responses:
@@ -50,7 +52,7 @@ Events (only on a subscribed connection; no `id`):
 |---|---|---|
 | `hello` | — | `{"version": "0.1.0", "api": 1, "demo": false}` |
 | `status` | — | `{"engines": [Engine], "uptime_s": 12}` |
-| `sensors` | — | `{"sensors": [Sensor], "primary": "<sensor id or empty>"}` |
+| `sensors` | — | `{"sensors": [Sensor], "primary": "<sensor id or empty>"}`; reads hwmon on request (results younger than 500 ms are reused), so it never needs a subscription |
 | `devices` | — | `{"devices": [Device]}` |
 | `subscribe` | `{"topics": ["sensors", "devices"], "interval_ms": 2000}` | `{}`; `interval_ms` is clamped to 500–10000 |
 | `unsubscribe` | — | `{}` |
