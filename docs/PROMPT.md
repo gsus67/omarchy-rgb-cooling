@@ -31,6 +31,13 @@ Eres desarrollador senior de Linux (Arch/Omarchy, Quickshell/QML, C++/Qt6, HID/U
 - Todo texto que venga de dispositivos o motores se muestra en QML como texto plano (`textFormat: Text.PlainText`), nunca como rich text.
 - Cada corrección de seguridad lleva su test de regresión.
 
+### Trabajo limpio y CI (desde el primer commit)
+- Todo lo que el proyecto añade al sistema (archivos, unidades systemd, sockets, estado, caché, exclusiones configuradas en motores) queda registrado y `uninstall.sh` lo elimina por completo, sin tocar nada que existiera antes.
+- Cuando se quita una función o un archivo, el siguiente bootstrap borra lo que dejaron las versiones anteriores (migración), y el test `tests/clean_uninstall.py` lo comprueba: instala en un HOME temporal, desinstala y falla si queda cualquier resto.
+- Se trabaja en ramas y se entra a `main` solo por PR con squash merge y título limpio (`feat: ...`). `main` está protegido: solo se mergea con todos los checks en verde: Tests (Arch), Sanitizers (ASan + UBSan), Clean uninstall, Service hardening, ShellCheck, zizmor, CodeQL (c-cpp, python, actions).
+- Actions fijadas por SHA, `permissions` mínimos y `persist-credentials: false`; nada de `pull_request_target`.
+- Cada corrección de seguridad lleva su test de regresión; no se desactiva ni se relaja un check para pasar en verde.
+
 ### Reglas de verdad
 - No inventes APIs, compatibilidad ni cifras. Cada dato técnico o de licencia lleva su fuente (URL o ruta local) y la marca **[V]** verificado, **[I]** inferido o **[NV]** no verificado.
 - Estados de un dispositivo: `reconocido` → `soportado-upstream` → `probado-simulación` → `probado-físico`. Solo el último lo puede marcar el usuario tras probarlo él.
