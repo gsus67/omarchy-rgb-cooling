@@ -18,6 +18,11 @@ def packet(device, command, payload=b""):
     return b"ORGB" + struct.pack("<III", device, command, len(payload)) + payload
 
 
+def signal_update(device, reason, description):
+    body = word(reason) + description
+    return packet(device, 1150, word(len(body) + 4) + body)
+
+
 def mode(name="Static", *, flags=16 | 32 | 256, brightness=75, colors=None,
          minimum=10, maximum=90, color_mode=1, colors_min=1, colors_max=4,
          speed_min=0, speed_max=0, speed=0, value=0):
@@ -167,12 +172,13 @@ def apply_leds(descriptor, payload, version=6):
 
 class OpenRgbServer:
     def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False,
-                 listener=None, device_ids=None, defer_listen=False):
+                 listener=None, device_ids=None, defer_listen=False, updates="before"):
         self.behavior = behavior
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
         self.device_ids = device_ids
         self.fragment = fragment
+        self.updates = updates
         self.respond = threading.Event()
         self.respond.set()
         self.commands = []
@@ -225,6 +231,7 @@ class OpenRgbServer:
             self.disconnected.clear()
             client.settimeout(0.1)
             data = b""
+            updates = []
             try:
                 while not self.stop_event.is_set():
                     try:
@@ -281,6 +288,9 @@ class OpenRgbServer:
                             self.send(packet(device, 1, self.descriptors[ids.index(device)]))
                             if self.advertised >= 6:
                                 self.send(packet(device, 10, word(1) + word(0)))
+                            for update in updates:
+                                self.send(update)
+                            updates.clear()
                             self.ready.set()
                         elif command in (1101, 1050, 1102):
                             ids = self.device_ids or list(range(len(self.descriptors)))
@@ -309,6 +319,15 @@ class OpenRgbServer:
                             if self.advertised >= 6 and (command != 1050
                                     or self.behavior != "missing_led_ack"):
                                 self.send(packet(device, 10, ack))
+                            if self.advertised >= 6 and not rejected and not ignored:
+                                reason = {1050: 0, 1101: 1, 1102: 2}[command]
+                                description = (payload[4:] if command == 1050
+                                               else self.descriptors[index])
+                                update = signal_update(device, reason, description)
+                                if self.updates == "after":
+                                    updates.append(update)
+                                elif self.updates == "before":
+                                    self.send(update)
                         else:
                             raise ValueError("Unexpected write or engine command")
             except (OSError, ValueError):

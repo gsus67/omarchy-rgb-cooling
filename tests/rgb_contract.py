@@ -8,7 +8,8 @@ import struct
 import subprocess
 import tempfile
 
-from fakes.openrgb import OpenRgbServer, controller, mode, mode_bytes, string, word
+from fakes.openrgb import (OpenRgbServer, controller, mode, mode_bytes, packet,
+                           signal_update, string, word)
 from fakes.usb import UsbTree, rule
 
 
@@ -175,6 +176,106 @@ class OpenRgbContractMixin:
         self.assertEqual(current["result"], result["result"])
         self.assertFalse(any(packet in (1050, 1051, 1100, 1102)
                              for _, packet, _ in self.fake.commands))
+
+    def assert_write_preserves_real_inventory(self, operation):
+        self.launch(updates="after", device_ids=[42], descriptors=[controller(active=1)])
+        before = self.devices("devices.rescan")
+        self.assertEqual(len(before), 1)
+        device = before[0]
+        self.assertTrue(device["writable"], device)
+        self.assertTrue(device["id"].startswith("openrgb:"))
+        self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 500})
+        self.devices()  # Apply the subscription on the worker before writing.
+        self.client.event("devices")
+        self.client.events.clear()
+        params = {"brightness": 100} if operation == "lighting.set" else {}
+        reply = self.client.request(operation, {"device": device["id"], **params})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.devices(), before)
+        with self.daemon.client() as other:
+            self.assertEqual(other.request("devices")["result"]["devices"], before)
+        self.assertEqual(self.client.event("devices")["data"]["devices"], before)
+        self.advance(0.5)
+        self.assertEqual(self.client.event("devices")["data"]["devices"], before)
+        self.assertEqual(self.fake.accepted, 1)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+
+    def test_rescan_set_preserves_real_inventory_across_connections_and_events(self):
+        self.assert_write_preserves_real_inventory("lighting.set")
+
+    def test_rescan_save_preserves_real_inventory_across_connections_and_events(self):
+        self.assert_write_preserves_real_inventory("lighting.save")
+
+    def test_new_connection_reuses_completed_openrgb_inventory(self):
+        self.launch()
+        before = self.devices("devices.rescan")
+        self.assertTrue(before[0]["writable"], before)
+        self.client.close()
+        with self.daemon.client() as other:
+            self.assertEqual(other.request("devices")["result"]["devices"], before)
+        self.assertEqual(self.fake.accepted, 1)
+
+    def test_transport_failure_keeps_identity_and_next_write_reconnects(self):
+        self.launch(device_ids=[42])
+        before = self.devices("devices.rescan")
+        device = before[0]
+        self.fake.send(packet(42, 1150, word(8)))  # Missing update reason.
+        self.core.wait_until(lambda: self.client.request("status")["result"]["engines"][0][
+            "state"] == "unreachable", message="invalid notification rejected")
+        cached = self.devices()
+        self.assertEqual([item["id"] for item in cached], [device["id"]])
+        self.assertFalse(cached[0]["writable"])
+        with self.daemon.client() as other:
+            self.assertEqual(other.request("devices")["result"]["devices"], cached)
+        self.fake.respond.clear()
+        self.addCleanup(self.fake.respond.set)
+        self.client.send({"v": 1, "id": 77, "op": "lighting.set",
+                          "params": {"device": device["id"], "brightness": 100}})
+        self.core.wait_until(lambda: self.fake.accepted == 2, message="SDK reconnect")
+        self.client.request("subscribe", {"topics": ["devices"]})
+        self.assertEqual(self.client.event("devices")["data"]["devices"], cached)
+        self.fake.respond.set()
+        result = self.read_response(self.client, 77)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"]["device"], device["id"])
+        self.assertEqual(self.devices(), before)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+
+    def test_failed_reconnect_keeps_identity_without_retrying_in_a_loop(self):
+        self.launch()
+        device = self.devices("devices.rescan")[0]
+        self.fake.behavior = "magic"
+        self.advance(2.01)
+        cached = self.devices("devices.rescan")
+        self.assertEqual([item["id"] for item in cached], [device["id"]])
+        self.assertFalse(cached[0]["writable"])
+        result = self.set_color(device)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"]["code"], "unavailable")
+        self.assertEqual(self.fake.accepted, 3)
+        self.assertEqual(self.devices(), cached)
+        self.assertEqual(self.writes(), [])
+
+    def test_signal_updates_are_validated_and_never_introduce_a_controller(self):
+        self.launch(device_ids=[42])
+        before = self.devices()
+        # A notification alone cannot turn an unenumerated descriptor into a device.
+        self.fake.send(signal_update(99, 1, controller(name="Unenumerated")))
+        self.assertEqual(self.devices(), before)
+        malformed = [word(8), word(10) + word(0) + b"\0\0extra",
+                     word(10) + word(0) + b"\xff\xff",
+                     word(9) + word(1) + b"x",
+                     signal_update(42, 1, controller(name="Changed identity"))[16:]]
+        for payload in malformed:
+            with self.subTest(payload=payload[:16]):
+                self.fake.send(packet(42, 1150, payload))
+                self.core.wait_until(lambda: self.client.request("status")["result"][
+                    "engines"][0]["state"] == "unreachable",
+                    message="malformed SIGNALUPDATE rejected")
+                self.assertEqual(self.devices()[0]["id"], before[0]["id"])
+                self.assertFalse(self.devices()[0]["writable"])
+                self.advance(2.01)
+                self.assertEqual(self.devices("devices.rescan"), before)
 
     def test_mode_specific_color_and_emulated_brightness(self):
         static = mode(flags=64 | 256, color_mode=2, minimum=0, maximum=0,
