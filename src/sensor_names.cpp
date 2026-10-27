@@ -72,8 +72,9 @@ QString SensorNames::device(const QString &hwmonName, const QString &parentPath,
     if (hwmon.startsWith("iwlwifi") || module.startsWith("iwlwifi")) {
         return "Wi-Fi";
     }
-    if (startsWithAny(module, {"r8169", "igc", "e1000e", "e1000", "atlantic", "alx",
-                               "igb", "ixgbe", "r8152", "tg3", "bnx2"})
+    const QStringList ethernetDrivers = {"r8169", "igc", "e1000e", "e1000", "atlantic",
+                                         "alx", "igb", "ixgbe", "r8152", "tg3", "bnx2"};
+    if (startsWithAny(hwmon, ethernetDrivers) || startsWithAny(module, ethernetDrivers)
         || parentPath.contains("/net/")) {
         return "Ethernet";
     }

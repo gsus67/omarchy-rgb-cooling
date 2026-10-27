@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "selftest.hpp"
 #include "demo.hpp"
+#include "fan_headers.hpp"
 #include "hwmon.hpp"
 #include "openrgb.hpp"
 #include "protocol.hpp"
@@ -239,6 +240,11 @@ void testSensorNames(Checks &checks)
                   && SensorNames::device("r8169", "", "", "") == "Ethernet"
                   && SensorNames::device("acpitz", "", "", "") == "ACPI",
                   "storage, memory, network and ACPI names follow the contract");
+    checks.verify(SensorNames::device("r8169_0_600:00", "platform/mdio_bus", "mdio_bus", "")
+                  == "Ethernet"
+                  && SensorNames::device("igc_0", "", "other_driver", "") == "Ethernet"
+                  && SensorNames::device("other", "platform/net/eth0", "", "") == "Ethernet",
+                  "Ethernet names match hwmon prefixes or network parents");
     bool motherboard = true;
     for (const auto &name : {"nct6683", "nct6687", "nct6775", "nct6779", "it87", "it8689"}) {
         motherboard = motherboard && SensorNames::device(name, "", "", "") == "Motherboard"
@@ -254,6 +260,38 @@ void testSensorNames(Checks &checks)
                   "sensor labels use hwmon labels or human channel names");
 }
 
+void testRamNames(Checks &checks)
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.path() + "/class/hwmon";
+    auto add = [&](const QString &number, const QString &address, const QString &value) {
+        const QString parent = temporary.path() + "/devices/platform/i2c-8/8-" + address;
+        const QString node = parent + "/hwmon/" + number;
+        QDir().mkpath(node);
+        QDir().mkpath(root);
+        QFile name(node + "/name");
+        name.open(QIODevice::WriteOnly);
+        name.write("spd5118\n");
+        QFile input(node + "/temp1_input");
+        input.open(QIODevice::WriteOnly);
+        input.write(value.toUtf8() + "\n");
+        return QFile::link(node, root + "/" + number);
+    };
+    const bool created = add("hwmon1", "0053", "43000")
+        && add("hwmon2", "0051", "42000");
+    Hwmon hwmon(root);
+    hwmon.sample(500);
+    const auto sensors = hwmon.snapshot(500).value("sensors").toArray();
+    QMap<QString, QString> labels;
+    for (const auto &value : sensors) {
+        const auto sensor = value.toObject();
+        labels.insert(sensor.value("id").toString(), sensor.value("label").toString());
+    }
+    checks.verify(created && labels.value("spd5118:platform/i2c-8/8-0051:temp1") == "DIMM 1"
+                  && labels.value("spd5118:platform/i2c-8/8-0053:temp1") == "DIMM 2",
+                  "RAM labels follow numeric I2C bus and address order");
+}
+
 void testDemo(Checks &checks)
 {
     DemoAdapter demo;
@@ -263,16 +301,61 @@ void testDemo(Checks &checks)
     checks.verify(!demo.setLighting("missing", "#123456", 10).ok(),
                   "missing demo device is unavailable");
 }
+
+void testFanHeaders(Checks &checks, const QString &dataDirectory)
+{
+    const QByteArray valid = R"({"version":1,"entries":[{
+        "chip":"nct6687","dmi_vendor":"MSI","dmi_boards":["MS-7D98"],
+        "status":"user-verified","headers":{"fan5":"SYS_FAN3"}}]})";
+    checks.verify(FanHeaders::validate(valid), "fan headers accept the v1 schema");
+    bool rejected = true;
+    for (const auto &invalid : {QByteArray("[]"), QByteArray("{"), QByteArray("\xff"),
+                                QByteArray(FanHeaders::MaximumBytes + 1, ' ')}) {
+        rejected = rejected && !FanHeaders::validate(invalid);
+    }
+    for (const auto &field : {"chip", "dmi_vendor", "dmi_boards", "status", "headers",
+                              "verified", "sources"}) {
+        auto table = QJsonDocument::fromJson(valid).object();
+        auto entry = table.value("entries").toArray().first().toObject();
+        entry.insert(field, true);
+        table.insert("entries", QJsonArray{entry});
+        rejected = rejected && !FanHeaders::validate(QJsonDocument(table).toJson());
+    }
+    for (const auto &name : {"sys_fan3", "<b>CPU</b>", "CPU_FAN1\n", "", "ABCDEFGHIJKLMNOPQ"}) {
+        auto invalid = valid;
+        // Replace a whole JSON string so escaped newlines also reach the validator.
+        const auto quoted = QJsonDocument(QJsonArray{name}).toJson(QJsonDocument::Compact);
+        invalid.replace("\"SYS_FAN3\"", quoted.sliced(1).chopped(1));
+        rejected = rejected && !FanHeaders::validate(invalid);
+    }
+    checks.verify(rejected, "fan headers reject invalid types, names, UTF-8 and oversized JSON");
+    quint32 seed = 0xabcdef;
+    for (int index = 0; index < 1000; ++index) {
+        seed = seed * 1664525U + 1013904223U;
+        auto mutated = valid;
+        mutated[seed % static_cast<quint32>(mutated.size())] = static_cast<char>(seed >> 24);
+        FanHeaders::validate(mutated);
+    }
+    checks.verify(true, "fan headers malformed-input sanitizer corpus completed");
+    if (!dataDirectory.isEmpty()) {
+        QFile file(QDir(dataDirectory).filePath("fan-headers.json"));
+        checks.verify(file.open(QIODevice::ReadOnly)
+                      && FanHeaders::validate(file.read(FanHeaders::MaximumBytes + 1)),
+                      "repository fan-headers.json passes the runtime schema");
+    }
+}
 } // namespace
 
-int runSelfTests()
+int runSelfTests(const QString &dataDirectory)
 {
     Checks checks;
     testProtocol(checks);
     testSdk(checks);
     testSensorNames(checks);
+    testRamNames(checks);
     testHwmon(checks);
     testDemo(checks);
+    testFanHeaders(checks, dataDirectory);
     checks.verify(!Server::peerAllowed(-1, ::getuid()), "SO_PEERCRED rejects invalid descriptors");
     QTextStream(stdout) << "Self-tests: " << checks.failures << " failures\n";
     return checks.failures == 0 ? 0 : 1;

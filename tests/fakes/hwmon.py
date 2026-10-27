@@ -32,6 +32,11 @@ class HwmonTree:
         (self.root / number).symlink_to(node, target_is_directory=True)
         return node
 
+    def add_mdio_ethernet(self, number="hwmon30"):
+        return self.add(number, "r8169_0_600:00", "platform/mdio_bus/0/0-0000:00:00.0", {
+            "temp1_input": "47000",
+        })
+
     def snapshot(self):
         return {str(path.relative_to(self.directory)): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in self.directory.rglob("*") if path.is_file()}

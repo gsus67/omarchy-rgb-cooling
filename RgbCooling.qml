@@ -275,6 +275,57 @@ Panel {
     onTriggered: if (!socket.connected && root.coreError === "") socket.connected = true
   }
 
+  // ---- user sensor names ---------------------------------------------------
+  // Stored by the panel only (docs/API.md, "User fan names"); rgbcd stays read-only.
+
+  readonly property string labelsPath: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy-rgb-cooling/labels.json"
+  readonly property int maxLabel: 32
+  property var userLabels: ({})
+  property string renamingId: ""
+
+  function displayLabel(s) {
+    var custom = userLabels[s.id]
+    return typeof custom === "string" && custom !== "" ? custom : String(s.label || s.id)
+  }
+
+  function cleanLabel(text) {
+    // Plain text only: drop control characters and keep it short.
+    return String(text).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, maxLabel)
+  }
+
+  function loadLabels(text) {
+    var parsed = null
+    try { parsed = JSON.parse(text) } catch (e) {}
+    var labels = {}
+    if (parsed && parsed.v === 1 && parsed.labels && typeof parsed.labels === "object") {
+      for (var id in parsed.labels) {
+        var name = cleanLabel(parsed.labels[id])
+        if (typeof parsed.labels[id] === "string" && name !== "") labels[id] = name
+      }
+    }
+    userLabels = labels
+  }
+
+  function renameSensor(id, text) {
+    var labels = {}
+    for (var key in userLabels) labels[key] = userLabels[key]
+    var name = cleanLabel(text)
+    if (name === "") delete labels[id]
+    else labels[id] = name
+    userLabels = labels
+    renamingId = ""
+    labelsFile.setText(JSON.stringify({ v: 1, labels: labels }, null, 2) + "\n")
+  }
+
+  FileView {
+    id: labelsFile
+    path: root.labelsPath
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadLabels(text())
+    onLoadFailed: root.userLabels = ({})
+  }
+
   // ---- modes (power profiles) --------------------------------------------
   // The modes change how much heat the CPU makes; the BIOS fan curves react.
 
@@ -422,6 +473,8 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Typed keys go to the rename field while it is open.
+      blocked: root.renamingId !== ""
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -440,11 +493,20 @@ Panel {
         anchors.fill: parent
         clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-        ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        // Always visible when there is more to see, in its own gutter at the
+        // right edge so it never covers the values.
+        readonly property bool overflowing: panelColumn.implicitHeight > height
+        ScrollBar.vertical: ScrollBar {
+          parent: scrollArea
+          anchors.top: scrollArea.top
+          anchors.right: scrollArea.right
+          anchors.bottom: scrollArea.bottom
+          policy: scrollArea.overflowing ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+        }
 
         Column {
           id: panelColumn
-          width: scrollArea.availableWidth
+          width: scrollArea.availableWidth - (scrollArea.overflowing ? scrollArea.ScrollBar.vertical.width + Style.space(8) : 0)
           spacing: Style.space(14)
 
           // Hero
@@ -570,17 +632,38 @@ Panel {
                   width: panelColumn.width
                   implicitHeight: sensorLabel.implicitHeight
 
+                  readonly property bool renaming: root.renamingId === modelData.id
+
                   MouseArea {
                     anchors.fill: parent
-                    enabled: modelData.summary === true
-                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-                    onClicked: root.coresExpanded = !root.coresExpanded
+                    enabled: !parent.renaming
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    cursorShape: modelData.summary === true ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: function(mouse) {
+                      if (mouse.button === Qt.RightButton && modelData.summary !== true) root.renamingId = modelData.id
+                      else if (modelData.summary === true) root.coresExpanded = !root.coresExpanded
+                    }
+                  }
+
+                  TextField {
+                    visible: parent.renaming
+                    anchors.left: parent.left
+                    anchors.right: sensorValue.left
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    foreground: root.bar.foreground
+                    maximumLength: root.maxLabel
+                    placeholderText: String(modelData.label || modelData.id)
+                    onVisibleChanged: if (visible) { text = root.displayLabel(modelData); forceActiveFocus(); selectAll() }
+                    onAccepted: root.renameSensor(modelData.id, text)
+                    Keys.onEscapePressed: root.renamingId = ""
                   }
 
                   Text {
                     id: sensorLabel
+                    visible: !parent.renaming
                     textFormat: Text.PlainText
-                    text: String(modelData.label || modelData.id)
+                    text: root.displayLabel(modelData)
                     color: root.bar.foreground
                     opacity: modelData.stale ? 0.5 : 1
                     font.family: root.bar.fontFamily
@@ -607,6 +690,17 @@ Panel {
                 }
               }
             }
+          }
+
+          Text {
+            visible: root.sensorGroups.length > 0
+            textFormat: Text.PlainText
+            text: root.t("Right-click a sensor to rename it.")
+            color: Qt.darker(root.bar.foreground, 1.6)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.Wrap
+            width: parent.width
           }
 
           // Lighting

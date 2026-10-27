@@ -113,7 +113,8 @@ def build(source, output, *, tools=None, tests=False, sanitize=False):
                 environment = os.environ.copy()
                 environment["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1:abort_on_error=1"
                 environment["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
-                print(run(str(candidate), "--self-test", env=environment), end="")
+                print(run(str(candidate), "--self-test", "--data-dir", str(source / "data"),
+                          env=environment), end="")
             binary = output / "rgbcd"
             candidate.replace(binary)
         return binary

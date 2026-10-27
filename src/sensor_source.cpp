@@ -2,10 +2,18 @@
 #include "sensor_source.hpp"
 #include <utility>
 
-SensorSource::SensorSource(const QString &root) : worker(new QObject), hwmon(root)
+SensorSource::SensorSource(const QString &root, const QString &dataDirectory,
+                           const QString &dmiRoot, bool demo)
+    : worker(new QObject), hwmon(root)
 {
     worker->moveToThread(&thread);
     connect(&thread, &QThread::finished, worker, &QObject::deleteLater);
+    if (!demo) {
+        // Queued before any sample: one startup read without blocking the API event loop.
+        QMetaObject::invokeMethod(worker, [this, dataDirectory, dmiRoot] {
+            hwmon.loadFanHeaders(dataDirectory, dmiRoot);
+        }, Qt::QueuedConnection);
+    }
     thread.start();
 }
 

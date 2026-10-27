@@ -19,7 +19,7 @@ PLACEHOLDER = "@RGB CD BINARY@"
 
 
 def quote(value):
-    """Quote a literal systemd executable path, including specifier escaping."""
+    """Quote a literal systemd argument, including specifier escaping."""
     value = str(value)
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("Installation paths must not contain control characters")
@@ -130,7 +130,8 @@ def install(source, state, config, entries):
         if suffix == "service":
             if content.count(PLACEHOLDER) != 1:
                 raise ValueError("Service template must contain exactly one executable placeholder")
-            content = content.replace(PLACEHOLDER, quote(binary))
+            command = quote(binary) + " --data-dir " + quote(source / "data")
+            content = content.replace(PLACEHOLDER, command)
         entries.add(str(destination))
         if not destination.is_file() or destination.read_text(encoding="utf-8") != content:
             atomic_write(destination, content)
