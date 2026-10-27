@@ -63,16 +63,38 @@ Panel {
     return null
   }
   readonly property bool hot: primarySensor !== null && primarySensor.value !== null && primarySensor.value >= hotCelsius
+  // Fans seen spinning since the panel loaded; one that stops again stays
+  // visible (and urgent) instead of hiding with the unused headers.
+  property var spunFans: ({})
+  // The CPU shows its hottest core; clicking that row lists every core.
+  property bool coresExpanded: false
+  function isCore(s) { return /CPU$/.test(String(s.device || "")) && /^Core \d+$/.test(String(s.label || "")) }
   readonly property var sensorGroups: {
-    var groups = [], index = {}
+    var groups = [], index = {}, hottest = {}
     for (var i = 0; i < sensors.length; i++) {
       var s = sensors[i]
       var key = String(s.device || "")
       if (index[key] === undefined) { index[key] = groups.length; groups.push({ device: key, sensors: [] }) }
+      if (isCore(s)) {
+        // Per-core rows are summarised as the hottest core, listed after it when expanded.
+        if (s.value !== null && (hottest[key] === undefined || s.value > hottest[key].value)) hottest[key] = s
+        if (!coresExpanded) continue
+      }
+      if (s.kind === "fan" && key === "Motherboard" && !(s.value > 0) && !spunFans[s.id]) continue
       groups[index[key]].sensors.push(s)
+    }
+    for (var device in hottest) {
+      var h = hottest[device]
+      var list = groups[index[device]].sensors
+      var first = 0
+      while (first < list.length && !isCore(list[first])) first++
+      list.splice(first, 0, { id: h.id + ":max", label: t("Hottest core") + (coresExpanded ? " ▾" : " ▸"),
+                              device: device, kind: "temp", value: h.value, unit: "C",
+                              stale: h.stale, summary: true })
     }
     return groups
   }
+  function stoppedFan(s) { return s.kind === "fan" && !(s.value > 0) && spunFans[s.id] === true }
   readonly property var lightingDevices: {
     var list = []
     for (var i = 0; i < devices.length; i++) {
@@ -150,6 +172,7 @@ Panel {
       var data = message.data || ({})
       if (message.event === "sensors") applySensors(data)
       else if (message.event === "devices") applyDevices(data)
+      else if (message.event === "profile") applyProfile(data)
       return
     }
     var callback = pending[message.id]
@@ -160,6 +183,11 @@ Panel {
 
   function applySensors(data) {
     sensors = Array.isArray(data.sensors) ? data.sensors : []
+    var spun = spunFans, changed = false
+    for (var i = 0; i < sensors.length; i++) {
+      if (sensors[i].kind === "fan" && sensors[i].value > 0 && !spun[sensors[i].id]) { spun[sensors[i].id] = true; changed = true }
+    }
+    if (changed) spunFans = spun
     primaryId = typeof data.primary === "string" ? data.primary : ""
   }
 
@@ -174,7 +202,7 @@ Panel {
   function subscribe() {
     // The bar only needs the headline temperature; refresh faster while open,
     // and follow device hotplug only while the panel shows the device list.
-    send("subscribe", { topics: opened ? ["sensors", "devices"] : ["sensors"], interval_ms: opened ? 2000 : 5000 })
+    send("subscribe", { topics: opened ? ["sensors", "devices", "profile"] : ["sensors"], interval_ms: opened ? 2000 : 5000 })
   }
 
   function onConnected() {
@@ -187,7 +215,7 @@ Panel {
       coreReady = true
       send("sensors", {}, function(ok, r) { if (ok) applySensors(r) })
       subscribe()
-      if (opened) scan()
+      if (opened) { scan(); refreshProfile() }
     })
   }
 
@@ -217,7 +245,7 @@ Panel {
   onOpenedChanged: {
     if (!coreReady) return
     subscribe()
-    if (opened) scan()
+    if (opened) { scan(); refreshProfile() }
   }
 
   Process {
@@ -245,6 +273,42 @@ Panel {
     id: reconnectTimer
     repeat: false
     onTriggered: if (!socket.connected && root.coreError === "") socket.connected = true
+  }
+
+  // ---- modes (power profiles) --------------------------------------------
+  // The modes change how much heat the CPU makes; the BIOS fan curves react.
+
+  property string profile: ""
+  property var profilesAvailable: []
+  property string profileError: ""
+  readonly property var modes: {
+    var all = [
+      { value: "power-saver", label: t("Silent") },
+      { value: "balanced", label: t("Balanced") },
+      { value: "performance", label: t("Turbo") }
+    ]
+    return all.filter(function(m) { return profilesAvailable.indexOf(m.value) >= 0 })
+  }
+
+  function applyProfile(data) {
+    profile = typeof data.profile === "string" ? data.profile : ""
+    profilesAvailable = Array.isArray(data.available) ? data.available : []
+  }
+
+  function refreshProfile() {
+    send("profile.get", {}, function(ok, r) {
+      if (ok) { root.applyProfile(r); root.profileError = "" }
+      else { root.profilesAvailable = []; root.profileError = String(r.message || "") }
+    })
+  }
+
+  function setProfile(value) {
+    if (value === profile || profilesAvailable.indexOf(value) < 0) return
+    profile = value
+    send("profile.set", { profile: value }, function(ok, r) {
+      if (ok) { root.applyProfile(r); root.profileError = "" }
+      else { root.profileError = String(r.message || ""); root.refreshProfile() }
+    })
   }
 
   // ---- lighting -----------------------------------------------------------
@@ -295,6 +359,7 @@ Panel {
 
   readonly property var visibleSections: {
     var list = []
+    if (modes.length > 0) list.push("modes")
     if (lightingDevices.length > 0) list.push("devices")
     if (canWrite) list.push("colors")
     if (hasBrightness) list.push("brightness")
@@ -320,11 +385,13 @@ Panel {
     selectedIndex = focusSection === "brightness" ? -1 : (dy < 0 && focusSection === "devices" ? lightingDevices.length - 1 : 0)
   }
   function moveCursorH(dx) {
-    if (focusSection === "colors") selectedIndex = Math.max(0, Math.min(swatches.length - 1, selectedIndex + dx))
+    if (focusSection === "modes") selectedIndex = Math.max(0, Math.min(modes.length - 1, selectedIndex + dx))
+    else if (focusSection === "colors") selectedIndex = Math.max(0, Math.min(swatches.length - 1, selectedIndex + dx))
     else if (focusSection === "brightness" && lighting !== null) setLighting("", Math.max(0, Math.min(100, lighting.brightness + dx * 5)))
   }
   function activateCursor() {
-    if (focusSection === "devices" && selectedIndex >= 0 && selectedIndex < lightingDevices.length) selectDevice(lightingDevices[selectedIndex].id)
+    if (focusSection === "modes" && selectedIndex >= 0 && selectedIndex < modes.length) setProfile(modes[selectedIndex].value)
+    else if (focusSection === "devices" && selectedIndex >= 0 && selectedIndex < lightingDevices.length) selectDevice(lightingDevices[selectedIndex].id)
     else if (focusSection === "colors" && selectedIndex >= 0 && selectedIndex < swatches.length) setLighting(swatches[selectedIndex].color, -1)
   }
 
@@ -350,7 +417,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(600))
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(820))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -362,7 +429,10 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onCloseRequested: root.close()
-      onTextKey: function(key) { if (key === "s") root.scan() }
+      onTextKey: function(key) {
+        if (key === "s") root.scan()
+        else if (key === "c") root.coresExpanded = !root.coresExpanded
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       ScrollView {
@@ -426,6 +496,44 @@ Panel {
             }
           }
 
+          // Modes
+          Column {
+            visible: root.coreReady && root.modes.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSeparator { foreground: root.bar.foreground }
+
+            PanelSectionHeader {
+              text: root.t("MODE")
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            ButtonGroup {
+              width: parent.width
+              options: root.modes
+              value: root.profile
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              cursorIndex: root.cursorActive && root.focusSection === "modes" ? root.selectedIndex : -1
+              onChanged: function(v) { root.setProfile(v) }
+              onHovered: function(index, isHovered) {
+                if (isHovered) { root.cursorActive = true; root.focusSection = "modes"; root.selectedIndex = index }
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.profileError !== "" ? root.profileError : root.t("Fans follow your BIOS curves.")
+              color: root.profileError !== "" ? Commons.Color.urgent : Qt.darker(root.bar.foreground, 1.4)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+              width: parent.width
+            }
+          }
+
           Text {
             visible: root.coreError !== ""
             textFormat: Text.PlainText
@@ -462,6 +570,13 @@ Panel {
                   width: panelColumn.width
                   implicitHeight: sensorLabel.implicitHeight
 
+                  MouseArea {
+                    anchors.fill: parent
+                    enabled: modelData.summary === true
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.coresExpanded = !root.coresExpanded
+                  }
+
                   Text {
                     id: sensorLabel
                     textFormat: Text.PlainText
@@ -472,7 +587,7 @@ Panel {
                     font.pixelSize: Style.font.body
                     elide: Text.ElideRight
                     anchors.left: parent.left
-                    anchors.leftMargin: Style.space(6)
+                    anchors.leftMargin: root.isCore(modelData) ? Style.space(18) : Style.space(6)
                     anchors.right: sensorValue.left
                     anchors.rightMargin: Style.space(10)
                   }
@@ -481,7 +596,7 @@ Panel {
                     id: sensorValue
                     textFormat: Text.PlainText
                     text: root.formatValue(modelData)
-                    color: modelData.kind === "temp" && modelData.value !== null && modelData.value >= root.hotCelsius ? Commons.Color.urgent : Qt.darker(root.bar.foreground, 1.2)
+                    color: (modelData.kind === "temp" && modelData.value !== null && modelData.value >= root.hotCelsius) || root.stoppedFan(modelData) ? Commons.Color.urgent : Qt.darker(root.bar.foreground, 1.2)
                     opacity: modelData.stale ? 0.5 : 1
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.body

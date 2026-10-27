@@ -5,6 +5,7 @@
 #include "demo.hpp"
 #include "hotplug.hpp"
 #include "listener.hpp"
+#include "power_profiles.hpp"
 #include "sensor_source.hpp"
 #include <QElapsedTimer>
 #include <QSet>
@@ -25,6 +26,7 @@ private:
     Listener socket;
     bool demo;
     SensorSource sensorSource;
+    PowerProfiles powerProfiles;
     std::unique_ptr<LightingAdapter> adapter;
     std::unique_ptr<Hotplug> hotplug;
     QSet<Connection *> clients;
@@ -41,6 +43,7 @@ private:
     void subscriptionsChanged();
     void tick();
     void devicesChanged();
+    void profileChanged(const QJsonObject &data);
     void scheduleEvents();
     void readSensors(SensorSource::Callback ready);
 };

@@ -29,7 +29,7 @@ bool integer(const QJsonValue &value)
 }
 
 namespace {
-enum class Type { Device, Color, Brightness, Topics, Interval };
+enum class Type { Device, Color, Brightness, Topics, Interval, Profile };
 struct Field {
     const char *name;
     Type type;
@@ -39,6 +39,9 @@ struct Field {
 bool matches(const QJsonValue &value, Type type)
 {
     switch (type) {
+    case Type::Profile:
+        return value.isString() && (value == "power-saver" || value == "balanced"
+                                    || value == "performance");
     case Type::Device:
         return value.isString() && !value.toString().isEmpty();
     case Type::Color: {
@@ -52,7 +55,8 @@ bool matches(const QJsonValue &value, Type type)
             return false;
         }
         for (const auto &topic : value.toArray()) {
-            if (!topic.isString() || (topic != "sensors" && topic != "devices")) {
+            if (!topic.isString() || (topic != "sensors" && topic != "devices"
+                                      && topic != "profile")) {
                 return false;
             }
         }
@@ -68,7 +72,8 @@ Reply validate(const QString &operation, const QJsonObject &params)
     // Closed operation set with an explicit parameter schema for every operation.
     static const QMap<QString, QList<Field>> schemas{
         {"hello", {}}, {"status", {}}, {"sensors", {}}, {"devices", {}},
-        {"unsubscribe", {}}, {"devices.rescan", {}},
+        {"unsubscribe", {}}, {"devices.rescan", {}}, {"profile.get", {}},
+        {"profile.set", {{"profile", Type::Profile}}},
         {"subscribe", {{"topics", Type::Topics}, {"interval_ms", Type::Interval, false}}},
         {"lighting.get", {{"device", Type::Device}}},
         {"lighting.set", {{"device", Type::Device}, {"color", Type::Color},
