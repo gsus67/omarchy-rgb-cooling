@@ -4,8 +4,42 @@
 #include <QtEndian>
 #include <algorithm>
 
+bool OpenRgbWorker::signalUpdate(quint32 device, const QByteArray &payload) const
+{
+    // Protocol 6 sends these asynchronously, including after a write's readback.
+    // They are notifications, not replies or acknowledgements: validate them but
+    // keep explicit descriptor reads authoritative for lighting and write checks.
+    SdkReader reader(payload);
+    if (reader.u32() != quint32(payload.size())) {
+        return false;
+    }
+    const auto reason = reader.u32();
+    if (!reader.valid()) {
+        return false;
+    }
+    if (reason == 0) { // UPDATELEDS carries only a colour buffer.
+        const auto count = reader.u16();
+        return count <= 4096 && reader.skip(qsizetype(count) * 4) && reader.done();
+    }
+    SdkController controller;
+    if (!SdkController::decode(payload.mid(8), version, controller)) {
+        return false;
+    }
+    const auto &knownControllers = scanning ? pendingControllers : controllers;
+    for (const auto &known : knownControllers) {
+        if (known.index == device) {
+            return controller.device.value("id") == known.device.value("id");
+        }
+    }
+    // A notification can race enumeration; it must never add a controller.
+    return true;
+}
+
 bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &payload)
 {
+    if (version >= 6 && command == 1150) {
+        return signalUpdate(device, payload);
+    }
     if (version >= 6 && command == 51 && device == 0 && !payload.isEmpty()
         && payload.size() <= 4096) {
         const auto encoded = sdkHalf(payload.size()) + payload;
@@ -147,10 +181,10 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         }
         return true;
     }
-    if (controllers.contains(id)) {
+    if (pendingControllers.contains(id)) {
         return false;
     }
-    controllers.insert(id, controller);
+    pendingControllers.insert(id, controller);
     if (++index == count) {
         publish();
     } else {

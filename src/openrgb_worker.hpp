@@ -51,6 +51,7 @@ private:
     QMap<QString, QElapsedTimer> lastSave;
     bool saving = false;
     QMap<QString, SdkController> controllers;
+    QMap<QString, SdkController> pendingControllers;
     QMap<QString, QJsonObject> inventory;
     QString reading;
     bool scanning = false, writing = false, idleStopped = false;
@@ -62,6 +63,7 @@ private:
     void send(quint32 device, quint32 command, const QByteArray &payload = {});
     void receive();
     bool packet(quint32 device, quint32 command, const QByteArray &payload);
+    bool signalUpdate(quint32 device, const QByteArray &payload) const;
     void fail(const QString &message);
     void publish();
     void gates();

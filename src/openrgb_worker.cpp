@@ -115,7 +115,19 @@ void OpenRgbWorker::next()
         return;
     }
     if (idleStopped) {
+        request.join = true;
         scan();
+        return;
+    }
+    if (phase == Phase::Disconnected && !controllers.isEmpty() && !usb.enabled.isEmpty()) {
+        // A transport failure does not erase physical identity. Reconnect before
+        // checking the cached write gate, then use the newly validated descriptor.
+        if (request.join) {
+            finish(Protocol::Reply::failure("unavailable", reason));
+        } else {
+            request.join = true;
+            scan();
+        }
         return;
     }
     unit.activity();
@@ -156,7 +168,7 @@ void OpenRgbWorker::scan()
     phase = Phase::Disconnected;
     socket.abort();
     input.clear();
-    controllers.clear();
+    pendingControllers.clear();
     controllerIds.clear();
     acknowledgements.clear();
     awaitingWriteAck = false;
@@ -164,10 +176,12 @@ void OpenRgbWorker::scan()
     writtenMode = -1;
     saving = false;
     usb = UsbDevices::scan(root, rules);
-    inventory = usb.candidates;
+    if (controllers.isEmpty()) {
+        inventory = usb.candidates;
+    }
     updateSaved();
     QSet<QString> allowed;
-    for (const auto &device : inventory) {
+    for (const auto &device : usb.candidates) {
         if (device.value("enabled").toBool()) {
             allowed.insert(device.value("usb").toString());
         }
@@ -185,6 +199,8 @@ void OpenRgbWorker::scan()
             return;
         }
         if (allowed.isEmpty()) {
+            controllers.clear();
+            inventory = usb.candidates;
             state = "absent";
             reason = usb.valid ? "No enabled USB HID candidates"
                                : "Invalid devices.json; writes disabled";
@@ -305,8 +321,19 @@ void OpenRgbWorker::fail(const QString &message)
     socket.abort();
     timeout.stop();
     input.clear();
-    controllers.clear();
-    inventory = usb.candidates;
+    pendingControllers.clear();
+    // Keep the last complete inventory across transport failures. A controller
+    // already supplied by OpenRGB must not turn back into its USB candidate.
+    if (controllers.isEmpty()) {
+        inventory = usb.candidates;
+    }
+    for (auto &device : inventory) {
+        if (device.value("writable").toBool()) {
+            device.insert("writable", false);
+            device.insert("blocked_reason", message);
+            device.insert("capabilities", QJsonArray{"lighting.read"});
+        }
+    }
     writtenColor.clear();
     writtenMode = -1;
     saving = false;
@@ -324,6 +351,8 @@ void OpenRgbWorker::fail(const QString &message)
 void OpenRgbWorker::publish()
 {
     timeout.stop();
+    controllers = std::move(pendingControllers);
+    pendingControllers.clear();
     scanning = false;
     phase = Phase::Idle;
     gates();
