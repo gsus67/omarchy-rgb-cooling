@@ -110,6 +110,73 @@ shown as plain text. bootstrap creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
 with `0700` permissions (it is user data, so it is not in the ledger);
 `uninstall.sh --purge` removes it. rgbcd stays read-only.
 
+### Engines (install from the panel)
+
+The panel's Engines tab installs or removes an engine with one button. Only a
+closed list is supported; today that is `openrgb` (Arch package `openrgb`,
+needed for RGB on supported boards). The panel never builds commands itself: it
+runs `bin/omarchy-rgb-engines` with fixed arguments.
+
+`bin/omarchy-rgb-engines <command>` (Python stdlib, runs as the user) prints one
+JSON line:
+
+| command | effect |
+|---|---|
+| `status` | `{"engines": [{"id": "openrgb", "installed": bool, "installed_by_plugin": bool, "version": "", "size": "9.5 MiB", "purpose": "..."}]}` |
+| `install openrgb` | records which packages are new (`pacman -S --print --needed`), then `pkexec /usr/bin/pacman -S --needed --noconfirm openrgb`; marks it `installed_by_plugin` only if it was not installed before |
+| `uninstall openrgb` | only if `installed_by_plugin`: `pkexec /usr/bin/pacman -Rns --noconfirm openrgb` (removes its dependencies only when nothing else needs them); otherwise refuses |
+| `uninstall-all` | uninstalls every engine the plugin installed; used by `uninstall.sh` |
+
+The record lives in `$XDG_STATE_HOME/omarchy-rgb-cooling/engines.json`
+(`{"v": 1, "engines": {"openrgb": {"installed_by_plugin": true, "packages": [...],
+"new_dependencies": [...], "installed_at": "..."}}}`, mode `0600`). A cancelled
+or failed `pkexec` changes nothing and reports `{"ok": false, "error": ...}`.
+`uninstall.sh` runs `uninstall-all` before deleting the state directory; if the
+user cancels, it prints the exact manual command and continues.
+
+### OpenRGB, sandboxed and on demand
+
+rgbcd never runs OpenRGB itself. bootstrap installs a second user unit,
+`omarchy-rgb-cooling-openrgb.service` (in the ledger), whose `ExecStart` runs
+`bin/omarchy-rgb-openrgb`. That launcher:
+
+- reads the devices the user enabled (below) and resolves each to its current
+  `/dev/hidrawN` through sysfs (USB vendor, product and serial);
+- refuses `0416:5302` and any device that is not a USB HID node;
+- starts `/usr/bin/openrgb --server --server-host 127.0.0.1 --server-port 6742
+  --noautoconnect --config $XDG_STATE_HOME/omarchy-rgb-cooling/openrgb` inside
+  `bwrap`, with a minimal `/dev` that contains only those hidraw nodes (no I²C,
+  no other HID devices), read-only `/usr`, `/etc`, `/sys`, `/run/udev`, its own
+  config directory writable, network shared (loopback only);
+- exits with an error if `bwrap` or `openrgb` is missing or nothing is enabled.
+
+Scanning without any enabled device starts the launcher in discovery mode,
+which exposes every USB HID node whose VID:PID OpenRGB's packaged udev rules
+list, except `0416:5302`, so the user can see what can be enabled. Discovery
+never writes: rgbcd sends no write packets while no device is enabled.
+
+rgbcd starts the unit through the systemd user manager on D-Bus
+(`StartUnit`) only when a scan or lighting operation needs OpenRGB, and stops
+it (`StopUnit`) after 120 s without lighting activity or panel subscribers. No
+polling, no retries.
+
+### Enabling RGB control per device
+
+Writes are off until the user enables a device in the panel and confirms a
+warning. The UI stores the choice in
+`$XDG_CONFIG_HOME/omarchy-rgb-cooling/devices.json` as
+`{"v": 1, "enabled": {"usb:1462:7d98:<serial>": true}}`. rgbcd only reads it.
+A device record gains `usb` (`usb:VID:PID:SERIAL` from the hidraw node OpenRGB
+reports, empty when unknown) and `enabled`.
+
+A device is `writable` only when all of these hold: it is enabled, its `usb`
+identity is known and unique, it is not `0416:5302`, OpenRGB runs through the
+plugin's own unit, and it has a `Static` mode with a mode-specific or per-LED
+colour. `lighting.set` then sends `UPDATEMODE` with that `Static` mode and the
+colour; brightness uses the mode's own range when it has one, otherwise the
+colour is scaled and `brightness_emulated` is true. rgbcd never sends
+`SAVEMODE`, `SETCUSTOMMODE` to other modes, zone resizes or per-LED effects.
+
 ### Engine scans (no background polling)
 
 rgbcd never polls engines on its own. An engine is contacted only by:
