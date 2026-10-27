@@ -150,10 +150,14 @@ rgbcd never runs OpenRGB itself. bootstrap installs a second user unit,
   config directory writable, network shared (loopback only);
 - exits with an error if `bwrap` or `openrgb` is missing or nothing is enabled.
 
-Scanning without any enabled device starts the launcher in discovery mode,
-which exposes every USB HID node whose VID:PID OpenRGB's packaged udev rules
-list, except `0416:5302`, so the user can see what can be enabled. Discovery
-never writes: rgbcd sends no write packets while no device is enabled.
+Discovery never runs OpenRGB, because some OpenRGB detectors send
+initialisation commands to a device as soon as they open it. Instead rgbcd
+lists **candidates**: connected USB HID devices whose `VID:PID` appears in
+OpenRGB's packaged udev rules (`/usr/lib/udev/rules.d/60-openrgb.rules`, read
+once per scan), never `0416:5302`. Candidates appear in `devices` with
+`engine: "openrgb"`, `support: "recognized"`, `enabled: false`,
+`writable: false` and the name from the rules comment or `VID:PID`. OpenRGB
+only starts once at least one device is enabled, and it sees only those.
 
 rgbcd starts the unit through the systemd user manager on D-Bus
 (`StartUnit`) only when a scan or lighting operation needs OpenRGB, and stops
