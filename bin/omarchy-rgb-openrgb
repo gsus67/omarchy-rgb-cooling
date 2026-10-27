@@ -3,16 +3,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import os
-import shutil
 import sys
 
 sys.dont_write_bytecode = True
 from rgb_common import enabled_devices, hidraw_devices, xdg
 
 
+# Fixed system paths: a program found through PATH could be a user-writable
+# impostor of the sandbox or the engine.
+BWRAP = "/usr/bin/bwrap"
+OPENRGB = "/usr/bin/openrgb"
+
+
 def command(root):
-    for program in ("bwrap", "openrgb"):
-        if shutil.which(program) is None:
+    for program in (BWRAP, OPENRGB):
+        if not os.access(program, os.X_OK):
             raise ValueError(f"{program} is required; install it before enabling RGB control")
     enabled = enabled_devices()
     if any(key.startswith("usb:0416:5302:") for key in enabled):
@@ -28,7 +33,7 @@ def command(root):
         raise ValueError("No enabled, uniquely identified USB HID devices are connected")
     config = xdg("XDG_STATE_HOME", ".local/state") / "openrgb"
     config.mkdir(mode=0o700, parents=True, exist_ok=True)
-    args = [shutil.which("bwrap"), "--unshare-all", "--share-net", "--die-with-parent",
+    args = [BWRAP, "--unshare-all", "--share-net", "--die-with-parent",
             "--new-session"]
     for path in ("/usr", "/etc", "/sys", "/run/udev"):
         args += ["--ro-bind", path, path]
@@ -39,7 +44,7 @@ def command(root):
         args += ["--dev-bind", node, node]
     args += ["--tmpfs", "/tmp", "--bind", str(config), str(config),
              "--setenv", "QT_QPA_PLATFORM", "offscreen", "--setenv", "HOME", str(config),
-             "/usr/bin/openrgb", "--server", "--server-host", "127.0.0.1", "--server-port",
+             OPENRGB, "--server", "--server-host", "127.0.0.1", "--server-port",
              "6742", "--noautoconnect", "--config", str(config), "--loglevel", "warning"]
     return args
 

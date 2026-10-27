@@ -7,11 +7,31 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import types
+from unittest import mock
 
 from fakes.usb import UsbTree
 
 REPO = Path(__file__).resolve().parents[1]
 
+
+
+def load_launcher():
+    """Import bin/omarchy-rgb-openrgb (no .py suffix) as a fresh module."""
+    path = REPO / "bin/omarchy-rgb-openrgb"
+    loader = importlib.machinery.SourceFileLoader("omarchy_rgb_openrgb", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO / "bin"))
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.path.remove(str(REPO / "bin"))
+    return module
 
 class Helpers(unittest.TestCase):
     def setUp(self):
@@ -163,17 +183,35 @@ else:
         self.assertIn("NoNewPrivileges=yes", content)
         self.assertIn("PrivateTmp=no", content)
         self.assertIn("ProtectSystem=strict", content)
-        for args in (["verify"], ["--offline=yes", "security", "--threshold=30"]):
+        # bwrap rules out PrivateTmp/ProtectHostname/ProtectKernelLogs (see the unit).
+        for args in (["verify"], ["--offline=yes", "security", "--threshold=32"]):
             result = subprocess.run(["systemd-analyze", "--user", *args, str(unit)],
                                     capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def launcher(self, *, success=True):
-        result = subprocess.run([sys.executable, str(REPO / "bin/omarchy-rgb-openrgb"),
-                                 "--sys-root", str(self.usb.root)], env=self.env,
-                                capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
-        return result
+        """Run the launcher in-process with its fixed binaries pointed at test stubs.
+
+        The launcher has no way to change BWRAP/OPENRGB from outside (no PATH
+        lookup, no environment override); only the test swaps the module
+        constants, and os.execv is captured instead of replacing the process.
+        """
+        module = load_launcher()
+        module.BWRAP = str(self.stubs / "bwrap")
+        module.OPENRGB = str(self.stubs / "openrgb")
+        executed = []
+        stderr = io.StringIO()
+        environment = {key: value for key, value in self.env.items()}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(module.os, "execv", lambda path, argv: executed.append(argv)), \
+                mock.patch.object(sys, "argv", ["omarchy-rgb-openrgb", "--sys-root",
+                                                str(self.usb.root)]), \
+                contextlib.redirect_stderr(stderr):
+            code = module.main()
+        self.assertEqual(code or 0, 0 if success else 1, stderr.getvalue())
+        if executed:
+            (self.home / "bwrap.json").write_text(json.dumps(executed[0][1:]))
+        return types.SimpleNamespace(stderr=stderr.getvalue(), argv=executed)
 
     def prepare_launcher(self, enabled):
         self.usb = UsbTree(self.home / "sys")
@@ -202,9 +240,17 @@ Path(os.environ['RGB_TEST_HOME'], 'bwrap.json').write_text(json.dumps(sys.argv[1
         args += ["--proc", "/proc", "--dev", "/dev", "--dev-bind", "/dev/hidraw9",
                  "/dev/hidraw9", "--tmpfs", "/tmp", "--bind", config, config,
                  "--setenv", "QT_QPA_PLATFORM", "offscreen", "--setenv", "HOME", config,
-                 "/usr/bin/openrgb", "--server", "--server-host", "127.0.0.1", "--server-port",
+                 str(self.stubs / "openrgb"), "--server", "--server-host", "127.0.0.1",
+                 "--server-port",
                  "6742", "--noautoconnect", "--config", config, "--loglevel", "warning"]
         self.assertEqual(json.loads((self.home / "bwrap.json").read_text()), args)
+
+    def test_launcher_binaries_are_fixed_system_paths(self):
+        # Regression: resolving bwrap/openrgb through PATH let an impostor run.
+        module = load_launcher()
+        self.assertEqual(module.BWRAP, "/usr/bin/bwrap")
+        self.assertEqual(module.OPENRGB, "/usr/bin/openrgb")
+        self.assertNotIn("shutil.which", (REPO / "bin/omarchy-rgb-openrgb").read_text())
 
     def test_launcher_rejects_trofeo_even_if_explicitly_enabled(self):
         self.prepare_launcher({"usb:0416:5302:trofeo": True})
@@ -226,7 +272,7 @@ Path(os.environ['RGB_TEST_HOME'], 'bwrap.json').write_text(json.dumps(sys.argv[1
         for name in ("bwrap", "openrgb"):
             path = self.stubs / name
             path.rename(path.with_suffix(".hidden"))
-            self.assertIn(f"{name} is required", self.launcher(success=False).stderr)
+            self.assertIn(f"{path} is required", self.launcher(success=False).stderr)
             path.with_suffix(".hidden").rename(path)
 
     def test_launcher_allows_multiple_interfaces_of_the_same_physical_usb(self):

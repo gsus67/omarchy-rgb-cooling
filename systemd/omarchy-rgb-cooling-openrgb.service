@@ -9,6 +9,9 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=@OPENRGB CONFIG@
+# Exposure is 3.1 (CI allows 3.2 for this unit only). Tested on the real
+# OpenRGB: PrivateTmp, ProtectHostname, ProtectKernelLogs (bwrap cannot mount
+# its /proc) and AF_INET-only (OpenRGB crashes) all break it.
 # bwrap builds its own /tmp and minimal /dev, and needs the host hidraw sources.
 PrivateTmp=no
 PrivateDevices=no
@@ -27,8 +30,8 @@ ProtectHostname=no
 ProtectProc=invisible
 ProcSubset=pid
 RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
-IPAddressDeny=any
-IPAddressAllow=localhost
+# IPAddressDeny/Allow are not applied to user units; the launcher binds OpenRGB
+# to 127.0.0.1 and rgbcd only connects to numeric loopback.
 SystemCallFilter=@system-service @mount
 SystemCallFilter=~@resources @reboot @swap @debug @cpu-emulation @obsolete
 SystemCallErrorNumber=EPERM
