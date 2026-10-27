@@ -17,6 +17,7 @@ Panel {
   moduleName: "io.github.gsus67.omarchy-rgb-cooling"
   ipcTarget: "omarchy-rgb-cooling"
   implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
 
   readonly property string pluginDirectory: decodeURIComponent(String(Qt.resolvedUrl("bootstrap.py")).replace(/^file:\/\//, "")).replace(/\/bootstrap\.py$/, "")
   readonly property string socketPath: (Quickshell.env("XDG_RUNTIME_DIR") || "") + "/omarchy-rgb-cooling.sock"
