@@ -4,6 +4,7 @@
 #include "fan_headers.hpp"
 #include "hwmon.hpp"
 #include "openrgb.hpp"
+#include "sdk_mode.hpp"
 #include "protocol.hpp"
 #include "sdk_reader.hpp"
 #include "server.hpp"
@@ -154,6 +155,41 @@ void testSdk(Checks &checks)
                       && excluded.value("capabilities").toArray().isEmpty()
                       && noLighting.isEmpty(), "0416:5302 exclusion has no lighting capabilities");
     }
+    SdkMode staticMode;
+    staticMode.name = "Static";
+    staticMode.flags = 16 | 32 | 256;
+    staticMode.brightnessMin = 10;
+    staticMode.brightnessMax = 90;
+    staticMode.brightness = 50;
+    staticMode.colorMode = 1;
+    staticMode.colors = {0x332211};
+    QByteArray modern = word(0) + text("Fake RGB") + text("Vendor") + text("USB")
+        + text("1") + text("serial") + text("HID: /dev/hidraw9");
+    modern += halfWord(1) + word(0) + staticMode.encode();
+    modern += halfWord(0); // No zones.
+    modern += halfWord(1) + text("LED"); // Protocol 6 omits led.value too.
+    modern += halfWord(1) + word(0x332211);
+    modern += halfWord(0) + word(0) + text("") + word(3) + QByteArray("{}\0", 3);
+    modern.prepend(word(modern.size() + 4));
+    SdkController decoded;
+    checks.verify(SdkController::decode(modern, 6, decoded) && decoded.staticMode() == 0
+                  && decoded.lighting().value("brightness").toInt() == 50,
+                  "SDK v6 exact Static flags and native brightness decode");
+    bool modernBounds = true;
+    for (qsizetype length = 0; length < modern.size(); ++length) {
+        modernBounds = modernBounds
+            && !SdkController::decode(modern.first(length), 6, decoded);
+    }
+    checks.verify(modernBounds && !SdkController::decode(modern + 'x', 6, decoded),
+                  "SDK v6 rejects every truncated descriptor and trailing bytes");
+    quint32 modernSeed = 0x197912;
+    for (int i = 0; i < 4000; ++i) {
+        modernSeed = modernSeed * 1664525U + 1013904223U;
+        auto mutated = modern;
+        mutated[modernSeed % mutated.size()] = static_cast<char>(modernSeed >> 24);
+        SdkController::decode(mutated, 6, decoded);
+    }
+    checks.verify(true, "SDK v6 malformed-input sanitizer corpus completed");
     quint32 seed = 0x12345678;
     for (int index = 0; index < 4000; ++index) {
         seed = seed * 1664525U + 1013904223U;

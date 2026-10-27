@@ -8,12 +8,17 @@ view RGB device status, and select **Silent**, **Balanced** or **Turbo** through
 continues to control fan curves. Motherboard fan names are shown only when an
 exact-board entry is verified in [`data/fan-headers.json`](data/fan-headers.json).
 
-RGB is read-only for now; writes stay blocked until verified.
+RGB: install the engine your hardware needs from the panel's **Engines** tab
+(one button, your password through the Omarchy dialog), then enable each device
+in the **Lighting** tab. Only a static colour and brightness are sent, nothing
+is saved to the device, and OpenRGB runs sandboxed seeing only the devices you
+enabled.
 
 ## Scope
 
 - Reads hwmon temperatures and fan RPM as the logged-in user.
-- Does not write PWM or hardware registers, install packages, or run as root.
+- Does not write PWM or hardware registers and never runs as root. Packages
+  are installed only from the Engines tab, from a closed list, with your password.
 - Uses a socket-activated `systemd --user` core. `power-profiles-daemon` is
   optional; power modes are unavailable without it.
 
@@ -24,6 +29,7 @@ RGB is read-only for now; writes stay blocked until verified.
   (`Qt6Core`, `Qt6Network`, `Qt6DBus`, and `libudev`).
 - A working `systemd --user` session.
 - Optional: `power-profiles-daemon` for Silent, Balanced, and Turbo.
+- For RGB: `bubblewrap` (sandbox) and OpenRGB, installable from the Engines tab.
 
 These requirements were checked against Omarchy 4.0.6, Quickshell 0.3.2,
 Qt 6.12, GCC 16.2, and systemd-libs 262.1 on the reference system.
@@ -44,10 +50,11 @@ To remove it, run `uninstall.sh` from the installed plugin directory:
 bash ~/.config/omarchy/plugins/io.github.gsus67.omarchy-rgb-cooling/uninstall.sh
 ```
 
-This removes the plugin checkout, its user service/socket units and enablement,
-the built core and recorded state, and the runtime socket. It keeps user sensor
-labels in `$XDG_CONFIG_HOME/omarchy-rgb-cooling/`. Add `--purge` to remove that
-settings directory too. See [API and footprint](docs/API.md#footprint-what-the-plugin-adds-to-a-system).
+This removes the plugin checkout, its user units, the built core, its state,
+the runtime socket, your settings in `$XDG_CONFIG_HOME/omarchy-rgb-cooling/`
+(sensor names, enabled devices) and the engines it installed (it asks for your
+password; packages you had before are never removed). Add `--keep-settings` to
+keep your settings. See [API and footprint](docs/API.md#footprint-what-the-plugin-adds-to-a-system).
 
 ## Optional hardware setup
 
@@ -80,9 +87,14 @@ Reboot also clears a temporary load. Keep fan curves in BIOS; do not use
 
 ### RGB
 
-OpenRGB can optionally provide RGB device status through its network protocol.
-RGB writes are blocked pending hardware and mode verification. Install and run
-OpenRGB separately if desired; this plugin does not install or start it.
+The Engines tab installs OpenRGB (`openrgb`, about 10 MiB; Arch has no
+headless-only package, but the plugin only runs its server, never its window).
+OpenRGB starts only when an enabled device needs it, inside `bwrap` with access
+to nothing but those devices (no I²C/SMBus, no other HID devices), listening on
+127.0.0.1, and stops after two idle minutes. Devices are listed from OpenRGB's
+udev rules without running it, because some detectors initialise a device as
+soon as they open it. A Thermalright Trofeo (`0416:5302`, used by
+omarchy-trcc) is always excluded. Requires `bubblewrap`.
 
 ## Hardware support
 

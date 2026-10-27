@@ -47,6 +47,23 @@ if args and args[0] in ("enable", "disable"):
                 link.unlink()
 '''
 
+# pacman -Q answers "installed" for every package; pkexec logs the privileged
+# command and exits with PKEXEC_STATUS (126 = the user cancelled the dialog).
+PACMAN = r'''#!/usr/bin/env python3
+import os, sys
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write("pacman " + " ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:2] == ["-Q"]:
+    print(sys.argv[2] + " 1.1-1")
+'''
+
+PKEXEC = r'''#!/usr/bin/env python3
+import os, sys
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write("pkexec " + " ".join(sys.argv[1:]) + "\n")
+sys.exit(int(os.environ.get("PKEXEC_STATUS", "0")))
+'''
+
 OMARCHY = r'''#!/usr/bin/env python3
 import os, shutil, sys
 from pathlib import Path
@@ -81,7 +98,7 @@ def run(command, env, cwd=None):
     return result.stdout
 
 
-def scenario(name, prepare):
+def scenario(name, prepare, engines=None, pkexec_status=0, expect_log=(), forbid_log=()):
     with tempfile.TemporaryDirectory(prefix="rgbc-clean-") as home:
         home = Path(home)
         env = {
@@ -90,12 +107,14 @@ def scenario(name, prepare):
             "XDG_STATE_HOME": str(home / ".local/state"),
             "XDG_RUNTIME_DIR": str(home / "run"),
             "STUB_LOG": str(home / "stubs/log"),
+            "PKEXEC_STATUS": str(pkexec_status),
             "PATH": str(home / "stubs") + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
             "LANG": "C.UTF-8",
         }
         stubs = home / "stubs"
         stubs.mkdir()
-        for tool, source in (("systemctl", SYSTEMCTL), ("omarchy", OMARCHY)):
+        for tool, source in (("systemctl", SYSTEMCTL), ("omarchy", OMARCHY),
+                             ("pacman", PACMAN), ("pkexec", PKEXEC)):
             (stubs / tool).write_text(source)
             (stubs / tool).chmod(0o755)
         for directory in (".config/omarchy/plugins", ".local/state", "run"):
@@ -127,7 +146,19 @@ def scenario(name, prepare):
                 raise AssertionError(
                     f"bootstrap must activate only the socket, never the service: {line}")
 
+        if engines is not None:
+            # What the Engines tab leaves after installing an engine.
+            record = home / f".local/state/{NAME}/engines.json"
+            record.write_text(json.dumps({"v": 1, "engines": engines}))
+            record.chmod(0o600)
         run(["bash", str(plugin / "uninstall.sh")], env)
+        log = (home / "stubs/log").read_text()
+        for line in expect_log:
+            if line not in log:
+                raise AssertionError(f"{name}: expected '{line}' in:\n{log}")
+        for line in forbid_log:
+            if line in log:
+                raise AssertionError(f"{name}: unexpected '{line}' in:\n{log}")
         after = snapshot(home)
         added = sorted(set(after) - set(before))
         removed = sorted(set(before) - set(after))
@@ -151,9 +182,22 @@ def existing_units(home):
     (home / ".config/omarchy-rgb-cooling-unrelated").write_text("keep me\n")
 
 
+OPENRGB_BY_PLUGIN = {"openrgb": {"installed_by_plugin": True, "packages": ["openrgb"],
+                                  "new_dependencies": [], "installed_at": "2026-10-27T00:00:00"}}
+REMOVE_OPENRGB = "pkexec /usr/bin/pacman -Rns --noconfirm openrgb"
+
+
 def main():
-    scenario("fresh home", fresh)
-    scenario("home with its own user units", existing_units)
+    scenario("fresh home", fresh, forbid_log=("pkexec",))
+    scenario("home with its own user units", existing_units, forbid_log=("pkexec",))
+    scenario("engine installed by the plugin", fresh, engines=OPENRGB_BY_PLUGIN,
+             expect_log=(REMOVE_OPENRGB,))
+    # Cancelling the password dialog must not stop the rest of the cleanup.
+    scenario("engine removal cancelled", fresh, engines=OPENRGB_BY_PLUGIN, pkexec_status=126,
+             expect_log=(REMOVE_OPENRGB,))
+    preexisting = {"openrgb": dict(OPENRGB_BY_PLUGIN["openrgb"], installed_by_plugin=False)}
+    scenario("engine installed before the plugin", fresh, engines=preexisting,
+             forbid_log=("pkexec",))
 
 
 if __name__ == "__main__":

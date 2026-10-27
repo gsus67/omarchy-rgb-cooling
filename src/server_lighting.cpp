@@ -40,11 +40,13 @@ void Server::dispatchLighting(Connection *connection, const Protocol::Request &r
             }
         } else {
             auto *engine = static_cast<OpenRgbAdapter *>(adapter.get());
-            if (op == "devices.rescan") {
-                accepted = engine->rescan(std::move(ready));
-            } else {
-                engine->request(std::move(ready));
-            }
+            engine->perform(op, request.params,
+                [peer = QPointer(connection), id = request.id](const auto &result) {
+                    if (peer) {
+                        peer->send(Protocol::response(id, result));
+                    }
+                });
+            return;
         }
         if (accepted) {
             return;

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,19 @@ def systemctl(*arguments):
     native_build.run("systemctl", "--user", *arguments)
 
 
+def user_directory(path):
+    """Keep user data outside the ledger; never chmod a symlink or another owner's data."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        return
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        os.chmod(path, 0o700, follow_symlinks=False)
+
+
 def ensure(source):
     """Build under flock and activate only the socket when the installation changes."""
     source = Path(source).resolve()
@@ -123,8 +137,10 @@ def install(source, state, config, entries):
             os.replace(compiled, binary)
     unit_dir = config / "systemd/user"
     make_directory(unit_dir, entries)
-    for suffix in ("socket", "service"):
-        name = f"{NAME}.{suffix}"
+    user_directory(config / NAME)
+    for suffix in ("socket", "service", "openrgb.service"):
+        name = (f"{NAME}-openrgb.service" if suffix == "openrgb.service"
+                else f"{NAME}.{suffix}")
         destination = unit_dir / name
         content = (source / "systemd" / name).read_text(encoding="utf-8")
         if suffix == "service":
@@ -132,6 +148,12 @@ def install(source, state, config, entries):
                 raise ValueError("Service template must contain exactly one executable placeholder")
             command = quote(binary) + " --data-dir " + quote(source / "data")
             content = content.replace(PLACEHOLDER, command)
+        if suffix == "openrgb.service":
+            rgb_config = state / "openrgb"
+            make_directory(rgb_config, entries)
+            content = content.replace("@OPENRGB LAUNCHER@",
+                                      quote(source / "bin/omarchy-rgb-openrgb"))
+            content = content.replace("@OPENRGB CONFIG@", quote(rgb_config))
         entries.add(str(destination))
         if not destination.is_file() or destination.read_text(encoding="utf-8") != content:
             atomic_write(destination, content)

@@ -22,10 +22,15 @@ SANITIZE_FLAGS = (
 )
 
 
+# Generous enough for slow machines and CodeQL's build tracer, which made the
+# single compiler invocation exceed three minutes in CI.
+COMMAND_TIMEOUT = 900
+
+
 def run(*command, env=None, cwd=None):
     """Run an argument vector without a shell and report useful diagnostics."""
-    result = subprocess.run(command, capture_output=True, text=True, timeout=180,
-                            env=env, cwd=cwd)
+    result = subprocess.run(command, capture_output=True, text=True,
+                            timeout=COMMAND_TIMEOUT, env=env, cwd=cwd)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
         raise RuntimeError(f"{command[0]}: {detail[-8000:]}")

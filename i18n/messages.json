@@ -11,7 +11,6 @@
     "Could not prepare the core": "No se pudo preparar el núcleo",
     "Sensors": "Sensores",
     "LIGHTING": "ILUMINACIÓN",
-    "No lighting devices available.": "No hay dispositivos de iluminación disponibles.",
     "Recognized": "Reconocido",
     "Supported upstream": "Soportado por el proyecto original",
     "Tested in simulation": "Probado en simulación",
@@ -38,6 +37,24 @@
     "MODE": "MODO",
     "Fans follow your BIOS curves.": "Los ventiladores siguen las curvas de tu BIOS.",
     "Hottest core": "Núcleo más caliente",
-    "Right-click a sensor to rename it.": "Clic derecho en un sensor para renombrarlo."
+    "Right-click a sensor to rename it.": "Clic derecho en un sensor para renombrarlo.",
+    "Cooling": "Refrigeración",
+    "Lighting": "Iluminación",
+    "Engines": "Motores",
+    "Installing…": "Instalando…",
+    "Removing…": "Quitando…",
+    "The operation did not finish.": "La operación no terminó.",
+    "No lighting devices found. If you have RGB hardware, install its engine in the Engines tab.": "No se encontraron dispositivos de iluminación. Si tienes hardware RGB, instala su motor en la pestaña Motores.",
+    "Disable": "Desactivar",
+    "Enable": "Activar",
+    "To control RGB lighting the plugin needs an engine. Install only what your hardware needs; nothing else is added, and uninstalling the plugin removes it again.": "Para controlar la iluminación RGB el plugin necesita un motor. Instala solo lo que tu hardware necesita; no se añade nada más y al desinstalar el plugin se quita también.",
+    "Not installed": "No instalado",
+    "Installed by this plugin": "Instalado por este plugin",
+    "Installed before this plugin; it will not be removed": "Instalado antes que este plugin; no se quitará",
+    "Uninstall": "Desinstalar",
+    "Install": "Instalar",
+    "Let this plugin change the lighting of": "¿Permitir que este plugin cambie la iluminación de",
+    "Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.": "Solo se envían un color fijo y el brillo; no se guarda nada en el dispositivo y puedes desactivarlo aquí.",
+    "Cancel": "Cancelar"
   }
 }

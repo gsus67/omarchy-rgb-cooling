@@ -24,6 +24,9 @@ int main(int argc, char **argv)
     parser.addOption({"dmi-root", "Override the read-only DMI root for tests", "path",
                       "/sys/class/dmi/id"});
     parser.addOption({"data-dir", "Directory containing fan-headers.json", "path"});
+    parser.addOption({"sys-root", "Read-only sysfs root for RGB tests", "path", "/sys"});
+    parser.addOption({"openrgb-rules", "OpenRGB udev rules for tests", "path",
+                      "/usr/lib/udev/rules.d/60-openrgb.rules"});
     parser.addOption({"self-test", "Run native checks without real hardware"});
     parser.process(application);
     if (parser.isSet("self-test")) {
@@ -31,7 +34,8 @@ int main(int argc, char **argv)
     }
     QString error;
     Server server(parser.isSet("demo"), parser.value("hwmon-root"), parser.value("data-dir"),
-                  parser.value("dmi-root"));
+                  parser.value("dmi-root"), parser.value("sys-root"),
+                  parser.value("openrgb-rules"));
     bool listening = false;
     if (parser.isSet("listen")) {
         listening = server.listen(parser.value("listen"), error);

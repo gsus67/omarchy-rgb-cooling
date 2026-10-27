@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Manage the closed list of optional RGB engines without taking package ownership."""
+# SPDX-License-Identifier: GPL-3.0-or-later
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+from rgb_common import read_json, xdg
+
+ENGINES = {"openrgb": {"package": "openrgb", "size": "9.5 MiB",
+                       "purpose": "RGB control on supported USB HID devices"}}
+
+
+def run(arguments, *, check=True):
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=600)
+    if check and result.returncode:
+        raise ValueError(result.stderr.strip() or f"{arguments[0]} failed or was cancelled")
+    return result
+
+
+def installed(package):
+    result = run(["pacman", "-Q", package], check=False)
+    return result.returncode == 0, result.stdout.strip().partition(" ")[2]
+
+
+def record(path):
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        return {"v": 1, "engines": {}}
+    if (not isinstance(value, dict) or type(value.get("v")) is not int or value["v"] != 1
+            or not isinstance(value.get("engines"), dict)):
+        raise ValueError("Invalid engines.json schema")
+    for name, entry in value["engines"].items():
+        if name not in ENGINES or not isinstance(entry, dict):
+            raise ValueError("Invalid engines.json engine")
+        if type(entry.get("installed_by_plugin")) is not bool:
+            raise ValueError("Invalid engines.json ownership")
+        for field in ("packages", "new_dependencies"):
+            if (not isinstance(entry.get(field), list)
+                    or any(not isinstance(item, str) for item in entry[field])):
+                raise ValueError("Invalid engines.json package record")
+    return value
+
+
+def save(path, value):
+    descriptor, temporary = tempfile.mkstemp(prefix=".engines-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def status(value):
+    engines = []
+    for name, metadata in ENGINES.items():
+        present, version = installed(metadata["package"])
+        entry = value["engines"].get(name, {})
+        engines.append({"id": name, "installed": present, "version": version,
+                        "installed_by_plugin": entry.get("installed_by_plugin", False),
+                        "size": metadata["size"], "purpose": metadata["purpose"]})
+    return {"engines": engines}
+
+
+def install(path, value, name):
+    package = ENGINES[name]["package"]
+    present, _version = installed(package)
+    # Capture the transaction BEFORE elevating; this list is never a command argument.
+    planned = run(["pacman", "-S", "--print", "--print-format", "%n", "--needed", package])
+    packages = planned.stdout.splitlines()
+    run(["pkexec", "/usr/bin/pacman", "-S", "--needed", "--noconfirm", package])
+    if not present:
+        value["engines"][name] = {
+            **value["engines"].get(name, {}),
+            "installed_by_plugin": True, "packages": [package],
+            "new_dependencies": [item for item in packages if item != package],
+            "installed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        save(path, value)
+    return {"ok": True}
+
+
+def uninstall(path, value, name):
+    if not value["engines"].get(name, {}).get("installed_by_plugin", False):
+        raise ValueError(f"{name} was not installed by this plugin; refusing to remove it")
+    run(["pkexec", "/usr/bin/pacman", "-Rns", "--noconfirm", ENGINES[name]["package"]])
+    del value["engines"][name]
+    save(path, value)
+    return {"ok": True}
+
+
+def execute(arguments):
+    valid = (arguments in (["status"], ["uninstall-all"])
+             or len(arguments) == 2 and arguments[0] in ("install", "uninstall")
+             and arguments[1] in ENGINES)
+    if not valid:
+        raise ValueError("Usage: status | install openrgb | uninstall openrgb | uninstall-all")
+    state = xdg("XDG_STATE_HOME", ".local/state")
+    path = state / "engines.json"
+    if arguments == ["status"]:
+        return status(record(path))
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Lock the directory, leaving no extra persistent lock file.
+    descriptor = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        value = record(path)
+        if arguments[0] == "install":
+            return install(path, value, arguments[1])
+        if arguments[0] == "uninstall":
+            return uninstall(path, value, arguments[1])
+        for name in ENGINES:
+            if value["engines"].get(name, {}).get("installed_by_plugin", False):
+                uninstall(path, value, name)
+        return {"ok": True}
+    finally:
+        os.close(descriptor)
+
+
+def main():
+    try:
+        result = execute(sys.argv[1:])
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        result = {"ok": False, "error": str(error)}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

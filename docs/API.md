@@ -108,7 +108,83 @@ The panel can rename any sensor. Names are stored by the UI, not rgbcd, in
 `{"v": 1, "labels": {"<sensor id>": "<name>"}}`, at most 32 characters each,
 shown as plain text. bootstrap creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
 with `0700` permissions (it is user data, so it is not in the ledger);
-`uninstall.sh --purge` removes it. rgbcd stays read-only.
+`uninstall.sh` removes it unless `--keep-settings` is given. rgbcd stays read-only.
+
+### Engines (install from the panel)
+
+The panel's Engines tab installs or removes an engine with one button. Only a
+closed list is supported; today that is `openrgb` (Arch package `openrgb`,
+needed for RGB on supported boards). The panel never builds commands itself: it
+runs `bin/omarchy-rgb-engines` with fixed arguments.
+
+`bin/omarchy-rgb-engines <command>` (Python stdlib, runs as the user) prints one
+JSON line:
+
+| command | effect |
+|---|---|
+| `status` | `{"engines": [{"id": "openrgb", "installed": bool, "installed_by_plugin": bool, "version": "", "size": "9.5 MiB", "purpose": "..."}]}` |
+| `install openrgb` | records which packages are new (`pacman -S --print --needed`), then `pkexec /usr/bin/pacman -S --needed --noconfirm openrgb`; marks it `installed_by_plugin` only if it was not installed before |
+| `uninstall openrgb` | only if `installed_by_plugin`: `pkexec /usr/bin/pacman -Rns --noconfirm openrgb` (removes its dependencies only when nothing else needs them); otherwise refuses |
+| `uninstall-all` | uninstalls every engine the plugin installed; used by `uninstall.sh` |
+
+The record lives in `$XDG_STATE_HOME/omarchy-rgb-cooling/engines.json`
+(`{"v": 1, "engines": {"openrgb": {"installed_by_plugin": true, "packages": [...],
+"new_dependencies": [...], "installed_at": "..."}}}`, mode `0600`). A cancelled
+or failed `pkexec` changes nothing and reports `{"ok": false, "error": ...}`.
+`uninstall.sh` runs `uninstall-all` before deleting the state directory; if the
+user cancels, it prints the exact manual command and continues.
+
+### OpenRGB, sandboxed and on demand
+
+rgbcd never runs OpenRGB itself. bootstrap installs a second user unit,
+`omarchy-rgb-cooling-openrgb.service` (in the ledger), whose `ExecStart` runs
+`bin/omarchy-rgb-openrgb`. That launcher:
+
+- reads the devices the user enabled (below) and resolves each to its current
+  `/dev/hidrawN` through sysfs (USB vendor, product and serial);
+- refuses `0416:5302` and any device that is not a USB HID node;
+- starts `/usr/bin/openrgb --server --server-host 127.0.0.1 --server-port 6742
+  --noautoconnect --config $XDG_STATE_HOME/omarchy-rgb-cooling/openrgb` inside
+  `bwrap`, with a minimal `/dev` that contains only those hidraw nodes (no I²C,
+  no other HID devices), read-only `/usr`, `/etc`, `/sys`, `/run/udev`, its own
+  config directory writable, network shared (loopback only);
+- exits with an error if `bwrap` or `openrgb` is missing or nothing is enabled.
+
+Discovery never runs OpenRGB, because some OpenRGB detectors send
+initialisation commands to a device as soon as they open it. Instead rgbcd
+lists **candidates**: connected USB HID devices whose `VID:PID` appears in
+OpenRGB's packaged udev rules (`/usr/lib/udev/rules.d/60-openrgb.rules`, read
+once per scan), never `0416:5302`. Candidates appear in `devices` with
+`engine: "openrgb"`, `support: "recognized"`, `enabled: false`,
+`writable: false` and the name from the rules comment or `VID:PID`. OpenRGB
+only starts once at least one device is enabled, and it sees only those.
+
+rgbcd starts the unit through the systemd user manager on D-Bus
+(`StartUnit`) only when a scan or lighting operation needs OpenRGB, and stops
+it (`StopUnit`) after 120 s without lighting activity or panel subscribers. No
+polling, no retries.
+
+### Enabling RGB control per device
+
+Writes are off until the user enables a device in the panel and confirms a
+warning. The UI stores the choice in
+`$XDG_CONFIG_HOME/omarchy-rgb-cooling/devices.json` as
+`{"v": 1, "enabled": {"usb:1462:7d98:<serial>": true}}`. rgbcd only reads it.
+A device record gains `usb` (`usb:VID:PID:SERIAL` from the hidraw node OpenRGB
+reports, empty when unknown) and `enabled`.
+
+A device is `writable` only when all of these hold: it is enabled, its `usb`
+identity is known and unique, it is not `0416:5302`, OpenRGB runs through the
+plugin's own unit, and it has a `Static` mode with a mode-specific or per-LED
+colour. `lighting.set` then sends `UPDATEMODE` with that `Static` mode and the
+colour; brightness uses the mode's own range when it has one, otherwise the
+colour is scaled and `brightness_emulated` is true. When the `Static` mode
+uses per-LED colours (`MODE_COLORS_PER_LED`, as on MSI Mystic Light), the
+colour is applied with `UPDATELEDS` carrying the **same** colour for every LED
+of that controller, right after `UPDATEMODE` selects `Static`; with
+mode-specific colours it travels inside `UPDATEMODE`. rgbcd never sends
+`SAVEMODE`, `SETCUSTOMMODE`, `UPDATEZONELEDS`, zone resizes, or LED buffers
+with different colours, and re-reads the controller to confirm the change.
 
 ### Engine scans (no background polling)
 
@@ -186,12 +262,14 @@ It runs `systemctl --user daemon-reload` and `enable --now omarchy-rgb-cooling.s
 (never the service). It prints one JSON line: `{"ok": true}` or
 `{"ok": false, "error": "<plain text>"}`.
 
-`uninstall.sh` stops and disables the socket and service, removes every path
-in the ledger plus the fixed list above, removes the plugin through
-`omarchy plugin remove`, and removes `$XDG_STATE_HOME/omarchy-rgb-cooling`
-and the runtime socket. `uninstall.sh --purge` also removes
-`$XDG_CONFIG_HOME/omarchy-rgb-cooling` (user settings). Nothing outside these
-paths is touched, and nothing needs `sudo`.
+`uninstall.sh` stops the units, removes the engines the plugin installed
+(`bin/omarchy-rgb-engines uninstall-all`, which asks for the password through
+pkexec), removes the plugin through `omarchy plugin remove`, every path in the
+ledger plus the fixed list above, `$XDG_STATE_HOME/omarchy-rgb-cooling`, the
+runtime socket and the user settings in `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
+(sensor names, enabled devices). `uninstall.sh --keep-settings` keeps those
+settings. Nothing outside these paths is touched, and only the engines step
+needs a password.
 
 Tests drive `bootstrap.py` and `uninstall.sh` in a throwaway `HOME` with stub
 `systemctl` and `omarchy` executables first on `PATH`.

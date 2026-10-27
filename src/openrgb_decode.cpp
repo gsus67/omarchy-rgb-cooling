@@ -1,128 +1,167 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "openrgb.hpp"
-#include "sdk_reader.hpp"
+#include "sdk_mode.hpp"
 #include <QCryptographicHash>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QRegularExpression>
 
 namespace {
-constexpr quint32 MaxPacket = 1024 * 1024;
-} // namespace
-
-const QString OpenRgbAdapter::WriteGate = QStringLiteral(
-    "Hardware writes are blocked: persistent identity, single ownership, "
-    "engine Trofeo exclusions and exact device/mode support are not verified");
-const QString OpenRgbAdapter::TrofeoGate = QStringLiteral(
-    "0416:5302 is reserved exclusively for omarchy-trcc");
-
-bool OpenRgbAdapter::decodeController(const QByteArray &payload, unsigned version,
-                                     QJsonObject &device, QJsonObject &lighting)
+bool matrix(SdkReader &reader)
 {
-    device = {};
-    lighting = {};
-    if (version > 1 || payload.size() > MaxPacket) {
+    const auto bytes = reader.u16();
+    if (!bytes) {
+        return reader.valid();
+    }
+    const quint64 height = reader.u32();
+    const quint64 width = reader.u32();
+    return height * width <= 4096 && bytes == 8 + height * width * 4
+        && reader.skip(height * width * 4);
+}
+
+bool zone(SdkReader &reader, unsigned version)
+{
+    reader.string();
+    reader.u32();
+    reader.u32();
+    reader.u32();
+    if (reader.u32() > 4096 || !matrix(reader)) {
+        return false;
+    }
+    const auto segments = version >= 4 ? reader.u16() : 0;
+    if (segments > 4096) {
+        return false;
+    }
+    for (int i = 0; i < segments; ++i) {
+        reader.string();
+        reader.skip(12);
+        if (version >= 6) {
+            if (!matrix(reader)) {
+                return false;
+            }
+            reader.u32();
+        }
+    }
+    if (version >= 5) {
+        reader.u32();
+    }
+    if (version >= 6) {
+        const auto active = reader.u32();
+        const auto count = reader.u16();
+        if (count > 256 || (count && active >= count)) {
+            return false;
+        }
+        for (int i = 0; i < count; ++i) {
+            SdkMode mode;
+            if (!SdkMode::decode(reader, version, mode)) {
+                return false;
+            }
+        }
+        reader.string();
+    }
+    return reader.valid();
+}
+}
+
+bool SdkController::decode(const QByteArray &payload, unsigned version, SdkController &out)
+{
+    out = {};
+    out.version = version;
+    if (version > 6 || payload.size() > 1024 * 1024) {
         return false;
     }
     SdkReader reader(payload);
     if (reader.u32() != payload.size()) {
         return false;
     }
-    reader.u32(); // Device type is presentation metadata, never a write gate.
-    const QString name = reader.string();
-    const QString vendor = version >= 1 ? reader.string() : QString();
-    const QString description = reader.string();
-    reader.string(); // Firmware version may change without changing physical identity.
-    const QString serial = reader.string();
-    const QString location = reader.string();
+    reader.u32();
+    const auto name = reader.string();
+    const auto vendor = version >= 1 ? reader.string() : QString();
+    const auto description = reader.string();
+    reader.string();
+    const auto serial = reader.string();
+    out.location = reader.string();
     const auto modes = reader.u16();
-    const auto activeMode = reader.u32();
-    if (modes > 256 || (modes > 0 && activeMode >= modes)) {
+    out.active = reader.u32();
+    if (modes > 256 || (modes && out.active >= modes)) {
         return false;
     }
-    for (unsigned index = 0; index < modes; ++index) {
-        reader.string();
-        // v0/v1: value, flags, speed/color limits, speed, direction and color mode.
-        reader.skip(9 * 4);
-        const auto count = reader.u16();
-        if (count > 4096 || !reader.skip(qsizetype(count) * 4)) {
+    for (int i = 0; i < modes; ++i) {
+        SdkMode mode;
+        if (!SdkMode::decode(reader, version, mode)) {
             return false;
         }
+        out.modes.append(mode);
     }
     const auto zones = reader.u16();
     if (zones > 256) {
         return false;
     }
-    for (unsigned index = 0; index < zones; ++index) {
-        reader.string();
-        reader.u32(); // Zone type.
-        reader.u32(); // Minimum LEDs.
-        reader.u32(); // Maximum LEDs.
-        const auto count = reader.u32();
-        const auto matrixBytes = reader.u16();
-        if (count > 4096) {
+    for (int i = 0; i < zones; ++i) {
+        if (!zone(reader, version)) {
             return false;
-        }
-        if (matrixBytes != 0) {
-            const auto height = reader.u32();
-            const auto width = reader.u32();
-            const quint64 cells = quint64(height) * width;
-            if (cells > 4096 || matrixBytes != 8 + cells * 4
-                || !reader.skip(qsizetype(cells) * 4)) {
-                return false;
-            }
         }
     }
     const auto leds = reader.u16();
     if (leds > 4096) {
         return false;
     }
-    for (unsigned index = 0; index < leds; ++index) {
+    for (int i = 0; i < leds; ++i) {
         reader.string();
-        reader.u32();
+        if (version < 6) {
+            reader.u32();
+        }
     }
-    const auto colorCount = reader.u16();
-    if (colorCount > 4096 || colorCount != leds) {
+    const auto colors = reader.u16();
+    if (colors != leds) {
         return false;
     }
-    quint32 firstColor = 0;
-    bool uniform = true;
-    for (unsigned index = 0; index < colorCount; ++index) {
-        const auto color = reader.u32();
-        if (index == 0) {
-            firstColor = color;
-        } else if (color != firstColor) {
-            uniform = false;
+    for (int i = 0; i < colors; ++i) {
+        out.colors.append(reader.u32());
+    }
+    if (version >= 5) {
+        const auto names = reader.u16();
+        if (names > leds) {
+            return false;
         }
+        for (int i = 0; i < names; ++i) {
+            reader.string();
+        }
+        reader.u32();
+    }
+    if (version >= 6) {
+        reader.string();
+        reader.string(true);
     }
     if (!reader.done()) {
         return false;
     }
-    const QJsonArray identityFields{name, vendor, description, serial, location};
-    const QByteArray identityBytes = QJsonDocument(identityFields).toJson(QJsonDocument::Compact);
-    const QString identityText = QString::fromUtf8(identityBytes);
-    const auto identity = QCryptographicHash::hash(identityBytes,
-                                                  QCryptographicHash::Sha256).toHex();
-    const QString id = "openrgb:" + QString::fromLatin1(identity);
-    static const QRegularExpression trofeo(
-        "0416.{0,32}5302", QRegularExpression::CaseInsensitiveOption);
-    const bool excluded = trofeo.match(identityText).hasMatch()
-        || identityText.contains("trofeo", Qt::CaseInsensitive)
-        || identityText.contains("usbdisplay", Qt::CaseInsensitive);
-    QJsonArray capabilities;
-    if (!excluded && colorCount > 0 && uniform) {
-        capabilities.append("lighting.read");
-        const auto red = firstColor & 255;
-        const auto green = (firstColor >> 8) & 255;
-        const auto blue = (firstColor >> 16) & 255;
-        const QString color = QString("#%1%2%3")
-            .arg(red, 2, 16, QChar('0')).arg(green, 2, 16, QChar('0'))
-            .arg(blue, 2, 16, QChar('0'));
-        lighting = {{"device", id}, {"color", color}, {"brightness", 100},
-                    {"brightness_emulated", false}};
+    const auto identity = QJsonDocument(QJsonArray{name, vendor, description, serial, out.location})
+        .toJson(QJsonDocument::Compact);
+    const QString text = QString::fromUtf8(identity);
+    const QRegularExpression trofeo("0416.{0,32}5302", QRegularExpression::CaseInsensitiveOption);
+    const bool excluded = trofeo.match(text).hasMatch()
+        || text.contains("trofeo", Qt::CaseInsensitive)
+        || text.contains("usbdisplay", Qt::CaseInsensitive);
+    const QString id = "openrgb:" + QCryptographicHash::hash(identity,
+        QCryptographicHash::Sha256).toHex();
+    out.device = {{"id", id}, {"name", name}, {"vendor", vendor}, {"engine", "openrgb"},
+        {"support", "recognized"}, {"usb", ""}, {"enabled", false}, {"writable", false},
+        {"excluded", excluded}, {"blocked_reason", excluded
+            ? "0416:5302 is reserved exclusively for omarchy-trcc" : "USB identity is unknown"},
+        {"capabilities", excluded || out.lighting().isEmpty()
+            ? QJsonArray{} : QJsonArray{"lighting.read"}}};
+    return true;
+}
+
+bool OpenRgbAdapter::decodeController(const QByteArray &payload, unsigned version,
+                                     QJsonObject &device, QJsonObject &lighting)
+{
+    SdkController controller;
+    if (!SdkController::decode(payload, version, controller)) {
+        return false;
     }
-    device = {{"id", id}, {"name", name}, {"vendor", vendor}, {"engine", "openrgb"},
-              {"support", "recognized"}, {"writable", false},
-              {"blocked_reason", excluded ? TrofeoGate : WriteGate},
-              {"excluded", excluded}, {"capabilities", capabilities}};
+    device = controller.device;
+    lighting = controller.lighting();
     return true;
 }

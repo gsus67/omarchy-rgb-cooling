@@ -99,7 +99,8 @@ Panel {
     var list = []
     for (var i = 0; i < devices.length; i++) {
       var d = devices[i]
-      if (!d.excluded && d.capabilities && d.capabilities.indexOf("lighting.read") >= 0) list.push(d)
+      var readable = d.capabilities && d.capabilities.indexOf("lighting.read") >= 0
+      if (!d.excluded && (readable || d.engine === "openrgb")) list.push(d)
     }
     return list
   }
@@ -134,6 +135,8 @@ Panel {
     if (s.kind === "fan") return Math.round(s.value) + " RPM"
     return Math.round(s.value) + "°"
   }
+  // Names from OpenRGB's udev rules use underscores (MSI_Mystic_Light_MS7D98).
+  function deviceName(d) { return String(d.name || d.id).replace(/_/g, " ") }
   function supportLabel(d) {
     var labels = {
       "recognized": t("Recognized"),
@@ -326,6 +329,97 @@ Panel {
     onLoadFailed: root.userLabels = ({})
   }
 
+  // ---- tabs ----------------------------------------------------------------
+
+  property string tab: "cooling"
+  readonly property var tabs: [
+    { value: "cooling", label: t("Cooling") },
+    { value: "lighting", label: t("Lighting") },
+    { value: "engines", label: t("Engines") }
+  ]
+  onTabChanged: {
+    if (tab === "engines") refreshEngines()
+    if (tab === "lighting" && coreReady) scan()
+  }
+
+  // ---- engines (docs/API.md, "Engines") ----------------------------------
+  // The panel only runs the plugin's own helper with fixed arguments; the
+  // helper asks for the password through pkexec when it changes packages.
+
+  readonly property string enginesHelper: pluginDirectory + "/bin/omarchy-rgb-engines"
+  readonly property var engineActions: ["status", "install", "uninstall"]
+  property var engines: []
+  property string engineAction: "status"
+  property string engineMessage: ""
+  readonly property bool engineBusy: engineProc.running
+
+  function refreshEngines() { runEngine("status") }
+  function runEngine(action) {
+    if (engineProc.running || engineActions.indexOf(action) < 0) return
+    engineAction = action
+    if (action !== "status") engineMessage = action === "install" ? t("Installing…") : t("Removing…")
+    engineProc.running = true
+  }
+
+  Process {
+    id: engineProc
+    command: [root.enginesHelper, root.engineAction, "openrgb"]
+    stdout: StdioCollector { id: engineOut; waitForEnd: true }
+    onExited: function(code) {
+      var result = null
+      try { result = JSON.parse(String(engineOut.text).trim().split("\n").pop()) } catch (e) {}
+      if (root.engineAction === "status") {
+        root.engines = result && Array.isArray(result.engines) ? result.engines : []
+        return
+      }
+      root.engineMessage = result && result.ok === true ? ""
+        : (result && typeof result.error === "string" ? result.error : root.t("The operation did not finish."))
+      root.runEngine("status")
+      if (root.coreReady) root.scan()
+    }
+  }
+
+  // ---- enabled RGB devices (docs/API.md, "Enabling RGB control") ---------
+
+  readonly property string devicesPath: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/omarchy-rgb-cooling/devices.json"
+  property var enabledDevices: ({})
+  property var pendingEnable: null
+
+  function loadEnabled(text) {
+    var parsed = null
+    try { parsed = JSON.parse(text) } catch (e) {}
+    var enabled = {}
+    if (parsed && parsed.v === 1 && parsed.enabled && typeof parsed.enabled === "object") {
+      for (var key in parsed.enabled) {
+        if (parsed.enabled[key] === true && /^usb:[0-9a-f]{4}:[0-9a-f]{4}:/.test(key)) enabled[key] = true
+      }
+    }
+    enabledDevices = enabled
+  }
+
+  function setEnabled(usb, on) {
+    if (!/^usb:[0-9a-f]{4}:[0-9a-f]{4}:/.test(String(usb))) return
+    var enabled = {}
+    for (var key in enabledDevices) enabled[key] = true
+    if (on) enabled[usb] = true
+    else delete enabled[usb]
+    enabledDevices = enabled
+    devicesFile.setText(JSON.stringify({ v: 1, enabled: enabled }, null, 2) + "\n")
+    rescanSoon.restart()
+  }
+
+  // Let the file land before rgbcd re-reads it on the next scan.
+  Timer { id: rescanSoon; interval: 300; onTriggered: if (root.coreReady) root.scan() }
+
+  FileView {
+    id: devicesFile
+    path: root.devicesPath
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadEnabled(text())
+    onLoadFailed: root.enabledDevices = ({})
+  }
+
   // ---- modes (power profiles) --------------------------------------------
   // The modes change how much heat the CPU makes; the BIOS fan curves react.
 
@@ -473,8 +567,8 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // Typed keys go to the rename field while it is open.
-      blocked: root.renamingId !== ""
+      // Typed keys go to the rename field or the dialog while one is open.
+      blocked: root.renamingId !== "" || root.pendingEnable !== null
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -558,9 +652,19 @@ Panel {
             }
           }
 
+          // Tabs
+          ButtonGroup {
+            width: parent.width
+            options: root.tabs
+            value: root.tab
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            onChanged: function(v) { root.tab = v }
+          }
+
           // Modes
           Column {
-            visible: root.coreReady && root.modes.length > 0
+            visible: root.tab === "cooling" && root.coreReady && root.modes.length > 0
             width: parent.width
             spacing: Style.space(8)
 
@@ -613,6 +717,7 @@ Panel {
 
             Column {
               required property var modelData
+              visible: root.tab === "cooling"
               width: panelColumn.width
               spacing: Style.space(6)
 
@@ -693,7 +798,7 @@ Panel {
           }
 
           Text {
-            visible: root.sensorGroups.length > 0
+            visible: root.tab === "cooling" && root.sensorGroups.length > 0
             textFormat: Text.PlainText
             text: root.t("Right-click a sensor to rename it.")
             color: Qt.darker(root.bar.foreground, 1.6)
@@ -705,12 +810,12 @@ Panel {
 
           // Lighting
           PanelSeparator {
-            visible: root.coreReady
+            visible: root.tab === "lighting" && root.coreReady
             foreground: root.bar.foreground
           }
 
           Column {
-            visible: root.coreReady
+            visible: root.tab === "lighting" && root.coreReady
             width: parent.width
             spacing: Style.space(8)
 
@@ -743,7 +848,7 @@ Panel {
             Text {
               visible: root.lightingDevices.length === 0
               textFormat: Text.PlainText
-              text: root.t("No lighting devices available.")
+              text: root.t("No lighting devices found. If you have RGB hardware, install its engine in the Engines tab.")
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -767,7 +872,7 @@ Panel {
                 Column {
                   id: deviceColumn
                   anchors.left: parent.left
-                  anchors.right: parent.right
+                  anchors.right: enableButton.left
                   anchors.leftMargin: Style.space(8)
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
@@ -775,7 +880,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: String(deviceRow.modelData.name || deviceRow.modelData.id)
+                    text: root.deviceName(deviceRow.modelData)
                     color: root.bar.foreground
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.body
@@ -787,6 +892,8 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: root.supportLabel(deviceRow.modelData) + (deviceRow.modelData.writable ? "" : " · " + root.t("read only"))
+                          + (deviceRow.modelData.enabled === true && !deviceRow.modelData.writable && deviceRow.modelData.blocked_reason ? " · " + String(deviceRow.modelData.blocked_reason) : "")
+                    wrapMode: Text.Wrap
                     color: Qt.darker(root.bar.foreground, 1.4)
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.caption
@@ -800,6 +907,24 @@ Panel {
                   hoverEnabled: true
                   onEntered: { root.cursorActive = true; root.focusSection = "devices"; root.selectedIndex = deviceRow.index }
                   onClicked: root.selectDevice(deviceRow.modelData.id)
+                }
+
+                // Declared after the row's MouseArea so it receives its own clicks.
+                Button {
+                  id: enableButton
+                  visible: String(deviceRow.modelData.usb || "") !== ""
+                  width: visible ? implicitWidth : 0
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: deviceRow.modelData.enabled === true ? root.t("Disable") : root.t("Enable")
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  bordered: true
+                  onClicked: {
+                    if (deviceRow.modelData.enabled === true) root.setEnabled(deviceRow.modelData.usb, false)
+                    else root.pendingEnable = deviceRow.modelData
+                  }
                 }
               }
             }
@@ -920,7 +1045,119 @@ Panel {
               }
             }
           }
+
+          // Engines
+          Column {
+            visible: root.tab === "engines"
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSeparator { foreground: root.bar.foreground }
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.t("To control RGB lighting the plugin needs an engine. Install only what your hardware needs; nothing else is added, and uninstalling the plugin removes it again.")
+              color: Qt.darker(root.bar.foreground, 1.3)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+              width: parent.width
+            }
+
+            Repeater {
+              model: root.engines
+
+              Item {
+                id: engineRow
+                required property var modelData
+                width: panelColumn.width
+                implicitHeight: Math.max(engineText.implicitHeight, engineButton.implicitHeight)
+
+                Column {
+                  id: engineText
+                  anchors.left: parent.left
+                  anchors.right: engineButton.left
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(2)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: engineRow.modelData.id === "openrgb" ? "OpenRGB" : String(engineRow.modelData.id)
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    width: parent.width
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: String(engineRow.modelData.purpose || "") + (engineRow.modelData.size ? " · " + engineRow.modelData.size : "")
+                    color: Qt.darker(root.bar.foreground, 1.4)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: !engineRow.modelData.installed ? root.t("Not installed")
+                      : (engineRow.modelData.installed_by_plugin ? root.t("Installed by this plugin")
+                         : root.t("Installed before this plugin; it will not be removed"))
+                    color: Qt.darker(root.bar.foreground, 1.4)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                  }
+                }
+
+                Button {
+                  id: engineButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: !engineRow.modelData.installed || engineRow.modelData.installed_by_plugin === true
+                  enabled: !root.engineBusy
+                  text: engineRow.modelData.installed ? root.t("Uninstall") : root.t("Install")
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  bordered: true
+                  onClicked: root.runEngine(engineRow.modelData.installed ? "uninstall" : "install")
+                }
+              }
+            }
+
+            Text {
+              visible: root.engineMessage !== ""
+              textFormat: Text.PlainText
+              text: root.engineMessage
+              color: root.engineBusy ? Qt.darker(root.bar.foreground, 1.3) : Commons.Color.urgent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+              width: parent.width
+            }
+          }
         }
+      }
+
+      ConfirmDialog {
+        anchors.fill: parent
+        z: 10
+        opened: root.pendingEnable !== null
+        message: root.pendingEnable === null ? "" : root.t("Let this plugin change the lighting of") + " " + root.deviceName(root.pendingEnable) + "? " + root.t("Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.")
+        confirmText: root.t("Enable")
+        cancelText: root.t("Cancel")
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        onConfirmed: {
+          var device = root.pendingEnable
+          root.pendingEnable = null
+          if (device) root.setEnabled(device.usb, true)
+        }
+        onCanceled: root.pendingEnable = null
       }
     }
   }

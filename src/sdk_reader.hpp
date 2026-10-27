@@ -9,7 +9,7 @@ public:
     explicit SdkReader(const QByteArray &bytes);
     quint16 u16();
     quint32 u32();
-    QString string();
+    QString string(bool wide = false);
     bool skip(qsizetype count);
     bool done() const;
     bool valid() const;

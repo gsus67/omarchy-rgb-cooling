@@ -17,7 +17,7 @@
 class Server final : public QObject {
 public:
     Server(bool demo, const QString &hwmonRoot, const QString &dataDirectory,
-           const QString &dmiRoot);
+           const QString &dmiRoot, const QString &sysRoot, const QString &openrgbRules);
     ~Server() override;
     bool listen(const QString &path, QString &error);
     bool adopt(qintptr descriptor, QString &error);
@@ -26,6 +26,7 @@ public:
 private:
     Listener socket;
     bool demo;
+    QString sysRoot, openrgbRules;
     SensorSource sensorSource;
     PowerProfiles powerProfiles;
     std::unique_ptr<LightingAdapter> adapter;
