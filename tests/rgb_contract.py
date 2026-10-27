@@ -1,4 +1,5 @@
 """Phase 3c integration tests, sharing the native build and isolated daemon fixture."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -263,6 +264,131 @@ class OpenRgbContractMixin:
             self.assertTrue(other.read()["ok"])
         self.assertEqual(len(self.command()["calls"]), 1)
         self.assertEqual(self.fake.accepted, 1)
+
+    def connection_attempts(self):
+        path = self.root / "sdk-connects"
+        data = path.read_bytes() if path.exists() else b""
+        return [stamp for (stamp,) in struct.iter_unpack("q", data)]
+
+    def connection_rounds(self):
+        # Qt can issue multiple native connect calls in one SDK connection attempt.
+        return list(dict.fromkeys(self.connection_attempts()))
+
+    def wait_for_attempts(self, count):
+        self.core.wait_until(lambda: len(self.connection_rounds()) == count,
+                             message=f"SDK connection attempt {count}")
+        # Let the API and worker process connection errors at this clock value.
+        self.assertTrue(self.client.request("hello")["ok"])
+
+    def read_response(self, client, expected):
+        while True:
+            reply = client.read()
+            if "event" in reply:
+                client.events.append(reply)
+            else:
+                self.assertEqual(reply["id"], expected)
+                return reply
+
+    def test_startup_wait_joins_requests_and_publishes_writable_device_after_1500_ms(self):
+        self.environment["CORE_TEST_OPENRGB_CONNECTS"] = str(self.root / "sdk-connects")
+        self.launch(enabled=False, defer_listen=True)
+        self.assertFalse(self.devices()[0]["writable"])
+        self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
+        self.enable()
+        self.advance(2.01)
+        self.client.send({"v": 1, "id": 77, "op": "devices.rescan"})
+        self.wait_for_attempts(1)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+        identity = ["MSI RGB", "MSI", "USB lighting", "unique", "HID: /dev/hidraw9"]
+        encoded = json.dumps(identity, separators=(",", ":")).encode()
+        device_id = "openrgb:" + hashlib.sha256(encoded).hexdigest()
+        with self.daemon.client() as other:
+            for number, operation, params in (
+                    (78, "devices", {}), (79, "devices.rescan", {}),
+                    (80, "lighting.get", {"device": device_id}),
+                    (81, "lighting.set", {"device": device_id, "color": "#123456",
+                                          "brightness": 50})):
+                other.send({"v": 1, "id": number, "op": operation, "params": params})
+            self.assertTrue(other.request("hello")["ok"])
+            self.assertEqual(other.stashed, [], "Startup requests must remain pending")
+            for attempt in range(2, 7):
+                self.advance(0.25)
+                self.wait_for_attempts(attempt)
+                self.assertEqual(self.client.stashed, [], "No premature candidate reply")
+                self.assertEqual(self.fake.accepted, 0)
+            # StartUnit completed at t=0; OpenRGB opens its SDK listener at t=1.5 s.
+            self.daemon.clock.advance(0.25)
+            self.fake.start_listening()
+            self.client.request("hello")
+            result = self.read_response(self.client, 77)
+            self.assertTrue(result["ok"], result)
+            device = result["result"]["devices"][0]
+            self.assertTrue(device["writable"], device)
+            self.assertEqual(device["id"], device_id)
+            for number in (78, 79):
+                joined = self.read_response(other, number)
+                self.assertEqual(joined["result"]["devices"], [device])
+            self.assertTrue(self.read_response(other, 80)["ok"])
+            written = self.read_response(other, 81)
+            self.assertTrue(written["ok"], written)
+            self.assertEqual(written["result"]["color"], "#123456")
+        data = self.core.wait_event(self.client, "devices", lambda data: any(
+            item["writable"] for item in data["devices"]), message="startup devices event")
+        self.assertEqual(data["devices"][0]["id"], device_id)
+        attempts = self.connection_rounds()
+        self.assertEqual([stamp - attempts[0] for stamp in attempts],
+                         [index * 250_000_000 for index in range(7)])
+        native_attempts = self.connection_attempts()
+        self.advance(10)
+        self.assertEqual(self.client.request("status")["result"]["engines"][0]["state"],
+                         "ready", "Successful connection must cancel the startup deadline")
+        self.assertEqual(self.connection_attempts(), native_attempts)
+
+    def test_startup_wait_expires_at_10_seconds_without_background_retries(self):
+        self.environment["CORE_TEST_OPENRGB_CONNECTS"] = str(self.root / "sdk-connects")
+        self.launch(defer_listen=True)
+        self.client.send({"v": 1, "id": 77, "op": "devices.rescan"})
+        self.wait_for_attempts(1)
+        for attempt in range(2, 41):
+            self.advance(0.25)
+            self.wait_for_attempts(attempt)
+        self.advance(0.249)
+        self.assertEqual(self.client.stashed, [], "No failure before the 10 s deadline")
+        self.advance(0.001)
+        result = self.read_response(self.client, 77)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["result"]["devices"][0]["writable"])
+        engine = self.client.request("status")["result"]["engines"][0]
+        self.assertEqual(engine["state"], "unreachable")
+        self.assertIn("10 s after StartUnit", engine["reason"])
+        attempts = self.connection_rounds()
+        self.assertEqual([stamp - attempts[0] for stamp in attempts],
+                         [index * 250_000_000 for index in range(40)])
+        native_attempts = self.connection_attempts()
+        self.advance(30)
+        self.assertFalse(self.devices()[0]["writable"])
+        self.assertEqual(self.connection_attempts(), native_attempts)
+        # A rescan of the already running unit gets one attempt, no new startup window.
+        self.assertFalse(self.devices("devices.rescan")[0]["writable"])
+        self.assertEqual(len(self.connection_rounds()), 41)
+        native_attempts = self.connection_attempts()
+        self.advance(10)
+        self.assertEqual(self.connection_attempts(), native_attempts)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+
+    def test_sensors_subscriber_does_not_prevent_idle_stop_at_120_seconds(self):
+        self.launch()
+        self.devices()
+        self.client.request("subscribe", {"topics": ["sensors"], "interval_ms": 10000})
+        self.devices()  # Worker barrier before advancing the controlled clock.
+        self.advance(119.9)
+        self.assertEqual(len(self.command()["calls"]), 1)
+        self.advance(0.1)
+        calls = self.core.wait_until(lambda: self.command()["calls"]
+                                    if len(self.command()["calls"]) == 2 else None,
+                                    message="StopUnit despite sensors subscriber at 120 s")
+        self.assertEqual(calls[-1], ["StopUnit", "omarchy-rgb-cooling-openrgb.service",
+                                    "replace"])
 
     def test_stop_after_exact_120_seconds_and_lighting_activity_extends_deadline(self):
         self.launch()
