@@ -8,6 +8,7 @@
 #include <QRegularExpression>
 #include <QStringDecoder>
 #include <QTextStream>
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -28,13 +29,25 @@ QByteArray readBounded(const QString &path, qint64 maximum, bool &ok)
         ::close(descriptor);
         return {};
     }
-    QFile file;
-    if (!file.open(descriptor, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
-        ::close(descriptor);
-        return {};
+    // Read through the same descriptor that fstat() checked, never by name again.
+    QByteArray data;
+    char buffer[4096];
+    while (data.size() <= maximum) {
+        const ssize_t count = ::read(descriptor, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            ::close(descriptor);
+            return {};
+        }
+        if (count == 0) {
+            break;
+        }
+        data.append(buffer, count);
     }
-    const auto data = file.read(maximum + 1);
-    ok = file.error() == QFileDevice::NoError && data.size() <= maximum;
+    ::close(descriptor);
+    ok = data.size() <= maximum;
     return data;
 }
 
