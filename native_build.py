@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
-MODULES = ("Qt6Core", "Qt6Network", "libudev")
+MODULES = ("Qt6Core", "Qt6Network", "Qt6DBus", "libudev")
 BUILD_FLAGS = ("-std=c++20", "-O2", "-fPIC", "-Wall", "-Wextra", "-Wpedantic")
 SANITIZE_FLAGS = (
     "-O1", "-g", "-fno-omit-frame-pointer", "-fsanitize=address,undefined",
@@ -102,7 +102,12 @@ def build(source, output, *, tools=None, tests=False, sanitize=False):
             sources = sorted(str(path) for path in (source / "src").glob("*.cpp"))
             if not sources:
                 raise RuntimeError("No C++ sources found")
-            run(tools["compiler"], *flags, "-I", str(source / "src"),
+            libexec = run(tools["pkg_config"], "--variable=libexecdir", "Qt6Core").strip()
+            moc = str(Path(libexec) / "moc")
+            for path in (source / "src").glob("*.cpp"):
+                if "Q_OBJECT" in path.read_text():
+                    run(moc, str(path), "-o", str(Path(temporary) / (path.stem + ".moc")))
+            run(tools["compiler"], *flags, "-I", temporary, "-I", str(source / "src"),
                 *sources, *libraries, "-o", str(candidate), cwd=source)
             if tests:
                 environment = os.environ.copy()
