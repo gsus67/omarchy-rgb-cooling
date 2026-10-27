@@ -42,11 +42,9 @@ void Server::initializeAdapters()
     } else {
         adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); },
                                                    sysRoot, openrgbRules);
-        hotplug = std::make_unique<Hotplug>([this] {
+        hotplug = std::make_unique<Hotplug>([this](const auto &events) {
             sensorSource.invalidate();
-            if (deviceSubscriber) {
-                static_cast<OpenRgbAdapter *>(adapter.get())->refresh();
-            }
+            static_cast<OpenRgbAdapter *>(adapter.get())->hotplug(events, deviceSubscriber);
         });
     }
 }

@@ -432,6 +432,25 @@ Panel {
     rescanSoon.restart()
   }
 
+  // While the Lighting tab shows "Loading…", retry a few times on its own
+  // (scans must be 2 s apart) so the user never has to switch tabs. Bounded:
+  // it stops when the tab loads, is left, or after six attempts.
+  property int loadingAttempts: 0
+  onLightingLoadingChanged: if (!lightingLoading) loadingAttempts = 0
+  Timer {
+    id: loadingRetry
+    interval: 2200
+    repeat: true
+    running: root.opened && root.tab === "lighting" && root.lightingLoading
+             && root.coreReady && root.loadingAttempts < 6
+    onTriggered: {
+      root.loadingAttempts += 1
+      root.scanning = false
+      root.scan()
+      if (root.canWrite && root.lighting === null) root.refreshLighting()
+    }
+  }
+
   // Let the file land before rgbcd re-reads it on the next scan.
   Timer { id: rescanSoon; interval: 300; onTriggered: if (root.coreReady) root.scan() }
 

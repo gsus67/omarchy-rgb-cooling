@@ -832,6 +832,273 @@ class OpenRgbContractMixin:
         self.assertEqual(self.fake.accepted, 1)
         self.assertEqual(self.writes(), [])
 
+    def udev_fixture(self):
+        fifo, ack = self.root / "udev.fifo", self.root / "udev-ack.fifo"
+        os.mkfifo(fifo)
+        os.mkfifo(ack)
+        self.udev_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.udev_ack = os.open(ack, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, self.udev_fd)
+        self.addCleanup(os.close, self.udev_ack)
+        self.environment.update(CORE_TEST_UDEV_FIFO=str(fifo), CORE_TEST_UDEV_ACK_FIFO=str(ack))
+
+    def emit_udev(self, action, node, identity="", path=""):
+        os.write(self.udev_fd, f"{action}|{node}|{identity}|{path}\n".encode())
+
+        def consumed():
+            try:
+                return os.read(self.udev_ack, 1) == b"+"
+            except BlockingIOError:
+                return False
+        self.core.wait_until(consumed, message="processed udev event")
+        self.client.request("hello")
+
+    def wait_reconnecting(self):
+        self.core.wait_until(lambda: self.client.request("status")["result"]["engines"][0][
+            "reason"] == "Device reconnected; restarting OpenRGB", message="reconnecting state")
+        device = self.devices()[0]
+        self.assertFalse(device["writable"], device)
+        self.assertEqual(device["blocked_reason"], "Device reconnected; restarting OpenRGB")
+        return device
+
+    def reenumerate(self, before, after):
+        node = self.usb.root / f"class/hidraw/hidraw{before}"
+        # Deliberately omit identity on remove: real sysfs attributes may be gone.
+        node.rename(node.with_name(f"hidraw{after}"))
+        self.emit_udev("remove", f"/dev/hidraw{before}")
+        self.fake.descriptors[0] = controller_metadata(
+            self.fake.descriptors[0], location=f"HID: /dev/hidraw{after}")
+        self.emit_udev("add", f"/dev/hidraw{after}", self.identity)
+        self.wait_reconnecting()
+
+    def assert_write_reenumeration(self, acknowledged):
+        self.udev_fixture()
+        self.launch(descriptors=[controller(modes=self.lifecycle_modes(), active=1)],
+                    behavior="normal" if acknowledged else "missing_write_ack")
+        device = self.devices()[0]
+        # No devices subscriber: recovery must still refresh the sandbox.
+        def replug(_device, _command):
+            self.fake.on_write = None
+            node = self.usb.root / "class/hidraw/hidraw9"
+            node.rename(node.with_name("hidraw4"))
+            self.fake.descriptors[0] = controller_metadata(
+                self.fake.descriptors[0], location="HID: /dev/hidraw4")
+            os.write(self.udev_fd, ("remove|/dev/hidraw9||\n"
+                                   f"add|/dev/hidraw4|{self.identity}|\n").encode())
+            self.fake.behavior = "normal"
+            return True  # Drop REQ_DATA after the optional ACK.
+        self.fake.on_write = replug
+        self.client.send({"v": 1, "id": 77, "op": "lighting.set", "params": {
+            "device": device["id"], "color": "#abcdef"}})
+        current = self.wait_reconnecting()
+        self.assertEqual(current["id"], device["id"])
+        with self.daemon.client() as other:
+            other.send({"v": 1, "id": 78, "op": "lighting.set", "params": {
+                "device": device["id"], "color": "#123456"}})
+            other.send({"v": 1, "id": 79, "op": "lighting.save", "params": {
+                "device": device["id"]}})
+            self.assertTrue(other.request("hello")["ok"])
+            self.assertEqual(other.stashed, [], "Writes wait for reconnection")
+            self.advance(0.999)
+            self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+            self.advance(0.001)
+            initial = self.read_response(self.client, 77)
+            self.assertTrue(initial["ok"], initial)
+            self.assertEqual(initial["result"]["color"], "#abcdef")
+            self.assertTrue(self.read_response(other, 78)["ok"])
+            self.assertTrue(self.read_response(other, 79)["ok"])
+        current = self.devices()[0]
+        self.assertEqual(current["id"], device["id"])
+        self.assertTrue(current["writable"], current)
+        self.assertTrue(self.set_color(current)["ok"])
+        modes = [command for _, command, _ in self.writes() if command == 1101]
+        self.assertEqual(len(modes), 3 if acknowledged else 4,
+                         "An ACKed write is never replayed; a lost ACK gets one retry")
+        self.assertEqual([call[0] for call in self.command()["calls"]],
+                         ["StartUnit", "StopUnit", "StartUnit"])
+        connections, writes = self.fake.accepted, len(self.writes())
+        self.advance(20)
+        self.assertEqual((self.fake.accepted, len(self.writes())), (connections, writes))
+
+    def test_udev_write_ack_survives_reenumeration_without_replay(self):
+        self.assert_write_reenumeration(acknowledged=True)
+
+    def test_udev_write_without_ack_retries_once_after_reenumeration(self):
+        self.assert_write_reenumeration(acknowledged=False)
+
+    def test_udev_reenumerations_debounce_once_and_emit_stable_devices(self):
+        self.udev_fixture()
+        self.launch()
+        device = self.devices()[0]
+        self.assertTrue(self.set_color(device)["ok"])
+        self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
+        self.devices()
+        self.reenumerate(9, 4)
+        self.advance(0.7)
+        self.reenumerate(4, 5)
+        self.advance(0.7)
+        self.reenumerate(5, 6)
+        self.client.events.clear()  # Discard ready events from before reconnection.
+        self.advance(0.999)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+        self.advance(0.001)
+        restored = self.core.wait_event(self.client, "devices", lambda data: any(
+            item["writable"] for item in data["devices"]), message="recovered devices event")
+        self.assertEqual(restored["devices"][0]["id"], device["id"])
+        self.assertTrue(self.devices()[0]["writable"])
+        self.assertEqual([call[0] for call in self.command()["calls"]],
+                         ["StartUnit", "StopUnit", "StartUnit"])
+
+    def test_udev_disabled_and_trofeo_devices_never_restart_openrgb(self):
+        self.udev_fixture()
+        disabled = self.usb.add(11, serial="disabled")
+        self.launch()
+        self.devices()
+        self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
+        self.devices()
+        # Even explicit opt-in must not override the Trofeo exclusion.
+        self.config.write_text(json.dumps({"v": 1, "enabled": {
+            self.identity: True, "usb:0416:5302:trofeo": True, disabled: False}}))
+        for node, identity in ((11, disabled), (10, "usb:0416:5302:trofeo")):
+            self.emit_udev("remove", f"/dev/hidraw{node}", identity)
+            self.emit_udev("add", f"/dev/hidraw{node}", identity)
+            self.devices()
+        self.advance(2)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+
+    def test_udev_reenumeration_while_startunit_is_pending_restarts_once(self):
+        self.udev_fixture()
+        self.command(hold=True)
+        self.launch()
+        self.client.send({"v": 1, "id": 77, "op": "devices.rescan"})
+        self.core.wait_until(lambda: self.command()["held"], message="initial StartUnit pending")
+        self.reenumerate(9, 4)
+        self.advance(1)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+        self.command(hold=False, action="release")
+        reply = self.read_response(self.client, 77)
+        self.assertTrue(reply["ok"], reply)
+        device = reply["result"]["devices"][0]
+        self.assertTrue(device["writable"], device)
+        expected = "openrgb:" + hashlib.sha256(self.identity.encode()).hexdigest()
+        self.assertEqual(device["id"], expected)
+        self.assertEqual([call[0] for call in self.command()["calls"]],
+                         ["StartUnit", "StopUnit", "StartUnit"])
+
+    def test_udev_new_nodes_during_recovery_startunit_are_not_lost(self):
+        self.udev_fixture()
+        self.launch()
+        device = self.devices()[0]
+        self.reenumerate(9, 4)
+        self.command(hold=True)
+        self.advance(1)
+        self.core.wait_until(lambda: self.command()["held"], message="recovery StopUnit pending")
+        self.command(action="release")  # Complete StopUnit, hold the following StartUnit.
+        self.core.wait_until(lambda: len(self.command()["calls"]) == 3
+                             and self.command()["held"], message="recovery StartUnit pending")
+        self.reenumerate(4, 5)
+        self.advance(0.5)
+        self.reenumerate(5, 6)
+        self.client.send({"v": 1, "id": 77, "op": "lighting.set", "params": {
+            "device": device["id"], "color": "#abcdef"}})
+        self.advance(1)
+        self.assertEqual(len(self.command()["calls"]), 3)
+        self.command(hold=False, action="release")
+        reply = self.read_response(self.client, 77)
+        self.assertTrue(reply["ok"], reply)
+        current = self.devices()[0]
+        self.assertEqual(current["id"], device["id"])
+        self.assertTrue(current["writable"], current)
+        self.assertEqual([call[0] for call in self.command()["calls"]],
+                         ["StartUnit", "StopUnit", "StartUnit", "StopUnit", "StartUnit"])
+        self.assertEqual(sum(command == 1101 for _, command, _ in self.writes()), 1)
+
+    def test_udev_repeated_lost_ack_never_retries_a_write_twice(self):
+        self.udev_fixture()
+        self.launch(descriptors=[controller(modes=self.lifecycle_modes(), active=1)],
+                    behavior="missing_write_ack")
+        device = self.devices()[0]
+        nodes = iter(((9, 4), (4, 5)))
+
+        def replug(_device, _command):
+            before, after = next(nodes)
+            node = self.usb.root / f"class/hidraw/hidraw{before}"
+            node.rename(node.with_name(f"hidraw{after}"))
+            self.fake.descriptors[0] = controller_metadata(
+                self.fake.descriptors[0], location=f"HID: /dev/hidraw{after}")
+            os.write(self.udev_fd, (f"remove|/dev/hidraw{before}||\n"
+                                   f"add|/dev/hidraw{after}|{self.identity}|\n").encode())
+            if after == 5:
+                self.fake.on_write = None
+            return True
+        self.fake.on_write = replug
+        self.client.send({"v": 1, "id": 77, "op": "lighting.set", "params": {
+            "device": device["id"], "color": "#abcdef"}})
+        self.wait_reconnecting()
+        self.advance(1)
+        self.core.wait_until(lambda: len(self.writes()) == 2, message="one write retry")
+        self.wait_reconnecting()
+        self.advance(1)
+        reply = self.read_response(self.client, 77)
+        self.assertFalse(reply["ok"], reply)
+        self.core.wait_until(lambda: self.devices()[0]["writable"], message="second recovery")
+        self.advance(20)
+        self.assertEqual(len(self.writes()), 2)
+        self.assertEqual([call[0] for call in self.command()["calls"]],
+                         ["StartUnit", "StopUnit", "StartUnit", "StopUnit", "StartUnit"])
+
+    def test_udev_save_lost_ack_retries_once_despite_save_rate_limit(self):
+        self.udev_fixture()
+        self.launch(descriptors=[controller(modes=self.lifecycle_modes(), active=1)])
+        device = self.devices()[0]
+        self.assertTrue(self.set_color(device)["ok"])
+        self.fake.behavior = "missing_write_ack"
+
+        def replug(_device, _command):
+            self.fake.on_write = None
+            node = self.usb.root / "class/hidraw/hidraw9"
+            node.rename(node.with_name("hidraw4"))
+            self.fake.descriptors[0] = controller_metadata(
+                self.fake.descriptors[0], location="HID: /dev/hidraw4")
+            os.write(self.udev_fd, ("remove|/dev/hidraw9||\n"
+                                   f"add|/dev/hidraw4|{self.identity}|\n").encode())
+            self.fake.behavior = "normal"
+            return True
+        self.fake.on_write = replug
+        self.client.send({"v": 1, "id": 77, "op": "lighting.save", "params": {
+            "device": device["id"]}})
+        self.wait_reconnecting()
+        self.advance(1)
+        reply = self.read_response(self.client, 77)
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["saved"])
+        self.assertEqual(sum(command == 1102 for _, command, _ in self.writes()), 2)
+        self.assertEqual(self.client.request("lighting.save", {"device": device["id"]})[
+            "error"]["code"], "rate_limited")
+
+    def test_udev_missing_device_times_out_deferred_set_and_save(self):
+        self.udev_fixture()
+        self.launch()
+        device = self.devices()[0]
+        (self.usb.root / "class/hidraw/hidraw9/device").unlink()
+        self.emit_udev("remove", "/dev/hidraw9")
+        self.wait_reconnecting()
+        self.client.send({"v": 1, "id": 77, "op": "lighting.set", "params": {
+            "device": device["id"], "color": "#abcdef"}})
+        self.client.send({"v": 1, "id": 78, "op": "lighting.save", "params": {
+            "device": device["id"]}})
+        self.advance(14.999)
+        self.assertEqual(self.client.stashed, [])
+        self.advance(0.001)
+        for number in (77, 78):
+            reply = self.read_response(self.client, number)
+            self.assertFalse(reply["ok"], reply)
+            self.assertIn("15 s", reply["error"]["message"])
+        self.assertIn("15 s", self.devices()[0]["blocked_reason"])
+        self.advance(20)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+        self.assertEqual(self.writes(), [])
+
     def test_hotplug_scans_only_while_a_device_subscriber_exists(self):
         fifo = self.root / "udev.fifo"
         ack = self.root / "ack.fifo"

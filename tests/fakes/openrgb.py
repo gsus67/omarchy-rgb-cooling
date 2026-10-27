@@ -192,6 +192,7 @@ class OpenRgbServer:
     def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False,
                  listener=None, device_ids=None, defer_listen=False, updates="after"):
         self.behavior = behavior
+        self.on_write = None
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
         self.device_ids = device_ids
@@ -336,9 +337,11 @@ class OpenRgbServer:
                             if self.behavior == "bad_write_ack" or (
                                     command == 1050 and self.behavior == "bad_led_ack"):
                                 ack = ack[:-1]
-                            if self.advertised >= 6 and (command != 1050
-                                    or self.behavior != "missing_led_ack"):
+                            if self.advertised >= 6 and self.behavior != "missing_write_ack" and (
+                                    command != 1050 or self.behavior != "missing_led_ack"):
                                 self.send(packet(device, 10, ack))
+                            if self.on_write and self.on_write(device, command):
+                                raise OSError("USB re-enumeration lost the SDK connection")
                             if self.advertised >= 6 and not rejected and not ignored:
                                 reason = {1050: 0, 1101: 1, 1102: 2}[command]
                                 description = (payload[4:] if command == 1050

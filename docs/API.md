@@ -167,8 +167,12 @@ every 250 ms for at most 10 s while OpenRGB detects hardware. Pending `devices`,
 `devices.rescan` and `lighting.*` requests wait for the real scan result; a
 successful scan also emits a `devices` event. If the deadline expires, the engine
 becomes `unreachable` with an explicit reason and makes no further attempts until
-another operation requests a scan. This startup wait is the only automatic retry;
-there is no background polling.
+another operation requests a scan; there is no background polling.
+Udev re-enumeration of an enabled USB device is debounced for 1 s and
+asynchronously restarts the unit to refresh sandbox HID nodes, reporting
+“Device reconnected; restarting OpenRGB” while deferring lighting writes for up
+to 15 s and retrying an unacknowledged write once (acknowledged writes are never
+replayed).
 
 rgbcd stops the unit (`StopUnit`) after 120 s without lighting activity or
 subscribers to `devices` (the open panel). Only `lighting.get`, `lighting.set`

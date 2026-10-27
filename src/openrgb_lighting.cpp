@@ -33,7 +33,8 @@ Protocol::Reply OpenRgbWorker::write(const QString &id, const QJsonObject &param
         if (!mode.savable() || mode.name == "Direct") {
             return Protocol::Reply::failure("unsupported", "The active mode cannot be saved");
         }
-        if (lastSave[identity].isValid() && lastSave[identity].elapsed() < 10000) {
+        if (requests.head().retries == 0 && lastSave[identity].isValid()
+            && lastSave[identity].elapsed() < 10000) {
             return Protocol::Reply::failure("rate_limited", "Saves must be at least 10 s apart");
         }
         auto payload = appliedModes.value(identity);

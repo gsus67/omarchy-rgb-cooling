@@ -17,14 +17,23 @@ public:
     std::function<void(QJsonObject, QJsonArray, bool)> changed;
     void perform(const QString &operation, const QJsonObject &params, Callback ready);
     void refresh();
+    void hotplug(const QVector<HotplugEvent> &events, bool discover);
     void subscribed(bool value);
 
 private:
     enum class Phase { Disconnected, Starting, Connecting, Version, Count, Controller, Idle, Read };
-    struct Request { QString operation; QJsonObject params; Callback ready; bool join; };
+    struct Request {
+        QString operation;
+        QJsonObject params;
+        Callback ready;
+        bool join;
+        int retries = 0;
+        QJsonObject applied;
+    };
     QQueue<Request> requests;
     QString root, rules;
     QElapsedTimer lastScan;
+    quint64 scanGeneration = 0;
     OpenRgbUnit unit;
     UsbDevices usb;
     QSet<QString> launchedDevices;
@@ -32,6 +41,14 @@ private:
     QTcpSocket socket;
     QTimer timeout;
     QTimer startupRetry, startupDeadline;
+    QTimer recoveryDebounce, recoveryDeadline, writeFailure;
+    bool recovering = false, recoveryDue = false, recoveryRestarted = false;
+    bool recoveryDirty = false;
+    QSet<QString> reconnecting;
+    QString pendingFailure;
+    void recover();
+    void suspendOperation();
+    void completeAppliedWrite();
     QElapsedTimer startup;
     QByteArray input;
     Phase phase = Phase::Disconnected;
@@ -65,7 +82,7 @@ private:
     void receive();
     bool packet(quint32 device, quint32 command, const QByteArray &payload);
     bool signalUpdate(quint32 device, const QByteArray &payload);
-    void fail(const QString &message);
+    void fail(const QString &message, bool allowGrace = true);
     void publish();
     void gates();
     void identify(SdkController &controller, const SdkController *known = nullptr);
