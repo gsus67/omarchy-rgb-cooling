@@ -145,8 +145,15 @@ bool SdkController::decode(const QByteArray &payload, unsigned version, SdkContr
         || text.contains("usbdisplay", Qt::CaseInsensitive);
     const QString id = "openrgb:" + QCryptographicHash::hash(identity,
         QCryptographicHash::Sha256).toHex();
+    QJsonArray descriptions;
+    for (const auto &mode : out.modes) {
+        if (mode.name != "Direct") {
+            descriptions.append(mode.description());
+        }
+    }
     out.device = {{"id", id}, {"name", name}, {"vendor", vendor}, {"engine", "openrgb"},
-        {"support", "recognized"}, {"usb", ""}, {"enabled", false}, {"writable", false},
+        {"support", "recognized"}, {"modes", descriptions},
+        {"usb", ""}, {"enabled", false}, {"writable", false},
         {"excluded", excluded}, {"blocked_reason", excluded
             ? "0416:5302 is reserved exclusively for omarchy-trcc" : "USB identity is unknown"},
         {"capabilities", excluded || out.lighting().isEmpty()

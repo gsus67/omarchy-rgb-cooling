@@ -10,13 +10,10 @@
     "Incompatible core version": "Versión del núcleo incompatible",
     "Could not prepare the core": "No se pudo preparar el núcleo",
     "Sensors": "Sensores",
-    "LIGHTING": "ILUMINACIÓN",
     "Recognized": "Reconocido",
     "Supported upstream": "Soportado por el proyecto original",
     "Tested in simulation": "Probado en simulación",
     "Tested on hardware": "Probado en hardware",
-    "read only": "solo lectura",
-    "This device is read only.": "Este dispositivo es de solo lectura.",
     "BRIGHTNESS": "BRILLO",
     "emulated": "emulado",
     "Theme": "Tema",
@@ -55,6 +52,17 @@
     "Install": "Instalar",
     "Let this plugin change the lighting of": "¿Permitir que este plugin cambie la iluminación de",
     "Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.": "Solo se envían un color fijo y el brillo; no se guarda nada en el dispositivo y puedes desactivarlo aquí.",
-    "Cancel": "Cancelar"
+    "Cancel": "Cancelar",
+    "COLOUR": "COLOR",
+    "DEVICES": "DISPOSITIVOS",
+    "EFFECT": "EFECTO",
+    "Not enabled": "No activado",
+    "Not saved: OpenRGB keeps running so the lights stay as they are.": "Sin guardar: OpenRGB sigue activo para que las luces se mantengan.",
+    "Random": "Aleatorio",
+    "SPEED": "VELOCIDAD",
+    "Save to device": "Guardar en la placa",
+    "Saved to the device: it stays after reboots, OpenRGB can stop.": "Guardado en la placa: se mantiene al reiniciar y OpenRGB puede apagarse.",
+    "Saving…": "Guardando…",
+    "Starting…": "Arrancando…"
   }
 }

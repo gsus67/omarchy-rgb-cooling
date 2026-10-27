@@ -15,6 +15,8 @@ public:
     QJsonObject engine() const override;
     QJsonArray devices() const override;
     Protocol::Reply lighting(const QString &device) const override;
+    Protocol::Reply updateLighting(const QJsonObject &params) override;
+    Protocol::Reply saveLighting(const QString &device) override;
     Protocol::Reply setLighting(const QString &, const QString &, int) override;
     void perform(const QString &operation, const QJsonObject &params, Callback ready);
     void refresh();

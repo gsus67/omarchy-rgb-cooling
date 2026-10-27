@@ -38,6 +38,14 @@ Protocol::Reply OpenRgbAdapter::setLighting(const QString &, const QString &, in
 {
     return Protocol::Reply::failure("unavailable", "Use asynchronous lighting requests");
 }
+Protocol::Reply OpenRgbAdapter::updateLighting(const QJsonObject &)
+{
+    return Protocol::Reply::failure("unavailable", "Use asynchronous lighting requests");
+}
+Protocol::Reply OpenRgbAdapter::saveLighting(const QString &)
+{
+    return Protocol::Reply::failure("unavailable", "Use asynchronous lighting requests");
+}
 void OpenRgbAdapter::perform(const QString &op, const QJsonObject &params, Callback ready)
 {
     QMetaObject::invokeMethod(worker, [this, op, params, ready = std::move(ready)] {

@@ -24,6 +24,7 @@ public:
     std::optional<QDBusConnection> bus;
     QTimer idle;
     bool active = false, subscribed = false, registered = false, starting = false;
+    bool saved = true;
     QString job;
     QMap<QString, QString> completed;
     std::function<void(bool)> pending;
@@ -35,7 +36,7 @@ public:
         idle.setInterval(120000);
         idle.setTimerType(Qt::PreciseTimer);
         connect(&idle, &QTimer::timeout, this, [this] {
-            if (active && !subscribed && !pending) {
+            if (active && saved && !subscribed && !pending) {
                 stop([this](bool success) {
                     if (success && this->owner->stopped) {
                         this->owner->stopped();
@@ -59,7 +60,7 @@ public:
         }
         job.clear();
         completed.clear();
-        if (success && active && !subscribed) {
+        if (success && active && saved && !subscribed) {
             idle.start();
         }
         auto callback = std::exchange(pending, {});
@@ -198,8 +199,20 @@ bool OpenRgbUnit::owned() const { return worker->active; }
 bool OpenRgbUnit::transitioning() const { return bool(worker->pending); }
 void OpenRgbUnit::activity()
 {
-    if (worker->active && !worker->subscribed) {
+    if (worker->active && worker->saved && !worker->subscribed) {
         worker->idle.start();
+    }
+}
+void OpenRgbUnit::setSaved(bool value)
+{
+    if (worker->saved == value) {
+        return;
+    }
+    worker->saved = value;
+    if (value) {
+        activity();
+    } else {
+        worker->idle.stop();
     }
 }
 void OpenRgbUnit::setSubscribed(bool value)

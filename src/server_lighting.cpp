@@ -22,9 +22,10 @@ void Server::dispatchLighting(Connection *connection, const Protocol::Request &r
                 result.result = {{"devices", adapter->devices()}};
             } else if (request.operation == "lighting.get") {
                 result = adapter->lighting(params.value("device").toString());
+            } else if (request.operation == "lighting.save") {
+                result = adapter->saveLighting(params.value("device").toString());
             } else {
-                result = adapter->setLighting(params.value("device").toString(),
-                    params.value("color").toString(), params.value("brightness").toInt());
+                result = adapter->updateLighting(params);
             }
             peer->send(Protocol::response(request.id, result));
         };

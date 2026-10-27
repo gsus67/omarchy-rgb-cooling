@@ -10,6 +10,8 @@ public:
     virtual QJsonObject engine() const = 0;
     virtual QJsonArray devices() const = 0;
     virtual Protocol::Reply lighting(const QString &device) const = 0;
+    virtual Protocol::Reply updateLighting(const QJsonObject &params) = 0;
+    virtual Protocol::Reply saveLighting(const QString &device) = 0;
     virtual Protocol::Reply setLighting(const QString &device, const QString &color,
                                        int brightness) = 0;
 };

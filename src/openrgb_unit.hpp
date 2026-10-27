@@ -13,6 +13,7 @@ public:
     void start(std::function<void(bool)> ready);
     void stop(std::function<void(bool)> ready);
     void activity();
+    void setSaved(bool saved);
     void setSubscribed(bool subscribed);
     bool owned() const;
     bool transitioning() const;

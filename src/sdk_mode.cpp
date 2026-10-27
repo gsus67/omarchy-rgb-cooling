@@ -27,7 +27,7 @@ bool SdkMode::decode(SdkReader &reader, unsigned version, SdkMode &mode)
 {
     mode.name = reader.string();
     if (version < 6) {
-        reader.u32();
+        mode.value = reader.u32();
     }
     mode.flags = reader.u32();
     mode.speedMin = reader.u32();
@@ -46,7 +46,6 @@ bool SdkMode::decode(SdkReader &reader, unsigned version, SdkMode &mode)
     mode.colorMode = reader.u32();
     const auto count = reader.u16();
     if (count > 4096 || mode.colorsMin > mode.colorsMax || mode.colorsMax > 4096
-        || mode.speedMin > mode.speedMax || mode.brightnessMin > mode.brightnessMax
         || mode.colorMode > 3) {
         return false;
     }
@@ -56,13 +55,21 @@ bool SdkMode::decode(SdkReader &reader, unsigned version, SdkMode &mode)
     return reader.valid();
 }
 
-QByteArray SdkMode::encode() const
+QByteArray SdkMode::encode(unsigned version) const
 {
     QByteArray result = sdkText(name);
-    for (auto field : {flags, speedMin, speedMax, brightnessMin, brightnessMax,
-                       colorsMin, colorsMax, speed, brightness, direction, colorMode}) {
-        result += sdkWord(field);
+    if (version < 6) {
+        result += sdkWord(value);
     }
+    result += sdkWord(flags) + sdkWord(speedMin) + sdkWord(speedMax);
+    if (version >= 3) {
+        result += sdkWord(brightnessMin) + sdkWord(brightnessMax);
+    }
+    result += sdkWord(colorsMin) + sdkWord(colorsMax) + sdkWord(speed);
+    if (version >= 3) {
+        result += sdkWord(brightness);
+    }
+    result += sdkWord(direction) + sdkWord(colorMode);
     result += sdkHalf(colors.size());
     for (auto color : colors) {
         result += sdkWord(color);
@@ -90,21 +97,44 @@ QJsonObject SdkController::lighting() const
     }
     const auto &mode = modes[active];
     const auto &values = mode.colorMode == 2 ? mode.colors : colors;
-    if (values.isEmpty() || !std::all_of(values.begin(), values.end(),
-                                       [&](auto value) { return value == values.first(); })) {
+    const bool uniform = !values.isEmpty() && std::all_of(values.begin(), values.end(),
+        [&](auto value) { return value == values.first(); });
+    if (mode.singleColor() && mode.colorMode != 3 && !uniform) {
         return {};
     }
-    const auto first = values.first();
+    const auto first = uniform ? values.first() : 0U;
     const auto color = QString("#%1%2%3").arg(first & 255, 2, 16, QChar('0'))
         .arg((first >> 8) & 255, 2, 16, QChar('0')).arg((first >> 16) & 255, 2, 16, QChar('0'));
-    int brightness = 100;
-    const bool native = (mode.flags & 16U) && mode.brightnessMax > mode.brightnessMin;
-    if (native) {
-        const auto value = std::clamp(mode.brightness, mode.brightnessMin, mode.brightnessMax);
-        brightness = int((quint64(value - mode.brightnessMin) * 100
-                          + (mode.brightnessMax - mode.brightnessMin) / 2)
-                         / (mode.brightnessMax - mode.brightnessMin));
+    const bool native = mode.flags & 16U;
+    return {{"device", device.value("id")}, {"mode", mode.name}, {"color", color},
+            {"brightness", native
+                ? modePercent(mode.brightness, mode.brightnessMin, mode.brightnessMax) : 100},
+            {"brightness_emulated", !native},
+            {"speed", (mode.flags & 1U)
+                ? QJsonValue(modePercent(mode.speed, mode.speedMin, mode.speedMax))
+                : QJsonValue(QJsonValue::Null)},
+            {"random", mode.colorMode == 3}, {"saved", true}};
+}
+
+quint32 modeRange(int percent, quint32 minimum, quint32 maximum)
+{
+    return (quint64(minimum) * (100 - percent) + quint64(maximum) * percent + 50) / 100;
+}
+
+int modePercent(quint32 value, quint32 minimum, quint32 maximum)
+{
+    if (minimum == maximum) {
+        return 100;
     }
-    return {{"device", device.value("id")}, {"color", color}, {"brightness", brightness},
-            {"brightness_emulated", !native}};
+    value = std::clamp(value, std::min(minimum, maximum), std::max(minimum, maximum));
+    const quint64 distance = qAbs(qint64(value) - minimum);
+    const quint64 range = qAbs(qint64(maximum) - minimum);
+    return (distance * 100 + range / 2) / range;
+}
+
+QJsonObject SdkMode::description() const
+{
+    return {{"name", name}, {"speed", bool(flags & 1U)}, {"brightness", bool(flags & 16U)},
+            {"color", singleColor() ? "single" : "none"}, {"random", bool(flags & 128U)},
+            {"savable", savable()}};
 }

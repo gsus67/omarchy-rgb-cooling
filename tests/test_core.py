@@ -508,7 +508,7 @@ class CoreContract(unittest.TestCase):
         watch.drain()
         device = self.client.request("devices")["result"]["devices"][0]
         self.assertEqual(set(device), {"id", "name", "vendor", "engine", "support", "writable",
-                                       "blocked_reason", "excluded", "capabilities"})
+                                       "blocked_reason", "excluded", "modes", "capabilities"})
         self.assertEqual(device["id"], "demo:rgb0")
         self.assertEqual(device["support"], "simulation-tested")
         self.assertTrue(device["writable"])
@@ -532,7 +532,8 @@ class CoreContract(unittest.TestCase):
 
     def test_contract_demo_lighting_get_set_roundtrip_and_unavailable(self):
         expected = {"device": "demo:rgb0", "color": "#abcdef", "brightness": 0,
-                    "brightness_emulated": True}
+                    "brightness_emulated": True, "mode": "Static", "speed": None,
+                    "random": False, "saved": False}
         reply = self.client.request("lighting.set", {
             "device": "demo:rgb0", "color": "#ABCDEF", "brightness": 0,
         })
