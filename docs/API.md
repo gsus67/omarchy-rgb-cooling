@@ -142,6 +142,11 @@ Lighting {device: string, color: "#rrggbb", brightness: 0-100, brightness_emulat
   `Ethernet`, `ACPI`; anything else uses the hwmon `name`. `label` is the hwmon
   `*_label` when present (e.g. `Package id 0`, `edge`), otherwise `Temperature`,
   `Temperature 2`… or `Fan`, `Fan 2`… Both are plain text.
+- RAM sensors from several hwmon devices (`spd5118`, `jc42`, `ee1004`) are
+  labelled `DIMM 1`, `DIMM 2`… in I²C bus/address order, never repeated
+  `Temperature` rows.
+- Ethernet matching uses the hwmon name prefix (`r8169_0_600:00` is Ethernet)
+  or a network-class parent device.
 - When a device has more than one fan channel, every fan is labelled with its
   sysfs channel number (`Fan 1`, `Fan 5`, `Fan 10`), so the first one is never a
   bare `Fan`. Sensors are listed per device in natural order (`Fan 2` before
