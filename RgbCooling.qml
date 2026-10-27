@@ -110,6 +110,13 @@ Panel {
     return null
   }
   readonly property bool canWrite: currentDevice !== null && currentDevice.writable === true
+  // Lighting is still getting ready: a scan is running, or an enabled device is
+  // waiting for OpenRGB to start (the core answers once it is up). The tab
+  // shows a loading state instead of a half-empty panel.
+  readonly property bool lightingLoading: scanning
+      || (currentDevice !== null && currentDevice.enabled === true && currentDevice.writable !== true
+          && lightingError === "")
+      || (canWrite && lighting === null && lightingError === "")
   // Effects the controller offers (docs/API.md, "Effects and saving").
   readonly property var currentModes: currentDevice && Array.isArray(currentDevice.modes) ? currentDevice.modes : []
   readonly property var currentMode: {

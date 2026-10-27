@@ -63,6 +63,8 @@
     "Save to device": "Guardar en la placa",
     "Saved to the device: it stays after reboots, OpenRGB can stop.": "Guardado en la placa: se mantiene al reiniciar y OpenRGB puede apagarse.",
     "Saving…": "Guardando…",
-    "Starting…": "Arrancando…"
+    "Starting…": "Arrancando…",
+    "Loading RGB engine…": "Cargando el motor RGB…",
+    "OpenRGB is starting and reading your devices. This takes a few seconds.": "OpenRGB está arrancando y leyendo tus dispositivos. Tarda unos segundos."
   }
 }

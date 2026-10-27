@@ -70,14 +70,15 @@ def msi_modes():
 
 
 def controller(name="MSI RGB", location="HID: /dev/hidraw9", serial="unique", version=6,
-               with_lighting=True, modes=None, active=0, led_colors=None):
+               with_lighting=True, modes=None, active=0, led_colors=None,
+               vendor="MSI", description="USB lighting", firmware="1.0"):
     # Independent fixture including v6 zone/segment/display/configuration extensions.
     if modes is None:
         modes = [mode("Direct", flags=32), mode(flags=16 | 64 | 256, color_mode=2)]
     body = word(0) + string(name)
     if version >= 1:
-        body += string("MSI")
-    body += string("USB lighting") + string("1.0") + string(serial) + string(location)
+        body += string(vendor)
+    body += string(description) + string(firmware) + string(serial) + string(location)
     body += struct.pack("<HI", len(modes), active)
     body += b"".join(mode_bytes(value, version) for value in modes)
     body += struct.pack("<H", 1)
@@ -104,6 +105,22 @@ def controller(name="MSI RGB", location="HID: /dev/hidraw9", serial="unique", ve
         body += struct.pack("<H", 0) + word(0)
     if version >= 6:
         body += string("") + word(3) + b"{}\0"
+    return word(len(body) + 4) + body
+
+
+def controller_metadata(descriptor, *, version=6, **changes):
+    """Change only SDK metadata, retaining the mode/LED buffers after real writes."""
+    offset = 8
+    fields = ["name", "vendor", "description", "firmware", "serial", "location"]
+    body = descriptor[4:8]
+    for field in fields:
+        if field == "vendor" and version == 0:
+            continue
+        length, = struct.unpack_from("<H", descriptor, offset)
+        end = offset + 2 + length
+        body += string(changes[field]) if field in changes else descriptor[offset:end]
+        offset = end
+    body += descriptor[offset:]
     return word(len(body) + 4) + body
 
 

@@ -68,6 +68,7 @@ private:
     void fail(const QString &message);
     void publish();
     void gates();
+    void identify(SdkController &controller, const SdkController *known = nullptr);
     void notify();
     void finish(const Protocol::Reply &reply);
     Protocol::Reply lighting(const QString &device) const;
