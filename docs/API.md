@@ -160,9 +160,20 @@ once per scan), never `0416:5302`. Candidates appear in `devices` with
 only starts once at least one device is enabled, and it sees only those.
 
 rgbcd starts the unit through the systemd user manager on D-Bus
-(`StartUnit`) only when a scan or lighting operation needs OpenRGB, and stops
-it (`StopUnit`) after 120 s without lighting activity or panel subscribers. No
-polling, no retries.
+(`StartUnit`) only when a scan or lighting operation needs OpenRGB. After a
+successful start, an asynchronous, bounded startup wait retries the SDK connection
+every 250 ms for at most 10 s while OpenRGB detects hardware. Pending `devices`,
+`devices.rescan` and `lighting.*` requests wait for the real scan result; a
+successful scan also emits a `devices` event. If the deadline expires, the engine
+becomes `unreachable` with an explicit reason and makes no further attempts until
+another operation requests a scan. This startup wait is the only automatic retry;
+there is no background polling.
+
+rgbcd stops the unit (`StopUnit`) after 120 s without lighting activity or
+subscribers to `devices` (the open panel). Only `lighting.get`, `lighting.set`
+and `devices` subscriptions count as use; `sensors` and `profile` subscriptions
+do not keep OpenRGB running. The 120 s deadline restarts when the last `devices`
+subscriber unsubscribes or disconnects, or on lighting activity.
 
 ### Enabling RGB control per device
 
@@ -196,7 +207,8 @@ rgbcd never polls engines on its own. An engine is contacted only by:
 - a udev hotplug event while some connection is subscribed to `devices`.
 
 A failed scan leaves the engine `absent` or `unreachable` until the next one;
-there are no automatic retries. The UI subscribes to `devices` only while the
+there are no retries after the bounded startup wait described above.
+The UI subscribes to `devices` only while the
 panel is open, so with the panel closed nothing contacts OpenRGB.
 
 ### Types

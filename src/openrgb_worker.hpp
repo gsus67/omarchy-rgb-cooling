@@ -31,6 +31,8 @@ private:
     QMap<QString, QString> launchedNodes;
     QTcpSocket socket;
     QTimer timeout;
+    QTimer startupRetry, startupDeadline;
+    QElapsedTimer startup;
     QByteArray input;
     Phase phase = Phase::Disconnected;
     QString state = "absent", reason = "OpenRGB has not been requested";
@@ -49,6 +51,8 @@ private:
     void next();
     void scan();
     void connectServer();
+    void connectionFailed(const QString &message);
+    void endStartup();
     void send(quint32 device, quint32 command, const QByteArray &payload = {});
     void receive();
     bool packet(quint32 device, quint32 command, const QByteArray &payload);

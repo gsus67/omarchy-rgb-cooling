@@ -196,11 +196,7 @@ void Server::subscriptionsChanged()
     }
     powerProfiles.setSubscribed(profileSubscriber);
     if (!demo && adapter) {
-        bool subscribed = false;
-        for (const auto *client : clients) {
-            subscribed = subscribed || !client->topics.isEmpty();
-        }
-        static_cast<OpenRgbAdapter *>(adapter.get())->setSubscribed(subscribed);
+        static_cast<OpenRgbAdapter *>(adapter.get())->setSubscribed(deviceSubscriber);
     }
     scheduleEvents();
 }

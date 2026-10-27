@@ -72,6 +72,17 @@ extern "C" int connect(int fd, const sockaddr *address, socklen_t length)
     if (address->sa_family == AF_INET && length >= sizeof(sockaddr_in)) {
         auto target = *reinterpret_cast<const sockaddr_in *>(address);
         if (target.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && target.sin_port == htons(6742)) {
+            if (const char *log = std::getenv("CORE_TEST_OPENRGB_CONNECTS")) {
+                timespec now{};
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                const long long stamp = now.tv_sec * 1000000000LL + now.tv_nsec;
+                const int output = static_cast<int>(::syscall(
+                    SYS_openat, AT_FDCWD, log, O_WRONLY | O_CREAT | O_APPEND, 0600));
+                if (output < 0 || ::write(output, &stamp, sizeof(stamp)) != sizeof(stamp)) {
+                    std::abort();
+                }
+                ::close(output);
+            }
             const char *port = std::getenv("CORE_TEST_OPENRGB_PORT");
             if (!port) {
                 errno = ECONNREFUSED;

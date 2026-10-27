@@ -10,18 +10,37 @@ OpenRgbWorker::OpenRgbWorker(const QString &root, const QString &rules)
     // QObject members must be children so all sockets, D-Bus and timers follow the worker.
     socket.setParent(this);
     timeout.setParent(this);
+    startupRetry.setParent(this);
+    startupDeadline.setParent(this);
+    for (auto *timer : {&startupRetry, &startupDeadline}) {
+        timer->setTimerType(Qt::PreciseTimer);
+    }
+    startupDeadline.setSingleShot(true);
+    startupRetry.setInterval(250);
+    startupDeadline.setInterval(10000);
+    connect(&startupRetry, &QTimer::timeout, this, [this] { connectServer(); });
+    connect(&startupDeadline, &QTimer::timeout, this, [this] {
+        fail("OpenRGB SDK server did not become reachable within 10 s after StartUnit");
+    });
     socket.setReadBufferSize(1024 * 1024 + 16);
     timeout.setSingleShot(true);
     timeout.setInterval(2000);
     timeout.setTimerType(Qt::PreciseTimer);
-    connect(&timeout, &QTimer::timeout, this, [this] { fail("OpenRGB SDK response timed out"); });
+    connect(&timeout, &QTimer::timeout, this, [this] {
+        connectionFailed("OpenRGB SDK response timed out");
+    });
     connect(&socket, &QTcpSocket::connected, this, [this] {
+        if (startup.isValid() && startup.elapsed() >= 10000) {
+            fail("OpenRGB SDK server did not become reachable within 10 s after StartUnit");
+            return;
+        }
+        endStartup();
         phase = Phase::Version;
         send(0, 40, sdkWord(6));
     });
     connect(&socket, &QTcpSocket::readyRead, this, [this] { receive(); });
     connect(&socket, &QTcpSocket::errorOccurred, this, [this](auto) {
-        fail("OpenRGB SDK transport failed");
+        connectionFailed("OpenRGB SDK transport failed");
     });
     connect(&socket, &QTcpSocket::disconnected, this, [this] {
         if (phase != Phase::Disconnected) {
@@ -30,6 +49,12 @@ OpenRgbWorker::OpenRgbWorker(const QString &root, const QString &rules)
     });
     unit.settled = [this] { next(); };
     unit.stopped = [this] {
+        if (scanning || !reading.isEmpty()) {
+            fail("OpenRGB unit stopped before the SDK operation completed");
+            return;
+        }
+        endStartup();
+        timeout.stop();
         idleStopped = true;
         phase = Phase::Disconnected;
         socket.abort();
@@ -127,6 +152,7 @@ void OpenRgbWorker::scan()
     scanning = true;
     idleStopped = false;
     lastScan.start();
+    endStartup();
     phase = Phase::Disconnected;
     socket.abort();
     input.clear();
@@ -166,12 +192,19 @@ void OpenRgbWorker::scan()
             return;
         }
         phase = Phase::Starting;
-        unit.start([this, allowed, nodes](bool success) {
+        const bool starting = !unit.owned();
+        unit.start([this, allowed, nodes, starting](bool success) {
             if (!success) {
                 fail("Unable to start the plugin's OpenRGB unit through the session bus");
             } else {
                 launchedDevices = allowed;
                 launchedNodes = nodes;
+                if (starting) {
+                    // Only a new StartUnit gets a bounded connection grace period.
+                    startup.start();
+                    startupDeadline.start();
+                    startupRetry.start();
+                }
                 connectServer();
             }
         });
@@ -184,10 +217,33 @@ void OpenRgbWorker::scan()
 }
 void OpenRgbWorker::connectServer()
 {
+    if (startup.isValid() && startup.elapsed() >= 10000) {
+        fail("OpenRGB SDK server did not become reachable within 10 s after StartUnit");
+        return;
+    }
+    phase = Phase::Disconnected;
+    socket.abort();
     version = 6;
     phase = Phase::Connecting;
     timeout.start();
     socket.connectToHost(QHostAddress::LocalHost, 6742);
+}
+void OpenRgbWorker::connectionFailed(const QString &message)
+{
+    if (phase == Phase::Connecting && startup.isValid()) {
+        // Keep the scan and its joined requests pending while the unit detects hardware.
+        phase = Phase::Starting;
+        timeout.stop();
+        socket.abort();
+    } else {
+        fail(message);
+    }
+}
+void OpenRgbWorker::endStartup()
+{
+    startup.invalidate();
+    startupRetry.stop();
+    startupDeadline.stop();
 }
 void OpenRgbWorker::send(quint32 device, quint32 command, const QByteArray &payload)
 {
@@ -242,6 +298,7 @@ void OpenRgbWorker::receive()
 }
 void OpenRgbWorker::fail(const QString &message)
 {
+    endStartup();
     phase = Phase::Disconnected;
     socket.abort();
     timeout.stop();

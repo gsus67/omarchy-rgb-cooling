@@ -145,7 +145,7 @@ def apply_leds(descriptor, payload):
 
 class OpenRgbServer:
     def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False,
-                 listener=None, device_ids=None):
+                 listener=None, device_ids=None, defer_listen=False):
         self.behavior = behavior
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
@@ -158,6 +158,7 @@ class OpenRgbServer:
         self.accepted = 0
         self.disconnected = threading.Event()
         self.stop_event = threading.Event()
+        self.listening = threading.Event()
         self.ready = threading.Event()
         self.client = None
         self.lock = threading.Lock()
@@ -165,10 +166,15 @@ class OpenRgbServer:
         if listener is None:
             self.listener.bind(("127.0.0.1", 0))
         self.port = self.listener.getsockname()[1]
-        self.listener.listen(8)
         self.listener.settimeout(0.1)
+        if not defer_listen:
+            self.start_listening()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
+
+    def start_listening(self):
+        self.listener.listen(8)
+        self.listening.set()
 
     def send(self, data):
         with self.lock:
@@ -181,6 +187,9 @@ class OpenRgbServer:
                 self.client.sendall(data)
 
     def run(self):
+        while not self.listening.wait(0.1):
+            if self.stop_event.is_set():
+                return
         while not self.stop_event.is_set():
             try:
                 client, _address = self.listener.accept()
