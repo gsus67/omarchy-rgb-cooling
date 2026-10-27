@@ -139,11 +139,19 @@ class Client:
         self.input = b""
         self.sequence = 0
         self.events = []
+        # Replies to earlier requests that arrived while request() was waiting
+        # for its own; read() hands them out first, in arrival order.
+        self.stashed = []
 
     def send(self, value):
         self.socket.sendall(json.dumps(value).encode() + b"\n")
 
     def read(self, timeout=WAIT_TIMEOUT):
+        if self.stashed:
+            return self.stashed.pop(0)
+        return self.read_line(timeout)
+
+    def read_line(self, timeout=WAIT_TIMEOUT):
         deadline = time.monotonic() + timeout
         while b"\n" not in self.input:
             self.socket.settimeout(max(0.001, deadline - time.monotonic()))
@@ -162,12 +170,14 @@ class Client:
         self.sequence += 1
         self.send({"v": 1, "id": self.sequence, "op": operation, "params": params or {}})
         while True:
-            response = self.read()
+            response = self.read_line()
             if "event" in response:
                 self.events.append(response)
                 continue
-            if response["id"] != self.sequence:
-                raise AssertionError(response)
+            if response.get("id") != self.sequence:
+                # Another request's reply overtook ours: keep it for read().
+                self.stashed.append(response)
+                continue
             return response
 
     def event(self, topic, timeout=WAIT_TIMEOUT):
@@ -176,7 +186,7 @@ class Client:
                 return self.events.pop(index)
         deadline = time.monotonic() + timeout
         while True:
-            event = self.read(max(0.001, deadline - time.monotonic()))
+            event = self.read_line(max(0.001, deadline - time.monotonic()))
             if event.get("event") == topic:
                 return event
             if "event" in event:
@@ -1199,7 +1209,10 @@ class OpenRgbContract(unittest.TestCase):
         abandoned.close()
         wait_until(lambda: fake.commands, message="pending OpenRGB SDK request to arrive")
         self.assertTrue(other.request("hello")["ok"])
-        daemon.advance(2.3, other)
+        # The timeout can settle 101/102 before advance() reads its waking hello.
+        # Use a peer without pending replies so either dispatch order is valid.
+        with daemon.client() as control:
+            daemon.advance(2.3, control)
         reply = client.read()
         self.assertEqual(reply["id"], 100)
         self.assertEqual(reply["result"], {"devices": []})
