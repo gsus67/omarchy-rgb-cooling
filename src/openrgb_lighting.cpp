@@ -25,6 +25,7 @@ Protocol::Reply OpenRgbWorker::write(const QString &id, const QJsonObject &param
     const auto &controller = controllers[id];
     const auto identity = controller.device.value("usb").toString();
     saving = requests.head().operation == "lighting.save";
+    writeAckFailed = false;
     writtenMode = -1;
     writtenColor.clear();
     if (saving) {

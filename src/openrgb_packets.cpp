@@ -4,11 +4,12 @@
 #include <QtEndian>
 #include <algorithm>
 
-bool OpenRgbWorker::signalUpdate(quint32 device, const QByteArray &payload) const
+bool OpenRgbWorker::signalUpdate(quint32 device, const QByteArray &payload)
 {
-    // Protocol 6 sends these asynchronously, including after a write's readback.
-    // They are notifications, not replies or acknowledgements: validate them but
-    // keep explicit descriptor reads authoritative for lighting and write checks.
+    // Notifications refresh inventory but never complete an explicit read/write.
+    if (payload.size() < 8 || payload.size() > 1024 * 1024) {
+        return false;
+    }
     SdkReader reader(payload);
     if (reader.u32() != quint32(payload.size())) {
         return false;
@@ -17,18 +18,41 @@ bool OpenRgbWorker::signalUpdate(quint32 device, const QByteArray &payload) cons
     if (!reader.valid()) {
         return false;
     }
+    SdkController controller;
     if (reason == 0) { // UPDATELEDS carries only a colour buffer.
         const auto count = reader.u16();
-        return count <= 4096 && reader.skip(qsizetype(count) * 4) && reader.done();
-    }
-    SdkController controller;
-    if (!SdkController::decode(payload.mid(8), version, controller)) {
+        if (count > 4096) {
+            return false;
+        }
+        for (int i = 0; i < count; ++i) {
+            controller.colors.append(reader.u32());
+        }
+        if (!reader.done()) {
+            return false;
+        }
+    } else if (!SdkController::decodeUpdate(payload, version, controller)) {
         return false;
     }
-    const auto &knownControllers = scanning ? pendingControllers : controllers;
-    for (const auto &known : knownControllers) {
+    auto &knownControllers = scanning ? pendingControllers : controllers;
+    for (auto &known : knownControllers) {
         if (known.index == device) {
-            return controller.device.value("id") == known.device.value("id");
+            if (reason == 0) {
+                if (controller.colors.size() != known.colors.size()) {
+                    return false;
+                }
+                known.colors = controller.colors;
+            } else {
+                if (controller.device.value("id") != known.device.value("id")) {
+                    return false;
+                }
+                controller.index = device;
+                known = controller;
+            }
+            if (!scanning) {
+                gates();
+                notify();
+            }
+            return true;
         }
     }
     // A notification can race enumeration; it must never add a controller.
@@ -40,28 +64,25 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
     if (version >= 6 && command == 1150) {
         return signalUpdate(device, payload);
     }
-    if (version >= 6 && command == 51 && device == 0 && !payload.isEmpty()
-        && payload.size() <= 4096) {
-        const auto encoded = sdkHalf(payload.size()) + payload;
-        SdkReader reader(encoded);
-        reader.string();
-        return reader.done();
+    if (command == 51) {
+        return true; // Informational server string, including during the greeting.
     }
-    if (version >= 6 && command == 10) {
+    if (command == 10) {
         if (payload.size() != 8) {
-            return false;
+            return true; // Never invalidate inventory on an unsolicited/malformed ACK.
         }
         SdkReader reader(payload);
         const auto acknowledged = reader.u32();
         const auto status = reader.u32();
         const auto key = (quint64(device) << 32) | acknowledged;
-        if (status != 0 || acknowledgements.value(key) < 1) {
-            return false;
+        if (acknowledgements.value(key) < 1) {
+            return true;
         }
         if (--acknowledgements[key] == 0) {
             acknowledgements.remove(key);
         }
         if (acknowledged == 1101 || acknowledged == 1050 || acknowledged == 1102) {
+            writeAckFailed = writeAckFailed || status != 0;
             const auto prefix = quint64(device) << 32;
             awaitingWriteAck = acknowledgements.contains(prefix | 1101)
                 || acknowledgements.contains(prefix | 1050)
@@ -140,26 +161,35 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
             }
             send(device, 1, version >= 6 ? QByteArray() : sdkWord(version));
         } else {
-            if (awaitingWriteAck) {
-                return false;
-            }
             timeout.stop();
             reading.clear();
             phase = Phase::Idle;
             notify();
             auto result = lighting(id);
+            if (awaitingWriteAck || writeAckFailed) {
+                result = Protocol::Reply::failure("unavailable",
+                    "OpenRGB write acknowledgement is missing or rejected");
+            }
+            // A failed ACK affects this operation, not the controller's identity
+            // or write gate. Retire its bookkeeping before the next operation.
+            const auto prefix = quint64(device) << 32;
+            for (const auto command : {1101U, 1050U, 1102U}) {
+                acknowledgements.remove(prefix | command);
+            }
+            awaitingWriteAck = false;
+            writeAckFailed = false;
             if (writtenMode >= 0) {
                 if (controller.active >= unsigned(controller.modes.size())) {
                     return false;
                 }
                 const auto &actual = controller.modes[controller.active];
-                if (controller.active != unsigned(writtenMode) || !result.ok()
+                if (result.ok() && (controller.active != unsigned(writtenMode)
                     || (!writtenColor.isEmpty()
                         && result.result.value("color").toString() != writtenColor)
                     || actual.speed != writtenDescriptor.speed
                     || actual.colorMode != writtenDescriptor.colorMode
                     || actual.colors != writtenDescriptor.colors
-                    || (writtenBrightness >= 0 && actual.brightness != writtenBrightness)) {
+                    || (writtenBrightness >= 0 && actual.brightness != writtenBrightness))) {
                     result = Protocol::Reply::failure("unsupported",
                         "OpenRGB did not apply the requested mode values");
                 }

@@ -41,6 +41,7 @@ private:
     QVector<quint32> controllerIds;
     QMap<quint64, int> acknowledgements;
     bool awaitingWriteAck = false;
+    bool writeAckFailed = false;
     QString writtenColor;
     int writtenMode = -1;
     qint64 writtenBrightness = -1;
@@ -63,7 +64,7 @@ private:
     void send(quint32 device, quint32 command, const QByteArray &payload = {});
     void receive();
     bool packet(quint32 device, quint32 command, const QByteArray &payload);
-    bool signalUpdate(quint32 device, const QByteArray &payload) const;
+    bool signalUpdate(quint32 device, const QByteArray &payload);
     void fail(const QString &message);
     void publish();
     void gates();

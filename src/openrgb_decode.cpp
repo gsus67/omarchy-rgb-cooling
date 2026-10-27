@@ -161,6 +161,28 @@ bool SdkController::decode(const QByteArray &payload, unsigned version, SdkContr
     return true;
 }
 
+bool SdkController::decodeUpdate(const QByteArray &payload, unsigned version, SdkController &out)
+{
+    if (payload.size() < 8 || payload.size() > 1024 * 1024) {
+        return false;
+    }
+    SdkReader reader(payload);
+    if (reader.u32() != quint32(payload.size())) {
+        return false;
+    }
+    // OpenRGB release_1.1: this uint32 is update_reason (UPDATEMODE = 1),
+    // emitted by RGBController::UpdateMode(), not a nested descriptor size.
+    // NetworkServer::SendRequest_RGBController_SignalUpdate writes size, reason,
+    // then GetDeviceDescriptionData; NetworkClient::ProcessRequest_RGBController_SignalUpdate
+    // consumes both words before SetDeviceDescription. Ignore the reason here.
+    // https://github.com/CalcProgrammer1/OpenRGB/blob/release_1.1/NetworkServer.cpp
+    // https://github.com/CalcProgrammer1/OpenRGB/blob/release_1.1/NetworkClient.cpp
+    // https://github.com/CalcProgrammer1/OpenRGB/blob/release_1.1/RGBController/RGBController.cpp
+    reader.u32();
+    // Rebuild the REQ_DATA envelope using only the checked, actual buffer size.
+    return decode(sdkWord(payload.size() - 4) + payload.mid(8), version, out);
+}
+
 bool OpenRgbAdapter::decodeController(const QByteArray &payload, unsigned version,
                                      QJsonObject &device, QJsonObject &lighting)
 {

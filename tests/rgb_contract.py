@@ -157,7 +157,7 @@ class OpenRgbContractMixin:
         self.assertEqual(self.fake.accepted, 0)
 
     def test_static_update_mode_exact_bytes_native_brightness_and_readback(self):
-        self.launch(fragment=True)
+        self.launch(fragment=True, updates="before")
         device = self.devices()[0]
         self.assertTrue(device["writable"], device)
         result = self.set_color(device, brightness=25)
@@ -205,6 +205,76 @@ class OpenRgbContractMixin:
 
     def test_rescan_save_preserves_real_inventory_across_connections_and_events(self):
         self.assert_write_preserves_real_inventory("lighting.save")
+
+    def test_real_protocol_6_sequence_keeps_repeated_set_and_save_writable(self):
+        self.launch(fragment=True, device_ids=[42], descriptors=[controller(active=1)])
+        before = self.devices()
+        device = before[0]
+        for index, color in enumerate(("#123456", "#abcdef", "#654321")):
+            for operation in ("lighting.set", "lighting.save"):
+                with self.subTest(index=index, operation=operation):
+                    start = len(self.fake.sent)
+                    command, reason = (1101, 1) if operation == "lighting.set" else (1102, 2)
+                    params = {"color": color, "brightness": 25 + index * 25}
+                    reply = self.client.request(operation, {"device": device["id"],
+                        **(params if operation == "lighting.set" else {})})
+                    self.assertTrue(reply["ok"], reply)
+                    self.assertEqual(reply["result"]["device"], device["id"])
+                    self.assertEqual(reply["result"]["color"], color)
+                    self.assertEqual(reply["result"]["saved"], operation == "lighting.save")
+                    ack = packet(42, 10, word(command) + word(0))
+                    self.core.wait_until(lambda: len(self.fake.sent) >= start + 6,
+                                         message="ACK, descriptor, ACK and SIGNALUPDATE sent")
+                    frames = self.fake.sent[start:]
+                    write_ack = frames.index(ack)
+                    descriptor = self.fake.descriptors[0]
+                    # Assert the captured wire format independently of signal_update().
+                    notification = word(len(descriptor) + 4) + word(reason) + descriptor[4:]
+                    self.assertEqual(frames[write_ack:write_ack + 4], [ack,
+                        packet(42, 1, descriptor), packet(42, 10, word(1) + word(0)),
+                        packet(42, 1150, notification)])
+                    current = self.client.request("lighting.get", {"device": device["id"]})
+                    self.assertEqual(current["result"], reply["result"])
+                    self.assertEqual(self.devices(), before)
+                    if operation == "lighting.save":
+                        self.assertEqual(self.fake.saved_modes[42], self.writes()[-1][2])
+            self.advance(10)
+        self.assertEqual(self.fake.accepted, 1)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+
+    def test_signal_update_refreshes_inventory_without_a_descriptor_request(self):
+        self.launch(device_ids=[42], descriptors=[controller(active=1)])
+        before = self.devices()[0]
+        commands = len(self.fake.commands)
+        modes = [mode("Static", color_mode=2), mode("New effect", flags=16 | 32 | 256)]
+        self.fake.descriptors = [controller(modes=modes)]
+        descriptor = self.fake.descriptors[0]
+        self.fake.send(packet(42, 1150,
+            word(len(descriptor) + 4) + word(0xffffffff) + descriptor[4:]))
+        current = self.core.wait_until(lambda: next((device for device in self.devices()
+            if any(value["name"] == "New effect" for value in device["modes"])), None),
+            message="SIGNALUPDATE updates inventory without polling OpenRGB")
+        self.assertEqual(len(self.fake.commands), commands)
+        for key in ("id", "usb", "writable", "enabled"):
+            self.assertEqual(current[key], before[key])
+        self.assertTrue(self.set_color(current)["ok"])
+        self.assertTrue(self.save(current)["result"]["saved"])
+        self.assertEqual(self.devices()[0]["id"], before["id"])
+        self.assertEqual(self.fake.accepted, 1)
+
+    def test_server_strings_and_unrelated_or_malformed_acks_never_invalidate_inventory(self):
+        self.launch(device_ids=[42], descriptors=[controller(active=1)])
+        before = self.devices()
+        for command, payload in ((51, b"OpenRGB 1.1\0"), (51, b""),
+                (51, b"unterminated\xff"), (10, b""), (10, b"x" * 7),
+                (10, b"x" * 9), (10, word(1101) + word(3)),
+                (10, word(1) + word(0)), (10, word(999) + word(0))):
+            self.fake.send(packet(42, command, payload))
+        # The readback is a barrier behind all injected packets on the SDK socket.
+        self.assertTrue(self.client.request("lighting.get", {"device": before[0]["id"]})["ok"])
+        self.assertEqual(self.devices(), before)
+        self.assertTrue(self.set_color(before[0])["ok"])
+        self.assertEqual(self.fake.accepted, 1)
 
     def test_new_connection_reuses_completed_openrgb_inventory(self):
         self.launch()
@@ -690,12 +760,20 @@ class OpenRgbContractMixin:
         device = self.devices()[0]
         self.assertFalse(self.set_color(device)["ok"])
         self.assertEqual([command for _, command, _ in self.writes()], [1101])
+        self.assertTrue(self.devices()[0]["writable"])
+        self.fake.behavior = "normal"
+        self.assertTrue(self.set_color(device)["ok"])
+        self.assertEqual(self.fake.accepted, 1)
 
     def test_protocol_6_malformed_write_ack_is_rejected(self):
         self.launch(behavior="bad_write_ack")
         device = self.devices()[0]
         self.assertFalse(self.set_color(device)["ok"])
         self.assertEqual([command for _, command, _ in self.writes()], [1101])
+        self.assertTrue(self.devices()[0]["writable"])
+        self.fake.behavior = "normal"
+        self.assertTrue(self.set_color(device)["ok"])
+        self.assertEqual(self.fake.accepted, 1)
 
     def test_per_led_static_exact_bytes_uniform_buffer_native_brightness_and_readback(self):
         modes = [mode("Direct", flags=32), mode()]
