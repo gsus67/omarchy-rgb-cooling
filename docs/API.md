@@ -113,6 +113,10 @@ Lighting {device: string, color: "#rrggbb", brightness: 0-100, brightness_emulat
   `Ethernet`, `ACPI`; anything else uses the hwmon `name`. `label` is the hwmon
   `*_label` when present (e.g. `Package id 0`, `edge`), otherwise `Temperature`,
   `Temperature 2`… or `Fan`, `Fan 2`… Both are plain text.
+- When a device has more than one fan channel, every fan is labelled with its
+  sysfs channel number (`Fan 1`, `Fan 5`, `Fan 10`), so the first one is never a
+  bare `Fan`. Sensors are listed per device in natural order (`Fan 2` before
+  `Fan 10`), temperatures before fans.
 - Sensor ids are stable: `<hwmon name>:<canonical parent device path>:<channel>`
   (for example `coretemp:platform/coretemp.0:temp1`), never `hwmonN`.
 - `value` is `null` when the reading is missing, non-finite or failed; `stale`
