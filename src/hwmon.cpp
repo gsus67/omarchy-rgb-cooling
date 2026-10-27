@@ -8,7 +8,9 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <tuple>
 #include <utility>
 
 Hwmon::Hwmon(QString root) : root(std::move(root))
@@ -89,14 +91,36 @@ void Hwmon::sample(int intervalMilliseconds)
         return address;
     };
     QVector<QString> nvmeAddresses;
+    auto isRam = [](const Node &node) {
+        return node.name == "spd5118" || node.name == "jc42" || node.name == "ee1004";
+    };
+    auto i2cOrder = [](const QString &path) {
+        static const QRegularExpression busPattern("(?:^|/)i2c-([0-9]+)(?:/|$)");
+        static const QRegularExpression addressPattern("(?:^|/)([0-9]+)-([0-9a-fA-F]{4})$");
+        const auto busMatch = busPattern.match(path);
+        const auto addressMatch = addressPattern.match(path);
+        const int bus = busMatch.hasMatch() ? busMatch.captured(1).toInt() : INT_MAX;
+        const int addressBus = addressMatch.hasMatch() ? addressMatch.captured(1).toInt() : INT_MAX;
+        bool addressOk = false;
+        const int address = addressMatch.hasMatch()
+            ? addressMatch.captured(2).toInt(&addressOk, 16) : INT_MAX;
+        return std::tuple(bus, addressBus, addressOk ? address : INT_MAX, path);
+    };
+    QVector<QString> ramParents;
     for (const auto &node : nodes) {
         if (node.name.startsWith("nvme") || node.driver == "nvme") {
             nvmeAddresses.push_back(pciAddress(node.parent) + ":" + node.parent);
+        }
+        if (isRam(node) && !ramParents.contains(node.parent)) {
+            ramParents.push_back(node.parent);
         }
     }
     std::sort(nvmeAddresses.begin(), nvmeAddresses.end());
     nvmeAddresses.erase(std::unique(nvmeAddresses.begin(), nvmeAddresses.end()),
                         nvmeAddresses.end());
+    std::sort(ramParents.begin(), ramParents.end(), [&](const QString &left, const QString &right) {
+        return i2cOrder(left) < i2cOrder(right);
+    });
     QString cpuVendor;
     const QString cpuInfo = readText("/proc/cpuinfo");
     static const QRegularExpression vendorPattern("^vendor_id\\s*:\\s*(\\S+)",
@@ -137,6 +161,9 @@ void Hwmon::sample(int intervalMilliseconds)
             sensor.header = fanHeaders.header(name, channel);
             sensor.label = SensorNames::label(name, channel,
                                               readText(path + "/" + channel + "_label"));
+            if (isRam(node)) {
+                sensor.label = QString("DIMM %1").arg(ramParents.indexOf(node.parent) + 1);
+            }
             if (sensor.kind == "fan" && fans.size() > 1) {
                 sensor.label = "Fan " + channel.mid(3);
             }

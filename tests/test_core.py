@@ -628,8 +628,8 @@ class HwmonContract(unittest.TestCase):
              {"temp1_input": "42000"}),
             ("hwmon22", "nvme", "pci0000:00/0000:00:1c.1/0000:02:00.0",
              {"temp1_input": "43000"}),
-            ("hwmon23", "spd5118", "platform/i2c-0/0-0050", {"temp1_input": "44000"}),
-            ("hwmon24", "spd5118", "platform/i2c-0/0-0051", {"temp1_input": "45000"}),
+            ("hwmon23", "spd5118", "platform/i2c-8/8-0053", {"temp1_input": "44000"}),
+            ("hwmon24", "spd5118", "platform/i2c-8/8-0051", {"temp1_input": "45000"}),
             ("hwmon25", "iwlwifi_1", "pci0000:00/0000:06:00.0", {"temp1_input": "46000"}),
             ("hwmon26", "r8169-0000:04:00.0", "pci0000:00/0000:04:00.0",
              {"temp1_input": "47000"}),
@@ -637,6 +637,7 @@ class HwmonContract(unittest.TestCase):
         )
         for number, name, parent, files in devices:
             self.daemon.tree.add(number, name, parent, files)
+        self.daemon.tree.add_mdio_ethernet()
         data = self.client.request("sensors")["result"]
         sensors = {sensor["id"]: sensor for sensor in data["sensors"]}
         expected = {
@@ -645,12 +646,14 @@ class HwmonContract(unittest.TestCase):
                 ("NVMe 2", "Temperature"),
             "nvme:pci0000:00/0000:00:1c.1/0000:02:00.0:temp1":
                 ("NVMe 1", "Temperature"),
-            "spd5118:platform/i2c-0/0-0050:temp1": ("RAM", "Temperature"),
-            "spd5118:platform/i2c-0/0-0051:temp1": ("RAM", "Temperature"),
+            "spd5118:platform/i2c-8/8-0053:temp1": ("RAM", "DIMM 2"),
+            "spd5118:platform/i2c-8/8-0051:temp1": ("RAM", "DIMM 1"),
             "iwlwifi_1:pci0000:00/0000:06:00.0:temp1": ("Wi-Fi", "Temperature"),
             "r8169-0000:04:00.0:pci0000:00/0000:04:00.0:temp1":
                 ("Ethernet", "Temperature"),
             "acpitz:virtual/thermal/thermal_zone0:temp1": ("ACPI", "Temperature"),
+            "r8169_0_600:00:platform/mdio_bus/0/0-0000:00:00.0:temp1":
+                ("Ethernet", "Temperature"),
         }
         for sensor_id, (device, label) in expected.items():
             with self.subTest(sensor_id=sensor_id):
@@ -658,6 +661,15 @@ class HwmonContract(unittest.TestCase):
                 self.assertEqual(sensors[sensor_id]["label"], label)
         self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["device"], "Intel CPU")
         self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["label"], "Package id 0")
+
+    def test_contract_single_ram_module_is_dimm_one(self):
+        self.daemon.tree.add("hwmon31", "spd5118", "platform/i2c-12/12-0052", {
+            "temp1_input": "44000",
+        })
+        sensors = self.client.request("sensors")["result"]["sensors"]
+        ram = [sensor for sensor in sensors if sensor["id"].startswith("spd5118:")]
+        self.assertEqual(len(ram), 1)
+        self.assertEqual((ram[0]["device"], ram[0]["label"]), ("RAM", "DIMM 1"))
 
     def test_contract_motherboard_fans_are_named_and_never_writable(self):
         names = ("nct6683", "nct6687", "nct6775", "nct6779", "it87", "it8689", "it8xxx")

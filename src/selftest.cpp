@@ -240,6 +240,11 @@ void testSensorNames(Checks &checks)
                   && SensorNames::device("r8169", "", "", "") == "Ethernet"
                   && SensorNames::device("acpitz", "", "", "") == "ACPI",
                   "storage, memory, network and ACPI names follow the contract");
+    checks.verify(SensorNames::device("r8169_0_600:00", "platform/mdio_bus", "mdio_bus", "")
+                  == "Ethernet"
+                  && SensorNames::device("igc_0", "", "other_driver", "") == "Ethernet"
+                  && SensorNames::device("other", "platform/net/eth0", "", "") == "Ethernet",
+                  "Ethernet names match hwmon prefixes or network parents");
     bool motherboard = true;
     for (const auto &name : {"nct6683", "nct6687", "nct6775", "nct6779", "it87", "it8689"}) {
         motherboard = motherboard && SensorNames::device(name, "", "", "") == "Motherboard"
@@ -253,6 +258,38 @@ void testSensorNames(Checks &checks)
                   && SensorNames::label("", "fan2", "") == "Fan 2"
                   && SensorNames::label("", "temp1", "Package id 0") == "Package id 0",
                   "sensor labels use hwmon labels or human channel names");
+}
+
+void testRamNames(Checks &checks)
+{
+    QTemporaryDir temporary;
+    const QString root = temporary.path() + "/class/hwmon";
+    auto add = [&](const QString &number, const QString &address, const QString &value) {
+        const QString parent = temporary.path() + "/devices/platform/i2c-8/8-" + address;
+        const QString node = parent + "/hwmon/" + number;
+        QDir().mkpath(node);
+        QDir().mkpath(root);
+        QFile name(node + "/name");
+        name.open(QIODevice::WriteOnly);
+        name.write("spd5118\n");
+        QFile input(node + "/temp1_input");
+        input.open(QIODevice::WriteOnly);
+        input.write(value.toUtf8() + "\n");
+        return QFile::link(node, root + "/" + number);
+    };
+    const bool created = add("hwmon1", "0053", "43000")
+        && add("hwmon2", "0051", "42000");
+    Hwmon hwmon(root);
+    hwmon.sample(500);
+    const auto sensors = hwmon.snapshot(500).value("sensors").toArray();
+    QMap<QString, QString> labels;
+    for (const auto &value : sensors) {
+        const auto sensor = value.toObject();
+        labels.insert(sensor.value("id").toString(), sensor.value("label").toString());
+    }
+    checks.verify(created && labels.value("spd5118:platform/i2c-8/8-0051:temp1") == "DIMM 1"
+                  && labels.value("spd5118:platform/i2c-8/8-0053:temp1") == "DIMM 2",
+                  "RAM labels follow numeric I2C bus and address order");
 }
 
 void testDemo(Checks &checks)
@@ -315,6 +352,7 @@ int runSelfTests(const QString &dataDirectory)
     testProtocol(checks);
     testSdk(checks);
     testSensorNames(checks);
+    testRamNames(checks);
     testHwmon(checks);
     testDemo(checks);
     testFanHeaders(checks, dataDirectory);
