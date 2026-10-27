@@ -101,6 +101,13 @@ void Hwmon::sample(int intervalMilliseconds)
         const QString &path = node.path;
         const QString &name = node.name;
         const auto inputs = QDir(path).entryList(QDir::Files, QDir::Name);
+        QSet<QString> fans;
+        for (const auto &input : inputs) {
+            const auto match = channelPattern.match(input);
+            if (match.hasMatch() && match.captured(1) == "fan") {
+                fans.insert(input.left(input.lastIndexOf('_')));
+            }
+        }
         for (const auto &input : inputs) {
             const auto match = channelPattern.match(input);
             if (!match.hasMatch()) {
@@ -123,6 +130,9 @@ void Hwmon::sample(int intervalMilliseconds)
             sensor.kind = match.captured(1);
             sensor.label = SensorNames::label(name, channel,
                                               readText(path + "/" + channel + "_label"));
+            if (sensor.kind == "fan" && fans.size() > 1) {
+                sensor.label = "Fan " + channel.mid(3);
+            }
             sensor.cpuPackage = name == "coretemp"
                 && sensor.label.contains("package", Qt::CaseInsensitive);
             sensor.path = path + "/" + channel + "_input";
@@ -151,7 +161,28 @@ QJsonObject Hwmon::snapshot(int intervalMilliseconds) const
     QJsonArray result;
     QString primary;
     bool primaryPackage = false;
+    QVector<const Sensor *> ordered;
     for (const auto &sensor : sensors) {
+        ordered.append(&sensor);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const Sensor *left, const Sensor *right) {
+        const auto leftEnd = left->id.lastIndexOf(':');
+        const auto rightEnd = right->id.lastIndexOf(':');
+        const auto leftDevice = left->id.left(leftEnd);
+        const auto rightDevice = right->id.left(rightEnd);
+        if (leftDevice != rightDevice) {
+            return leftDevice < rightDevice;
+        }
+        if (left->kind != right->kind) {
+            return left->kind == "temp";
+        }
+        const auto leftChannel = left->id.mid(leftEnd + 1);
+        const auto rightChannel = right->id.mid(rightEnd + 1);
+        return leftChannel.size() != rightChannel.size()
+            ? leftChannel.size() < rightChannel.size() : leftChannel < rightChannel;
+    });
+    for (const auto *entry : ordered) {
+        const auto &sensor = *entry;
         const bool stale = sensor.lastSuccess < 0
             || clock.elapsed() - sensor.lastSuccess > qint64(intervalMilliseconds) * 3;
         result.append(QJsonObject{

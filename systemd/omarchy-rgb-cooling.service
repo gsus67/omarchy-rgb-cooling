@@ -23,6 +23,7 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
+# AF_UNIX and the visible /run/dbus/system_bus_socket permit power profiles.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # The adapter code restricts network access to loopback.
 SystemCallFilter=@system-service

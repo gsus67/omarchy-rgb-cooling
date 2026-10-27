@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import shutil
 import socket
 import stat
@@ -25,6 +26,7 @@ BINARY = None
 PEERCRED_LIBRARY = None
 UDEV_LIBRARY = None
 RUNTIME_LIBRARY = None
+POWER_PROFILES_FAKE = None
 WAIT_TIMEOUT = 30
 
 
@@ -85,6 +87,7 @@ class TestClock:
 def setUpModule():
     """Compile exactly once for this module, in a disposable directory."""
     global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY, UDEV_LIBRARY, RUNTIME_LIBRARY
+    global POWER_PROFILES_FAKE
     BUILD_DIRECTORY = tempfile.TemporaryDirectory(prefix="rgbcd-contract-")
     result = subprocess.run(
         [sys.executable, str(REPO / "native_build.py"), "--output", BUILD_DIRECTORY.name],
@@ -106,6 +109,16 @@ def setUpModule():
         ], capture_output=True, text=True, timeout=30)
         if result.returncode:
             raise RuntimeError(result.stdout + result.stderr)
+
+    POWER_PROFILES_FAKE = Path(BUILD_DIRECTORY.name) / "power-profiles"
+    qt_flags = shlex.split(subprocess.check_output(
+        ["pkg-config", "--cflags", "--libs", "Qt6Core", "Qt6DBus"], text=True))
+    result = subprocess.run([
+        compiler, "-std=c++20", "-fPIC", "-Wall", "-Wextra", "-Wpedantic",
+        str(REPO / "tests/fakes/power_profiles.cpp"), *qt_flags, "-o", str(POWER_PROFILES_FAKE),
+    ], capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(result.stdout + result.stderr)
 
 
 def tearDownModule():
@@ -185,7 +198,9 @@ class Daemon:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tree = HwmonTree(self.directory / "hwmon")
         self.path = self.directory / "core.sock"
-        environment = {**os.environ, **(environment or {})}
+        environment = {**os.environ,
+                       "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/nonexistent/rgbcd-test-bus",
+                       **(environment or {})}
         for variable in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES", "CORE_TEST_CLOCK"):
             environment.pop(variable, None)
         libraries = [str(RUNTIME_LIBRARY), str(UDEV_LIBRARY)]
@@ -640,6 +655,36 @@ class HwmonContract(unittest.TestCase):
                 self.assertEqual(sensors[sensor_id]["label"], label)
         self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["device"], "Intel CPU")
         self.assertEqual(sensors["coretemp:platform/coretemp.0:temp1"]["label"], "Package id 0")
+
+    def test_contract_motherboard_fans_are_named_and_never_writable(self):
+        names = ("nct6683", "nct6687", "nct6775", "nct6779", "it87", "it8689", "it8xxx")
+        for number, name in enumerate(names, 40):
+            node = self.daemon.tree.add(f"hwmon{number}", name, f"platform/{name}", {
+                "temp1_input": "42000", "fan1_input": "800", "fan1_label": "CPU_FAN",
+                "fan2_input": "900", "fan2_label": "SYS_FAN", "pwm1": "100",
+                "pwm1_enable": "2", "fan1_target": "1000", "fan10_input": "1000",
+            })
+            for path in node.iterdir():
+                if path.is_file():
+                    path.chmod(0o666)
+        before = self.daemon.tree.snapshot()
+        data = self.client.request("sensors")["result"]
+        for name in names:
+            sensors = [item for item in data["sensors"] if item["id"].startswith(name + ":")]
+            self.assertEqual(len(sensors), 4)
+            self.assertEqual([item["kind"] for item in sensors], ["temp", "fan", "fan", "fan"])
+            self.assertEqual({item["device"] for item in sensors}, {"Motherboard"})
+            fans = [item for item in sensors if item["kind"] == "fan"]
+            self.assertEqual([item["label"] for item in fans], ["Fan 1", "Fan 2", "Fan 10"])
+            for fan in fans:
+                for op in ("fans.set", "fan.set", "pwm.set"):
+                    response = self.client.request(op, {"device": fan["id"], "value": 255})
+                    self.assertEqual(response["error"]["code"], "unknown_op")
+                response = self.client.request("lighting.set", {
+                    "device": fan["id"], "color": "#ffffff", "brightness": 100,
+                })
+                self.assertFalse(response["ok"])
+        self.assertEqual(before, self.daemon.tree.snapshot())
 
     def test_contract_hwmon_blocked_read_does_not_block_other_connections(self):
         path = self.daemon.tree.cpu / "temp1_input"
@@ -1203,6 +1248,234 @@ class ActivationAndLifetimeContract(unittest.TestCase):
         peer = replacement.client()
         self.addCleanup(peer.close)
         self.assertTrue(peer.request("hello")["ok"])
+
+
+class PowerProfilesContract(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rgbcd-profiles-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        # --config-file replaces --session's default config; this is a private session
+        # masquerading as the system bus exclusively through the child's environment.
+        self.bus = subprocess.Popen([
+            "dbus-daemon", "--config-file=" + str(REPO / "tests/fakes/system-bus.conf"),
+            "--nofork", "--print-address=1",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.stop, self.bus)
+        self.address = self.bus_address()
+        self.environment = {"DBUS_SYSTEM_BUS_ADDRESS": self.address}
+        self.fake = None
+        self.start_fake()
+        self.daemon = Daemon(self.directory / "core", environment=self.environment, clock=True)
+        self.addCleanup(self.daemon.close)
+        self.client = self.daemon.client()
+        self.addCleanup(self.client.close)
+
+    @staticmethod
+    def stop(process):
+        if process.poll() is None:
+            process.terminate()
+        process.communicate(timeout=WAIT_TIMEOUT)
+
+    def bus_address(self):
+        self.assertTrue(select.select([self.bus.stdout], [], [], WAIT_TIMEOUT)[0])
+        value = self.bus.stdout.readline().decode().strip()
+        self.assertTrue(value.startswith("unix:"), value)
+        return value
+
+    def line(self, process):
+        self.assertTrue(select.select([process.stdout], [], [], WAIT_TIMEOUT)[0],
+                        "fake did not answer")
+        value = process.stdout.readline()
+        self.assertTrue(value, "fake exited unexpectedly")
+        return json.loads(value)
+
+    def start_fake(self):
+        self.fake = subprocess.Popen([str(POWER_PROFILES_FAKE)],
+                                     env={**os.environ, **self.environment},
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+        self.addCleanup(self.stop, self.fake)
+        self.assertEqual(self.line(self.fake), {"ready": True})
+
+    def command(self, **value):
+        self.fake.stdin.write(json.dumps(value).encode() + b"\n")
+        self.fake.stdin.flush()
+        return self.line(self.fake)
+
+    def names(self):
+        return set(self.command(action="names")["names"])
+
+    def assert_error(self, response, code):
+        self.assertFalse(response["ok"], response)
+        self.assertEqual(response["error"]["code"], code)
+
+    def test_get_reads_all_properties_and_profile_entries(self):
+        self.command(degraded="high-operating-temperature")
+        response = self.client.request("profile.get", {"profile": "performance"})
+        self.assertEqual(response["result"], {
+            "profile": "balanced", "available": ["power-saver", "balanced", "performance"],
+            "degraded": "high-operating-temperature",
+        })
+        self.assertEqual(self.command()["sets"], 0)
+
+    def test_set_each_contract_profile_and_confirm_state(self):
+        for profile in ("performance", "power-saver", "balanced"):
+            self.daemon.advance(1, self.client)
+            response = self.client.request("profile.set", {"profile": profile})
+            self.assertTrue(response["ok"], response)
+            self.assertEqual(response["result"]["profile"], profile)
+            self.assertEqual(self.client.request("profile.get")["result"], response["result"])
+        self.assertEqual(self.command()["sets"], 3)
+
+    def test_set_rejects_invalid_names_and_types_without_bus_interest(self):
+        baseline = self.names()
+        for value in (None, True, 1, [], {}, "", "turbo", "Balanced", "balanced\n"):
+            self.assert_error(self.client.request("profile.set", {"profile": value}), "bad_request")
+        self.assert_error(self.client.request("profile.set"), "bad_request")
+        self.assertEqual(self.names(), baseline)
+        self.assertEqual(self.command()["gets"], 0)
+
+    def test_set_unavailable_profile_is_bad_request_without_write(self):
+        self.command(available=["power-saver", "balanced"])
+        self.assert_error(self.client.request("profile.set", {"profile": "performance"}),
+                          "bad_request")
+        self.assertEqual(self.command()["sets"], 0)
+
+    def test_daemon_absent_returns_unavailable_then_recovers(self):
+        self.stop(self.fake)
+        for op in ("profile.get", "profile.set"):
+            self.assert_error(self.client.request(op, {"profile": "balanced"}), "unavailable")
+        self.start_fake()
+        self.assertEqual(self.client.request("profile.get")["result"]["profile"], "balanced")
+
+    def test_failed_bus_returns_unavailable(self):
+        daemon = Daemon(self.directory / "absent-bus")
+        self.addCleanup(daemon.close)
+        client = daemon.client()
+        self.addCleanup(client.close)
+        self.assert_error(client.request("profile.get"), "unavailable")
+
+    def test_set_response_waits_for_confirmation_and_other_requests_keep_running(self):
+        self.command(hold=True)
+        self.client.send({"v": 1, "id": 99, "op": "profile.set",
+                          "params": {"profile": "performance"}})
+        wait_until(lambda: self.command()["held"], message="Set to reach fake service")
+        self.assertFalse(select.select([self.client.socket], [], [], 0)[0])
+        self.assertTrue(self.client.request("hello")["ok"])
+        peer = self.daemon.client()
+        self.addCleanup(peer.close)
+        self.assertTrue(peer.request("sensors")["ok"])
+        self.command(action="release")
+        response = self.client.read()
+        self.assertEqual(response["id"], 99)
+        self.assertEqual(response["result"]["profile"], "performance")
+
+    def test_set_cannot_report_success_when_daemon_does_not_apply_change(self):
+        self.command(ignore=True)
+        self.assert_error(self.client.request("profile.set", {"profile": "performance"}),
+                          "unavailable")
+
+    def test_set_denied_returns_blocked(self):
+        self.command(reject=True)
+        self.assert_error(self.client.request("profile.set", {"profile": "performance"}), "blocked")
+
+    def test_external_signal_and_invalidation_emit_profile_without_polling(self):
+        self.assertTrue(self.client.request("subscribe", {"topics": ["profile"]})["ok"])
+        # This read is also a barrier after the asynchronous subscription setup.
+        self.client.request("profile.get")
+        for invalidated, profile in ((False, "power-saver"), (True, "performance")):
+            self.command(action="change", profile=profile, degraded="test", invalidated=invalidated)
+            data = self.client.event("profile")["data"]
+            self.assertEqual(data["profile"], profile)
+            self.assertEqual(data["degraded"], "test")
+            self.assertEqual(data["available"], ["power-saver", "balanced", "performance"])
+        gets = self.command()["gets"]
+        self.daemon.advance(60, self.client)
+        time.sleep(0.7)
+        self.assertEqual(self.command()["gets"], gets)
+        self.assertFalse(select.select([self.client.socket], [], [], 0)[0])
+
+    def test_set_rate_limit_is_two_per_second_per_connection(self):
+        for profile in ("power-saver", "balanced"):
+            self.assertTrue(self.client.request("profile.set", {"profile": profile})["ok"])
+        self.assert_error(self.client.request("profile.set", {"profile": "performance"}),
+                          "rate_limited")
+        peer = self.daemon.client()
+        self.addCleanup(peer.close)
+        self.assertTrue(peer.request("profile.set", {"profile": "performance"})["ok"])
+        self.daemon.advance(1, self.client)
+        self.assertTrue(self.client.request("profile.set", {"profile": "balanced"})["ok"])
+        self.assertEqual(self.command()["sets"], 4)
+
+    def test_no_interest_does_not_connect_and_operations_release_the_bus(self):
+        baseline = self.names()
+        self.client.request("sensors")
+        self.client.request("status")
+        self.client.request("subscribe", {"topics": ["sensors", "devices"]})
+        self.daemon.advance(2, self.client)
+        time.sleep(0.2)
+        self.assertEqual(self.names(), baseline)
+        self.assertEqual(self.command()["gets"], 0)
+        self.client.request("profile.get")
+        wait_until(lambda: self.names() == baseline, message="operation bus connection released")
+        self.client.request("subscribe", {"topics": ["profile"]})
+        wait_until(lambda: len(self.names() - baseline) == 1, message="subscriber bus connection")
+        peer = self.daemon.client()
+        self.addCleanup(peer.close)
+        peer.request("subscribe", {"topics": ["profile"]})
+        self.client.request("unsubscribe")
+        # A request provides a barrier while the second subscriber still holds the bus.
+        peer.request("profile.get")
+        self.assertEqual(len(self.names() - baseline), 1)
+        peer.request("unsubscribe")
+        wait_until(lambda: self.names() == baseline, message="unsubscribe bus connection released")
+        peer.request("subscribe", {"topics": ["profile"]})
+        wait_until(lambda: len(self.names() - baseline) == 1, message="resubscription")
+        peer.close()
+        wait_until(lambda: self.names() == baseline, message="closed subscriber releases bus")
+
+    def test_no_interest_never_attempts_bus_handshake_and_slow_bus_does_not_block_api(self):
+        trap = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(trap.close)
+        path = self.directory / "trap.sock"
+        trap.bind(str(path))
+        trap.listen()
+        daemon = Daemon(self.directory / "slow-bus", environment={
+            "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=" + str(path),
+        })
+        self.addCleanup(daemon.close)
+        client = daemon.client()
+        self.addCleanup(client.close)
+        client.request("subscribe", {"topics": ["sensors", "devices"], "interval_ms": 500})
+        self.assertTrue(client.request("sensors")["ok"])
+        self.assertFalse(select.select([trap], [], [], 0.7)[0], "unexpected D-Bus connection")
+        client.send({"v": 1, "id": 99, "op": "profile.get"})
+        self.assertTrue(select.select([trap], [], [], WAIT_TIMEOUT)[0])
+        handshake, _address = trap.accept()
+        self.addCleanup(handshake.close)
+        # Leave D-Bus authentication unanswered until API responsiveness is established.
+        peer = daemon.client()
+        self.addCleanup(peer.close)
+        self.assertTrue(peer.request("hello")["ok"])
+        self.assertTrue(peer.request("sensors")["ok"])
+        handshake.close()
+        response = client.read()
+        while "event" in response:
+            response = client.read()
+        self.assertEqual(response["id"], 99)
+        self.assert_error(response, "unavailable")
+
+    def test_disconnect_during_pending_set_is_safe(self):
+        self.command(hold=True)
+        self.client.send({"v": 1, "id": 99, "op": "profile.set",
+                          "params": {"profile": "performance"}})
+        wait_until(lambda: self.command()["held"], message="pending Set")
+        self.client.close()
+        self.command(action="release")
+        peer = self.daemon.client()
+        self.addCleanup(peer.close)
+        self.assertEqual(peer.request("profile.get")["result"]["profile"], "performance")
 
 
 class BootstrapContract(unittest.TestCase):

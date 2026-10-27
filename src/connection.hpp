@@ -22,6 +22,7 @@ public:
     void send(const QJsonObject &object);
     void subscriptionChanged();
     bool allowLightingWrite();
+    bool allowProfileWrite();
     void start();
 
 private:
@@ -29,6 +30,7 @@ private:
     QTimer idle;
     QElapsedTimer clock;
     QQueue<qint64> writeTimes;
+    QQueue<qint64> profileWriteTimes;
     QByteArray input;
     bool closing = false;
     void receive();

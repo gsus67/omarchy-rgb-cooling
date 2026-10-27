@@ -70,6 +70,19 @@ bool Connection::allowLightingWrite()
     return true;
 }
 
+bool Connection::allowProfileWrite()
+{
+    const auto now = clock.elapsed();
+    while (!profileWriteTimes.isEmpty() && now - profileWriteTimes.head() >= 1000) {
+        profileWriteTimes.dequeue();
+    }
+    if (profileWriteTimes.size() >= 2) {
+        return false;
+    }
+    profileWriteTimes.enqueue(now);
+    return true;
+}
+
 void Connection::receive()
 {
     if (closing) {

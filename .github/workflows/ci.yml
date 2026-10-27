@@ -25,7 +25,7 @@ jobs:
         # Arch mirrors sometimes drop a download; retry before failing.
         run: |
           for attempt in 1 2 3; do
-            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs python && exit 0
+            pacman -Syu --noconfirm --needed gcc pkgconf qt6-base systemd-libs dbus python && exit 0
             sleep 15
           done
           exit 1

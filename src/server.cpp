@@ -10,7 +10,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-Server::Server(bool demo, const QString &hwmonRoot) : demo(demo), sensorSource(hwmonRoot)
+Server::Server(bool demo, const QString &hwmonRoot)
+    : demo(demo), sensorSource(hwmonRoot),
+      powerProfiles([this](const auto &data) { profileChanged(data); })
 {
     clock.start();
     socket.accepted = [this](qintptr descriptor) { accept(descriptor); };
@@ -127,6 +129,21 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
             }
         });
         return;
+    } else if (op == "profile.get" || op == "profile.set") {
+        if (op == "profile.set" && !connection->allowProfileWrite()) {
+            reply = Protocol::Reply::failure(
+                "rate_limited", "At most two profile changes per second");
+        } else {
+            const auto profile = op == "profile.set"
+                ? params.value("profile").toString() : QString();
+            powerProfiles.request(profile,
+                [peer = QPointer(connection), id = request.id](const auto &result) {
+                    if (peer) {
+                        peer->send(Protocol::response(id, result));
+                    }
+                });
+            return;
+        }
     } else if (op == "subscribe") {
         ++connection->subscriptionRevision;
         connection->topics.clear();
@@ -157,12 +174,15 @@ void Server::subscriptionsChanged()
 {
     sampleInterval = 10000;
     deviceSubscriber = false;
+    bool profileSubscriber = false;
     for (const auto *connection : clients) {
         if (connection->topics.contains("sensors")) {
             sampleInterval = std::min(sampleInterval, connection->intervalMilliseconds);
         }
         deviceSubscriber = deviceSubscriber || connection->topics.contains("devices");
+        profileSubscriber = profileSubscriber || connection->topics.contains("profile");
     }
+    powerProfiles.setSubscribed(profileSubscriber);
     scheduleEvents();
 }
 
@@ -171,7 +191,7 @@ void Server::scheduleEvents()
     events.stop();
     qint64 earliest = std::numeric_limits<qint64>::max();
     for (const auto *connection : clients) {
-        if (!connection->topics.isEmpty()) {
+        if (connection->topics.contains("sensors") || connection->topics.contains("devices")) {
             earliest = std::min(earliest, connection->nextEvent);
         }
     }
@@ -216,6 +236,16 @@ void Server::devicesChanged()
     for (auto *connection : peers) {
         if (clients.contains(connection) && connection->topics.contains("devices")) {
             connection->send(Protocol::event("devices", {{"devices", adapter->devices()}}));
+        }
+    }
+}
+
+void Server::profileChanged(const QJsonObject &data)
+{
+    const auto peers = clients;
+    for (auto *connection : peers) {
+        if (clients.contains(connection) && connection->topics.contains("profile")) {
+            connection->send(Protocol::event("profile", data));
         }
     }
 }

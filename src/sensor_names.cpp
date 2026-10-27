@@ -13,6 +13,12 @@ bool startsWithAny(const QString &value, const QStringList &prefixes)
     return false;
 }
 
+bool motherboard(const QString &name)
+{
+    return name == "nct6683" || name == "nct6687" || name == "nct6775"
+        || name == "nct6779" || name == "it87" || name.startsWith("it8");
+}
+
 // The hwmon driver identifies the sensor's own CPU; /proc/cpuinfo is only a
 // fallback for drivers that do not imply a vendor.
 QString cpuName(const QString &driver, const QString &vendor)
@@ -38,6 +44,9 @@ QString SensorNames::device(const QString &hwmonName, const QString &parentPath,
 {
     const QString hwmon = hwmonName.toLower();
     const QString module = driver.isEmpty() ? hwmon : driver.toLower();
+    if (motherboard(hwmon) || motherboard(module)) {
+        return "Motherboard";
+    }
     if (hwmon == "coretemp" || hwmon == "k10temp" || hwmon == "zenpower"
         || hwmon.startsWith("cpu")) {
         return cpuName(hwmon, cpuVendor);
@@ -77,6 +86,9 @@ QString SensorNames::device(const QString &hwmonName, const QString &parentPath,
 QString SensorNames::label(const QString &hwmonName, const QString &channel,
                            const QString &customLabel)
 {
+    if (motherboard(hwmonName.toLower()) && channel.startsWith("fan")) {
+        return "Fan " + channel.mid(3);
+    }
     if (!customLabel.isEmpty()) {
         return customLabel;
     }

@@ -31,6 +31,12 @@
     "Purple": "Morado",
     "Off": "Apagado",
     "Scanning…": "Escaneando…",
-    "Scan for devices (S)": "Buscar dispositivos (S)"
+    "Scan for devices (S)": "Buscar dispositivos (S)",
+    "Silent": "Silencioso",
+    "Balanced": "Equilibrado",
+    "Turbo": "Turbo",
+    "MODE": "MODO",
+    "Fans follow your BIOS curves.": "Los ventiladores siguen las curvas de tu BIOS.",
+    "Hottest core": "Núcleo más caliente"
   }
 }

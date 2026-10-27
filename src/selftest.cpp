@@ -92,6 +92,14 @@ void testProtocol(Checks &checks)
                   && !valid({{"topics", QJsonArray{false}}}, "subscribe")
                   && !valid({{"topics", QJsonArray{"unknown"}}}, "subscribe"),
                   "subscribe validates topic types and leaves interval clamping to server");
+    checks.verify(valid({}, "profile.get")
+                  && valid({{"topics", QJsonArray{"profile"}}}, "subscribe")
+                  && valid({{"profile", "balanced"}}, "profile.set")
+                  && valid({{"profile", "power-saver"}}, "profile.set")
+                  && valid({{"profile", "performance"}}, "profile.set")
+                  && !valid({{"profile", "turbo"}}, "profile.set")
+                  && !valid({{"profile", true}}, "profile.set")
+                  && !valid({}, "profile.set"), "power profiles use the closed API schema");
     const auto failure = Protocol::response(7, Protocol::Reply::failure("blocked", "Plain text"));
     checks.verify(!failure.value("ok").toBool() && failure.value("id").toInt() == 7,
                   "error envelope echoes id");
@@ -196,11 +204,11 @@ void testHwmon(Checks &checks)
     checks.verify(temperature && fan, "hwmon converts millidegrees and preserves zero RPM");
     writeFixture(node + "/temp1_input", "NaN\n");
     hwmon.sample(500);
-    checks.verify(hwmon.snapshot(500).value("sensors").toArray().last().toObject()
+    checks.verify(hwmon.snapshot(500).value("sensors").toArray().first().toObject()
                   .value("value").isNull(), "hwmon non-finite values are null");
     QFile::remove(node + "/temp1_input");
     hwmon.sample(500);
-    checks.verify(hwmon.snapshot(500).value("sensors").toArray().last().toObject()
+    checks.verify(hwmon.snapshot(500).value("sensors").toArray().first().toObject()
                   .value("value").isNull(), "hwmon missing input is null");
     QFile pwm(node + "/pwm1");
     checks.verify(pwm.open(QIODevice::ReadOnly) && pwm.readAll() == "38\n",
@@ -231,6 +239,13 @@ void testSensorNames(Checks &checks)
                   && SensorNames::device("r8169", "", "", "") == "Ethernet"
                   && SensorNames::device("acpitz", "", "", "") == "ACPI",
                   "storage, memory, network and ACPI names follow the contract");
+    bool motherboard = true;
+    for (const auto &name : {"nct6683", "nct6687", "nct6775", "nct6779", "it87", "it8689"}) {
+        motherboard = motherboard && SensorNames::device(name, "", "", "") == "Motherboard"
+            && SensorNames::label(name, "fan1", "CPU_FAN") == "Fan 1"
+            && SensorNames::label(name, "fan2", "") == "Fan 2";
+    }
+    checks.verify(motherboard, "Super I/O sensors use Motherboard and numbered fan labels");
     checks.verify(SensorNames::label("", "temp1", "") == "Temperature"
                   && SensorNames::label("", "temp2", "") == "Temperature 2"
                   && SensorNames::label("", "fan1", "") == "Fan"
