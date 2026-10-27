@@ -29,6 +29,7 @@ struct SdkController {
     int staticMode() const;
     QJsonObject lighting() const;
     static bool decode(const QByteArray &payload, unsigned version, SdkController &controller);
+    static bool decodeUpdate(const QByteArray &, unsigned version, SdkController &controller);
 };
 
 quint32 modeRange(int percent, quint32 minimum, quint32 maximum);

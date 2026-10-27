@@ -19,7 +19,8 @@ def packet(device, command, payload=b""):
 
 
 def signal_update(device, reason, description):
-    body = word(reason) + description
+    # REQ_DATA has a size prefix; SIGNALUPDATE replaces it with size + reason.
+    body = word(reason) + (description if reason == 0 else description[4:])
     return packet(device, 1150, word(len(body) + 4) + body)
 
 
@@ -172,7 +173,7 @@ def apply_leds(descriptor, payload, version=6):
 
 class OpenRgbServer:
     def __init__(self, *, behavior="normal", descriptors=None, advertised=6, fragment=False,
-                 listener=None, device_ids=None, defer_listen=False, updates="before"):
+                 listener=None, device_ids=None, defer_listen=False, updates="after"):
         self.behavior = behavior
         self.descriptors = descriptors if descriptors is not None else [controller()]
         self.advertised = advertised
@@ -182,6 +183,7 @@ class OpenRgbServer:
         self.respond = threading.Event()
         self.respond.set()
         self.commands = []
+        self.sent = []
         self.saved_modes = {}
         self.command_times = []
         self.accepted = 0
@@ -209,6 +211,7 @@ class OpenRgbServer:
         with self.lock:
             if self.client is None:
                 return
+            self.sent.append(data)
             if self.fragment:
                 for start in range(0, len(data), 3):
                     self.client.sendall(data[start:start + 3])
@@ -268,7 +271,7 @@ class OpenRgbServer:
                         elif command == 40:
                             self.send(packet(0, 40, word(self.advertised)))
                             if self.advertised >= 6:
-                                self.send(packet(0, 51, b"Fake OpenRGB 1.1\0"))
+                                self.send(packet(0, 51, b"OpenRGB 1.1\0"))
                                 self.send(packet(0, 10, word(40) + word(0)))
                         elif command == 0:
                             count = len(self.descriptors)

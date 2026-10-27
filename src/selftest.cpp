@@ -182,6 +182,32 @@ void testSdk(Checks &checks)
     }
     checks.verify(modernBounds && !SdkController::decode(modern + 'x', 6, decoded),
                   "SDK v6 rejects every truncated descriptor and trailing bytes");
+    const auto update = word(modern.size() + 4) + word(1) + modern.mid(4);
+    checks.verify(SdkController::decodeUpdate(update, 6, decoded)
+                  && decoded.lighting().value("brightness").toInt() == 50,
+                  "SDK v6 SIGNALUPDATE decodes size, update_reason and descriptor body");
+    bool updateBounds = true;
+    for (qsizetype length = 0; length < update.size(); ++length) {
+        const auto truncated = update.first(length);
+        updateBounds = updateBounds && !SdkController::decodeUpdate(truncated, 6, decoded);
+        if (length >= 8) {
+            const auto resized = word(length) + truncated.mid(4);
+            updateBounds = updateBounds && !SdkController::decodeUpdate(resized, 6, decoded);
+        }
+    }
+    checks.verify(updateBounds
+                  && !SdkController::decodeUpdate(update + 'x', 6, decoded)
+                  && !SdkController::decodeUpdate(
+                      word(update.size() + 1) + update.mid(4), 6, decoded)
+                  && !SdkController::decodeUpdate(word(0xffffffffU) + update.mid(4), 6, decoded)
+                  && !SdkController::decodeUpdate(
+                      word(update.size() + 1) + update.mid(4) + 'x', 6, decoded)
+                  && !SdkController::decodeUpdate(
+                      word(modern.size() + 8) + word(1) + modern, 6, decoded),
+                  "SDK SIGNALUPDATE rejects truncation, forged sizes, trailing and nested sizes");
+    checks.verify(SdkController::decodeUpdate(word(update.size()) + word(0xffffffffU)
+                                             + update.mid(8), 6, decoded),
+                  "SDK SIGNALUPDATE descriptor ignores unknown update reasons");
     const auto legacyBytes = staticMode.encode(4);
     SdkReader legacyMode(legacyBytes);
     SdkMode roundtrip;
@@ -199,6 +225,9 @@ void testSdk(Checks &checks)
         auto mutated = modern;
         mutated[modernSeed % mutated.size()] = static_cast<char>(modernSeed >> 24);
         SdkController::decode(mutated, 6, decoded);
+        auto mutatedUpdate = update;
+        mutatedUpdate[modernSeed % mutatedUpdate.size()] = static_cast<char>(modernSeed >> 24);
+        SdkController::decodeUpdate(mutatedUpdate, 6, decoded);
     }
     checks.verify(true, "SDK v6 malformed-input sanitizer corpus completed");
     quint32 seed = 0x12345678;

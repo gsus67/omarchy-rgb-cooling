@@ -172,6 +172,7 @@ void OpenRgbWorker::scan()
     controllerIds.clear();
     acknowledgements.clear();
     awaitingWriteAck = false;
+    writeAckFailed = false;
     writtenColor.clear();
     writtenMode = -1;
     saving = false;
