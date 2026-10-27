@@ -81,6 +81,34 @@ Motherboard Super I/O sensors (`nct6683`, `nct6687`, `nct6775`, `nct6779`,
 `Fan N` labels. Fan channels are read-only in rgbcd regardless of sysfs
 permissions.
 
+### Fan header names (data/fan-headers.json)
+
+Motherboard fan channels get the board's real header name only from
+`data/fan-headers.json`, never from code. An entry matches when the hwmon
+`name` equals `chip` and `/sys/class/dmi/id/board_vendor` and `board_name`
+equal `dmi_vendor` and one of `dmi_boards` exactly (no wildcards: the same chip
+is wired differently on other boards, and newer MSI boards with the NCT6687D-R
+variant use another order). `headers` maps sysfs channels (`fan1`…) to names;
+channels not listed keep `Fan N`. `status` is `user-verified` (someone checked
+the headers in the BIOS or on the board) or `source-derived`; only
+`user-verified` entries are applied. Names must match `^[A-Z0-9_]{1,16}$`.
+
+rgbcd reads the file once at start from `--data-dir <plugin>/data` (set by
+bootstrap in `ExecStart`); a missing, oversized (> 256 KiB) or invalid file is
+ignored with a warning and every fan keeps `Fan N`.
+
+Sensors gain two fields: `channel` (the sysfs attribute stem, e.g. `fan5`,
+`temp1`) and `header` (the matched header name, or empty). When `header` is
+set, `label` equals it.
+
+### User fan names (panel only)
+
+The panel can rename any sensor. Names are stored by the UI, not rgbcd, in
+`$XDG_CONFIG_HOME/omarchy-rgb-cooling/labels.json` as
+`{"v": 1, "labels": {"<sensor id>": "<name>"}}`, at most 32 characters each,
+shown as plain text, written with `0600` permissions. `uninstall.sh --purge`
+removes them. rgbcd stays read-only.
+
 ### Engine scans (no background polling)
 
 rgbcd never polls engines on its own. An engine is contacted only by:
