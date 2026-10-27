@@ -51,7 +51,7 @@ Column {
   }
 
   Text {
-    visible: tab.panel.lightingDevices.length === 0
+    visible: !tab.panel.lightingLoading && tab.panel.lightingDevices.length === 0
     textFormat: Text.PlainText
     text: tab.t("No lighting devices found. If you have RGB hardware, install its engine in the Engines tab.")
     color: tab.dim
@@ -61,9 +61,57 @@ Column {
     width: parent.width
   }
 
+  // ---- loading state ------------------------------------------------------
+  Row {
+    visible: tab.panel.lightingLoading
+    width: parent.width
+    spacing: Style.space(10)
+
+    Text {
+      id: spinner
+      textFormat: Text.PlainText
+      text: "󰑓"
+      color: tab.bar.foreground
+      font.family: tab.bar.fontFamily
+      font.pixelSize: Style.font.title
+      anchors.verticalCenter: parent.verticalCenter
+      RotationAnimator on rotation {
+        running: spinner.visible
+        from: 0; to: 360; duration: 1000
+        loops: Animation.Infinite
+      }
+    }
+
+    Column {
+      width: parent.width - spinner.width - parent.spacing
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        textFormat: Text.PlainText
+        text: tab.t("Loading RGB engine…")
+        color: tab.bar.foreground
+        font.family: tab.bar.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        width: parent.width
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: tab.t("OpenRGB is starting and reading your devices. This takes a few seconds.")
+        color: tab.dim
+        font.family: tab.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.Wrap
+        width: parent.width
+      }
+    }
+  }
+
   // ---- device cards -------------------------------------------------------
   Repeater {
-    model: tab.panel.lightingDevices
+    model: tab.panel.lightingLoading ? [] : tab.panel.lightingDevices
 
     CursorSurface {
       id: card
@@ -152,7 +200,7 @@ Column {
 
   // ---- editor for the selected device -------------------------------------
   Column {
-    visible: tab.editable
+    visible: tab.editable && !tab.panel.lightingLoading
     width: parent.width
     spacing: Style.space(14)
 

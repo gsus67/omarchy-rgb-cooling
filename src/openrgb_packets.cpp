@@ -42,10 +42,19 @@ bool OpenRgbWorker::signalUpdate(quint32 device, const QByteArray &payload)
                 }
                 known.colors = controller.colors;
             } else {
+                controller.index = device;
+                if (!controller.sameController(known)) {
+                    return false;
+                }
+                if (!controller.location.isEmpty() && controller.location != known.location) {
+                    // A new HID path needs a fresh snapshot; ordinary mode/LED
+                    // notifications reuse the already resolved binding below.
+                    usb = UsbDevices::scan(root, rules);
+                }
+                identify(controller, &known);
                 if (controller.device.value("id") != known.device.value("id")) {
                     return false;
                 }
-                controller.index = device;
                 known = controller;
             }
             if (!scanning) {
@@ -137,14 +146,33 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         return false;
     }
     controller.index = device;
+    if (phase == Phase::Read) {
+        const auto &known = controllers[reading];
+        if (!controller.sameController(known)) {
+            return false;
+        }
+        // Refresh presence/opt-in, but never discard a resolved identity merely
+        // because OpenRGB still advertises a hidraw node that was renumbered.
+        usb = UsbDevices::scan(root, rules);
+        identify(controller, &known);
+    } else {
+        const SdkController *known = nullptr;
+        for (const auto &previous : controllers) {
+            if (controller.sameController(previous)) {
+                known = &previous;
+                break;
+            }
+        }
+        identify(controller, known);
+        // Ambiguity belongs to this enumeration, not a previous SDK list.
+        controller.ambiguous = false;
+    }
     const auto id = controller.device.value("id").toString();
     if (phase == Phase::Read) {
         if (id != reading) {
             return false;
         }
         controllers[id] = controller;
-        // Opt-out and hotplug must also take effect between scans and a lighting write.
-        usb = UsbDevices::scan(root, rules);
         gates();
         if (writing) {
             writing = false;
@@ -212,9 +240,12 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         return true;
     }
     if (pendingControllers.contains(id)) {
-        return false;
+        // One physical device has one public ID. Multiple SDK controllers for
+        // that device remain blocked rather than silently selecting a writer.
+        pendingControllers[id].ambiguous = true;
+    } else {
+        pendingControllers.insert(id, controller);
     }
-    pendingControllers.insert(id, controller);
     if (++index == count) {
         publish();
     } else {
@@ -223,15 +254,35 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
     return true;
 }
 
+void OpenRgbWorker::identify(SdkController &controller, const SdkController *known)
+{
+    if (known && controller.sameController(*known)) {
+        controller.ambiguous = known->ambiguous;
+        controller.device.insert("excluded", known->device.value("excluded").toBool()
+            || controller.device.value("excluded").toBool());
+        if (controller.location.isEmpty() || controller.location == known->location) {
+            // REQ_DATA and full SIGNALUPDATE replace the descriptor, not the physical
+            // controller. Keep the last nonempty location and its resolved USB ID.
+            controller.location = known->location;
+            const auto identity = known->device.value("usb").toString();
+            if (!identity.isEmpty()) {
+                controller.identify(identity);
+                return;
+            }
+        }
+    }
+    const QRegularExpression hid("\\AHID: (/dev/hidraw[0-9]+)\\z");
+    const auto match = hid.match(controller.location);
+    controller.identify(match.hasMatch() ? usb.nodes.value(match.captured(1)) : QString());
+}
+
 void OpenRgbWorker::gates()
 {
     inventory = usb.candidates;
     QMap<QString, int> identities;
     const QRegularExpression hid("\\AHID: (/dev/hidraw[0-9]+)\\z");
     for (auto &controller : controllers) {
-        const auto match = hid.match(controller.location);
-        const auto identity = match.hasMatch() ? usb.nodes.value(match.captured(1)) : QString();
-        controller.device.insert("usb", identity);
+        const auto identity = controller.device.value("usb").toString();
         if (!identity.isEmpty()) {
             ++identities[identity];
         }
@@ -239,6 +290,8 @@ void OpenRgbWorker::gates()
     for (auto &controller : controllers) {
         auto &device = controller.device;
         const auto identity = device.value("usb").toString();
+        const auto match = hid.match(controller.location);
+        const auto current = match.hasMatch() ? usb.nodes.value(match.captured(1)) : QString();
         const bool enabled = usb.enabled.contains(identity);
         const bool excluded = device.value("excluded").toBool()
             || identity.startsWith("usb:0416:5302:");
@@ -247,8 +300,13 @@ void OpenRgbWorker::gates()
             gate = "0416:5302 is reserved exclusively for omarchy-trcc";
         } else if (identity.isEmpty()) {
             gate = "USB identity is unknown";
-        } else if (identities.value(identity) != 1 || usb.locations.value(identity).size() != 1) {
+        } else if (controller.ambiguous || identities.value(identity) != 1
+                   || usb.locations.value(identity).size() > 1) {
             gate = "USB identity is not unique";
+        } else if (usb.locations.value(identity).isEmpty()) {
+            gate = "USB device is not present";
+        } else if (!current.isEmpty() && current != identity) {
+            gate = "USB identity changed; request a fresh scan";
         } else if (!enabled || !usb.valid) {
             gate = "RGB control is disabled for this device";
         } else if (!unit.owned()) {

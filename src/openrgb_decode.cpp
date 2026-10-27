@@ -79,7 +79,7 @@ bool SdkController::decode(const QByteArray &payload, unsigned version, SdkContr
     const auto vendor = version >= 1 ? reader.string() : QString();
     const auto description = reader.string();
     reader.string();
-    const auto serial = reader.string();
+    out.serial = reader.string();
     out.location = reader.string();
     const auto modes = reader.u16();
     out.active = reader.u32();
@@ -136,29 +136,49 @@ bool SdkController::decode(const QByteArray &payload, unsigned version, SdkContr
     if (!reader.done()) {
         return false;
     }
-    const auto identity = QJsonDocument(QJsonArray{name, vendor, description, serial, out.location})
-        .toJson(QJsonDocument::Compact);
-    const QString text = QString::fromUtf8(identity);
+    const QJsonArray metadata{name, vendor, description, out.serial, out.location};
+    const QString text = QString::fromUtf8(QJsonDocument(metadata).toJson(QJsonDocument::Compact));
     const QRegularExpression trofeo("0416.{0,32}5302", QRegularExpression::CaseInsensitiveOption);
     const bool excluded = trofeo.match(text).hasMatch()
         || text.contains("trofeo", Qt::CaseInsensitive)
         || text.contains("usbdisplay", Qt::CaseInsensitive);
-    const QString id = "openrgb:" + QCryptographicHash::hash(identity,
-        QCryptographicHash::Sha256).toHex();
     QJsonArray descriptions;
     for (const auto &mode : out.modes) {
         if (mode.name != "Direct") {
             descriptions.append(mode.description());
         }
     }
-    out.device = {{"id", id}, {"name", name}, {"vendor", vendor}, {"engine", "openrgb"},
+    out.device = {{"name", name}, {"vendor", vendor}, {"engine", "openrgb"},
         {"support", "recognized"}, {"modes", descriptions},
         {"usb", ""}, {"enabled", false}, {"writable", false},
         {"excluded", excluded}, {"blocked_reason", excluded
             ? "0416:5302 is reserved exclusively for omarchy-trcc" : "USB identity is unknown"},
         {"capabilities", excluded || out.lighting().isEmpty()
             ? QJsonArray{} : QJsonArray{"lighting.read"}}};
+    out.identify();
     return true;
+}
+
+void SdkController::identify(const QString &usb)
+{
+    // Physical USB identity takes precedence over all SDK metadata, including the
+    // hidraw number. The non-USB fallback deliberately excludes description,
+    // firmware, modes, LEDs, colours and every other writable descriptor field.
+    const auto identity = usb.isEmpty()
+        ? QJsonDocument(QJsonArray{device.value("name"), device.value("vendor"), serial, location})
+              .toJson(QJsonDocument::Compact)
+        : usb.toUtf8();
+    device.insert("usb", usb);
+    const QString id = "openrgb:" + QCryptographicHash::hash(identity,
+        QCryptographicHash::Sha256).toHex();
+    device.insert("id", id);
+}
+
+bool SdkController::sameController(const SdkController &other) const
+{
+    return index == other.index && serial == other.serial
+        && device.value("name") == other.device.value("name")
+        && device.value("vendor") == other.device.value("vendor");
 }
 
 bool SdkController::decodeUpdate(const QByteArray &payload, unsigned version, SdkController &out)

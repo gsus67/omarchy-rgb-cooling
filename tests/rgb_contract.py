@@ -8,7 +8,7 @@ import struct
 import subprocess
 import tempfile
 
-from fakes.openrgb import (OpenRgbServer, controller, mode, mode_bytes, packet,
+from fakes.openrgb import (OpenRgbServer, controller, controller_metadata, mode, mode_bytes, packet,
                            signal_update, string, word)
 from fakes.usb import UsbTree, rule
 
@@ -66,7 +66,10 @@ class OpenRgbContractMixin:
         self.enable(enabled)
         self.fake = OpenRgbServer(**options)
         self.addCleanup(self.fake.close)
-        self.daemon = self.core.Daemon(self.root / "core", clock=clock, environment={
+        return self.start_daemon(clock=clock)
+
+    def start_daemon(self, directory="core", *, clock=True):
+        self.daemon = self.core.Daemon(self.root / directory, clock=clock, environment={
             **self.environment, "CORE_TEST_OPENRGB_PORT": str(self.fake.port)}, extra=[
                 "--sys-root", str(self.usb.root), "--openrgb-rules", str(self.rules)])
         self.addCleanup(self.daemon.close)
@@ -242,6 +245,182 @@ class OpenRgbContractMixin:
         self.assertEqual(self.fake.accepted, 1)
         self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
 
+    def assert_ten_writes_keep_identity(self, device, before_write=None):
+        changes = [{"brightness": 50}, {"color": "#123456"},
+                   {"mode": "Breathing", "color": "#abcdef", "speed": 50},
+                   {"brightness": 25}, {"mode": "Static", "color": "#654321"},
+                   {"brightness": 75}, {"color": "#234567"},
+                   {"mode": "Breathing", "brightness": 100},
+                   {"mode": "Static", "color": "#345678"}, {"brightness": 50}]
+        for index, params in enumerate(changes):
+            with self.subTest(write=index + 1):
+                if before_write:
+                    before_write(index)
+                reply = self.client.request("lighting.set", {"device": device["id"], **params})
+                self.assertTrue(reply["ok"], reply)
+                self.assertEqual(reply["result"]["device"], device["id"])
+                # Barrier behind the fake's queued full/LED SIGNALUPDATE frames.
+                read = self.client.request("lighting.get", {"device": device["id"]})
+                self.assertTrue(read["ok"], read)
+                current = self.devices()
+                self.assertEqual(len(current), 1, current)
+                self.assertEqual(current[0]["id"], device["id"])
+                self.assertEqual(current[0]["usb"], self.identity)
+                self.assertTrue(current[0]["writable"], current)
+        self.assertEqual(sum(command == 1101 for _, command, _ in self.writes()), 10)
+
+    def lifecycle_modes(self):
+        return [mode("Direct", flags=32), mode(color_mode=2, flags=16 | 64 | 256),
+                mode("Breathing", flags=1 | 16 | 32 | 256, speed_max=10)]
+
+    def test_ten_mixed_writes_keep_physical_id_and_write_gate(self):
+        self.launch(fragment=True, device_ids=[42],
+                    descriptors=[controller(modes=self.lifecycle_modes(), active=1)])
+        device = self.devices("devices.rescan")[0]
+        expected = "openrgb:" + hashlib.sha256(self.identity.encode()).hexdigest()
+        self.assertEqual(device["id"], expected)
+        self.assert_ten_writes_keep_identity(device)
+        self.assertEqual(self.fake.accepted, 1)
+
+    def test_third_write_after_hidraw_renumbering_keeps_cached_usb_resolution(self):
+        self.launch(device_ids=[42],
+                    descriptors=[controller(modes=self.lifecycle_modes(), active=1)])
+        device = self.devices("devices.rescan")[0]
+
+        def renumber(index):
+            if index == 2:
+                # Real MSI failure: OpenRGB retains the old HID path after sysfs
+                # exposes the same physical USB device under a different number.
+                (self.usb.root / "class/hidraw/hidraw9").rename(
+                    self.usb.root / "class/hidraw/hidraw12")
+
+        self.assert_ten_writes_keep_identity(device, renumber)
+        self.assertEqual(self.fake.accepted, 1)
+
+    def test_empty_location_in_signal_update_and_req_data_preserves_usb(self):
+        self.launch(device_ids=[42],
+                    descriptors=[controller(modes=self.lifecycle_modes(), active=1)])
+        device = self.devices("devices.rescan")[0]
+        empty = controller_metadata(self.fake.descriptors[0], location="")
+        self.fake.send(signal_update(42, 1, empty))
+        self.assertTrue(self.client.request("lighting.get", {"device": device["id"]})["ok"])
+        self.assertEqual(self.devices()[0], device)
+
+        def omit_location(index):
+            if index == 2:
+                # All later REQ_DATA and full SIGNALUPDATE descriptors omit it.
+                self.fake.descriptors[0] = controller_metadata(
+                    self.fake.descriptors[0], location="")
+
+        self.assert_ten_writes_keep_identity(device, omit_location)
+        self.advance(2.01)
+        self.assertEqual(self.devices("devices.rescan")[0], device)
+
+    def test_signal_update_with_new_hidraw_location_resolves_the_same_physical_usb(self):
+        self.launch(device_ids=[42], descriptors=[controller(active=1)])
+        device = self.devices("devices.rescan")[0]
+        self.client.request("subscribe", {"topics": ["devices"], "interval_ms": 10000})
+        self.devices()  # Subscription barrier on the worker.
+        self.client.event("devices")
+        self.client.events.clear()
+        (self.usb.root / "class/hidraw/hidraw9").rename(
+            self.usb.root / "class/hidraw/hidraw12")
+        self.fake.descriptors[0] = controller_metadata(self.fake.descriptors[0],
+                                                      location="HID: /dev/hidraw12")
+        commands = len(self.fake.commands)
+        self.fake.send(signal_update(42, 1, self.fake.descriptors[0]))
+        # Observe the notification itself, before any REQ_DATA can refresh sysfs.
+        updated = self.client.event("devices")["data"]["devices"]
+        self.assertEqual(updated, [device])
+        self.assertEqual(len(self.fake.commands), commands)
+        self.assertTrue(self.set_color(device)["ok"])
+        self.assertTrue(self.devices()[0]["writable"])
+
+    def test_physical_id_survives_rgbcd_and_fake_restarts_and_metadata_changes(self):
+        self.launch(device_ids=[42], descriptors=[controller(active=1)])
+        device = self.devices("devices.rescan")[0]
+        self.assertTrue(self.set_color(device)["ok"])
+        self.client.close()
+        self.daemon.close()
+        self.start_daemon("core-restarted")
+        restarted = self.devices("devices.rescan")[0]
+        self.assertEqual(restarted["id"], device["id"])
+        self.assertEqual(restarted["usb"], self.identity)
+        self.assertTrue(restarted["writable"], restarted)
+        self.assertTrue(self.set_color(device, "#abcdef")["ok"])
+
+        # Preserve the listener's port while restarting the server and its IDs.
+        listener = self.fake.listener.dup()
+        self.addCleanup(listener.close)
+        self.fake.close()
+        self.core.wait_until(lambda: self.client.request("status")["result"]["engines"][0][
+            "state"] == "unreachable", message="fake OpenRGB stopped")
+        (self.usb.root / "class/hidraw/hidraw9").rename(
+            self.usb.root / "class/hidraw/hidraw12")
+        self.fake = OpenRgbServer(listener=listener, device_ids=[99], descriptors=[controller(
+            name="New SDK label", vendor="New vendor label", serial="SDK serial changed",
+            description="New description", firmware="2.0", location="HID: /dev/hidraw12",
+            active=1, led_colors=[0x112233, 0x445566])])
+        self.addCleanup(self.fake.close)
+        self.assertTrue(self.set_color(device)["ok"])
+        current = self.devices()[0]
+        self.assertEqual(current["id"], device["id"])
+        self.assertEqual(current["usb"], self.identity)
+        self.assertTrue(current["writable"], current)
+        self.client.close()
+        self.daemon.close()
+        self.start_daemon("core-restarted-again")
+        self.assertEqual(self.devices("devices.rescan")[0]["id"], device["id"])
+        self.assertTrue(self.set_color(device)["ok"])
+
+    def test_non_usb_fallback_uses_only_immutable_metadata(self):
+        self.launch(descriptors=[controller(location="I2C: immutable", active=1)])
+        before = self.devices("devices.rescan")
+        device = next(item for item in before if item["id"].startswith("openrgb:"))
+        encoded = json.dumps(["MSI RGB", "MSI", "unique", "I2C: immutable"],
+                             separators=(",", ":")).encode()
+        self.assertEqual(device["id"], "openrgb:" + hashlib.sha256(encoded).hexdigest())
+        self.fake.descriptors = [controller(location="I2C: immutable", description="Changed",
+            firmware="2.0", active=0, led_colors=[0xabcdef, 0xabcdef])]
+        self.fake.send(signal_update(0, 1, self.fake.descriptors[0]))
+        self.assertTrue(self.client.request("lighting.get", {"device": device["id"]})["ok"])
+        self.advance(2.01)
+        after = next(item for item in self.devices("devices.rescan")
+                     if item["id"].startswith("openrgb:"))
+        self.assertEqual(after["id"], device["id"])
+        self.assertEqual(after["usb"], "")
+        self.assertFalse(after["writable"])
+
+    def test_cached_usb_binding_does_not_allow_a_reused_hidraw_or_unplugged_device(self):
+        self.launch(descriptors=[controller(active=1)])
+        device = self.devices("devices.rescan")[0]
+        node = self.usb.root / "class/hidraw/hidraw9"
+        moved = node.with_name("hidraw12")
+        node.rename(moved)
+        self.usb.add(13, "1234", "abcd", "replacement")
+        (node.parent / "hidraw13").rename(node)
+        # The SDK still refers to hidraw9. Never transfer its resolved binding
+        # or write permission to the unrelated USB device now at that path.
+        reply = self.set_color(device)
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("USB identity changed", reply["error"]["message"])
+        cached = self.devices()[0]
+        self.assertEqual(cached["id"], device["id"])
+        self.assertEqual(cached["usb"], self.identity)
+        self.assertFalse(cached["writable"])
+        node.rename(node.with_name("hidraw13"))
+        moved.rename(node)
+        self.assertTrue(self.client.request("lighting.get", {"device": device["id"]})["ok"])
+        self.assertTrue(self.set_color(device)["ok"])
+        node.rename(self.root / "unplugged-hidraw")
+        reply = self.set_color(device)
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("USB device is not present", reply["error"]["message"])
+        cached = self.devices()[0]
+        self.assertEqual(cached["id"], device["id"])
+        self.assertEqual(cached["usb"], self.identity)
+        self.assertFalse(cached["writable"])
+
     def test_signal_update_refreshes_inventory_without_a_descriptor_request(self):
         self.launch(device_ids=[42], descriptors=[controller(active=1)])
         before = self.devices()[0]
@@ -398,6 +577,26 @@ class OpenRgbContractMixin:
             self.assertFalse(device["writable"])
         self.assertEqual(self.writes(), [])
 
+    def test_duplicate_controller_gate_survives_notifications_and_clears_only_on_rescan(self):
+        self.launch(device_ids=[42, 99], descriptors=[controller(active=1),
+                    controller(name="Duplicate controller", active=1)])
+        device = self.devices("devices.rescan")[0]
+        self.assertIn("not unique", device["blocked_reason"])
+        (self.usb.root / "class/hidraw/hidraw9").rename(
+            self.usb.root / "class/hidraw/hidraw12")
+        self.fake.descriptors[0] = controller_metadata(self.fake.descriptors[0],
+                                                      location="HID: /dev/hidraw12")
+        self.fake.send(signal_update(42, 1, self.fake.descriptors[0]))
+        self.assertTrue(self.client.request("lighting.get", {"device": device["id"]})["ok"])
+        self.assertIn("not unique", self.devices()[0]["blocked_reason"])
+        self.assertFalse(self.set_color(device)["ok"])
+        self.assertEqual(self.writes(), [])
+        self.fake.descriptors = self.fake.descriptors[:1]
+        self.fake.device_ids = [42]
+        self.advance(2.01)
+        self.assertTrue(self.devices("devices.rescan")[0]["writable"])
+        self.assertTrue(self.set_color(device)["ok"])
+
     def test_trofeo_never_candidate_even_enabled_and_descriptor_never_writable(self):
         self.launch(descriptors=[controller(),
                                  controller(name="Other", location="HID: /dev/hidraw10")])
@@ -472,9 +671,7 @@ class OpenRgbContractMixin:
         self.client.send({"v": 1, "id": 77, "op": "devices.rescan"})
         self.wait_for_attempts(1)
         self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
-        identity = ["MSI RGB", "MSI", "USB lighting", "unique", "HID: /dev/hidraw9"]
-        encoded = json.dumps(identity, separators=(",", ":")).encode()
-        device_id = "openrgb:" + hashlib.sha256(encoded).hexdigest()
+        device_id = "openrgb:" + hashlib.sha256(self.identity.encode()).hexdigest()
         with self.daemon.client() as other:
             for number, operation, params in (
                     (78, "devices", {}), (79, "devices.rescan", {}),
@@ -715,13 +912,12 @@ class OpenRgbContractMixin:
     def test_stable_identity_follows_usb_across_hidraw_renumbering(self):
         self.launch()
         before = self.devices()[0]
-        # Controller identity is based on metadata/location in legacy SDKs; USB is the
-        # stable physical identity exposed to the panel across every scan.
         (self.usb.root / "class/hidraw/hidraw9").rename(
             self.usb.root / "class/hidraw/hidraw12")
         self.fake.descriptors = [controller(location="HID: /dev/hidraw12")]
         self.advance(2.01)
         after = self.devices("devices.rescan")[0]
+        self.assertEqual(after["id"], before["id"])
         self.assertEqual(after["usb"], before["usb"])
         self.assertTrue(after["enabled"])
         self.assertTrue(after["writable"])
@@ -1117,7 +1313,7 @@ class OpenRgbContractMixin:
                                             location="HID: /dev/hidraw12")]
         self.advance(2.01)
         renamed = self.devices("devices.rescan")[0]
-        self.assertNotEqual(device["id"], renamed["id"])
+        self.assertEqual(device["id"], renamed["id"])
         self.assertFalse(self.client.request("lighting.get", {"device": renamed["id"]})[
             "result"]["saved"])
         self.assertTrue(self.save(renamed)["result"]["saved"])

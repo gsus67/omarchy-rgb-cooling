@@ -21,13 +21,16 @@ struct SdkMode {
 
 struct SdkController {
     QJsonObject device;
-    QString location;
+    QString location, serial;
+    bool ambiguous = false;
     QVector<SdkMode> modes;
     QVector<quint32> colors;
     quint32 active = 0, index = 0;
     unsigned version = 0;
     int staticMode() const;
     QJsonObject lighting() const;
+    void identify(const QString &usb = {});
+    bool sameController(const SdkController &other) const;
     static bool decode(const QByteArray &payload, unsigned version, SdkController &controller);
     static bool decodeUpdate(const QByteArray &, unsigned version, SdkController &controller);
 };
