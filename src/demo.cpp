@@ -41,9 +41,11 @@ QJsonObject DemoAdapter::sensors() const
     return {{"sensors", QJsonArray{
         QJsonObject{{"id", "demo:cpu:temp1"}, {"label", "CPU Package"}, {"device", "demo:cpu"},
                     {"kind", "temp"}, {"value", 42.5}, {"unit", "C"},
+                    {"channel", "temp1"}, {"header", ""},
                     {"source", "demo"}, {"stale", false}},
         QJsonObject{{"id", "demo:gpu:fan1"}, {"label", "GPU fan"}, {"device", "demo:gpu"},
                     {"kind", "fan"}, {"value", 900}, {"unit", "rpm"},
+                    {"channel", "fan1"}, {"header", ""},
                     {"source", "demo"}, {"stale", false}}
     }}, {"primary", "demo:cpu:temp1"}};
 }

@@ -106,8 +106,9 @@ set, `label` equals it.
 The panel can rename any sensor. Names are stored by the UI, not rgbcd, in
 `$XDG_CONFIG_HOME/omarchy-rgb-cooling/labels.json` as
 `{"v": 1, "labels": {"<sensor id>": "<name>"}}`, at most 32 characters each,
-shown as plain text, written with `0600` permissions. `uninstall.sh --purge`
-removes them. rgbcd stays read-only.
+shown as plain text. bootstrap creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
+with `0700` permissions (it is user data, so it is not in the ledger);
+`uninstall.sh --purge` removes it. rgbcd stays read-only.
 
 ### Engine scans (no background polling)
 

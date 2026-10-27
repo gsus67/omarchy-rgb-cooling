@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "selftest.hpp"
 #include "demo.hpp"
+#include "fan_headers.hpp"
 #include "hwmon.hpp"
 #include "openrgb.hpp"
 #include "protocol.hpp"
@@ -263,9 +264,52 @@ void testDemo(Checks &checks)
     checks.verify(!demo.setLighting("missing", "#123456", 10).ok(),
                   "missing demo device is unavailable");
 }
+
+void testFanHeaders(Checks &checks, const QString &dataDirectory)
+{
+    const QByteArray valid = R"({"version":1,"entries":[{
+        "chip":"nct6687","dmi_vendor":"MSI","dmi_boards":["MS-7D98"],
+        "status":"user-verified","headers":{"fan5":"SYS_FAN3"}}]})";
+    checks.verify(FanHeaders::validate(valid), "fan headers accept the v1 schema");
+    bool rejected = true;
+    for (const auto &invalid : {QByteArray("[]"), QByteArray("{"), QByteArray("\xff"),
+                                QByteArray(FanHeaders::MaximumBytes + 1, ' ')}) {
+        rejected = rejected && !FanHeaders::validate(invalid);
+    }
+    for (const auto &field : {"chip", "dmi_vendor", "dmi_boards", "status", "headers",
+                              "verified", "sources"}) {
+        auto table = QJsonDocument::fromJson(valid).object();
+        auto entry = table.value("entries").toArray().first().toObject();
+        entry.insert(field, true);
+        table.insert("entries", QJsonArray{entry});
+        rejected = rejected && !FanHeaders::validate(QJsonDocument(table).toJson());
+    }
+    for (const auto &name : {"sys_fan3", "<b>CPU</b>", "CPU_FAN1\n", "", "ABCDEFGHIJKLMNOPQ"}) {
+        auto invalid = valid;
+        // Replace a whole JSON string so escaped newlines also reach the validator.
+        const auto quoted = QJsonDocument(QJsonArray{name}).toJson(QJsonDocument::Compact);
+        invalid.replace("\"SYS_FAN3\"", quoted.sliced(1).chopped(1));
+        rejected = rejected && !FanHeaders::validate(invalid);
+    }
+    checks.verify(rejected, "fan headers reject invalid types, names, UTF-8 and oversized JSON");
+    quint32 seed = 0xabcdef;
+    for (int index = 0; index < 1000; ++index) {
+        seed = seed * 1664525U + 1013904223U;
+        auto mutated = valid;
+        mutated[seed % static_cast<quint32>(mutated.size())] = static_cast<char>(seed >> 24);
+        FanHeaders::validate(mutated);
+    }
+    checks.verify(true, "fan headers malformed-input sanitizer corpus completed");
+    if (!dataDirectory.isEmpty()) {
+        QFile file(QDir(dataDirectory).filePath("fan-headers.json"));
+        checks.verify(file.open(QIODevice::ReadOnly)
+                      && FanHeaders::validate(file.read(FanHeaders::MaximumBytes + 1)),
+                      "repository fan-headers.json passes the runtime schema");
+    }
+}
 } // namespace
 
-int runSelfTests()
+int runSelfTests(const QString &dataDirectory)
 {
     Checks checks;
     testProtocol(checks);
@@ -273,6 +317,7 @@ int runSelfTests()
     testSensorNames(checks);
     testHwmon(checks);
     testDemo(checks);
+    testFanHeaders(checks, dataDirectory);
     checks.verify(!Server::peerAllowed(-1, ::getuid()), "SO_PEERCRED rejects invalid descriptors");
     QTextStream(stdout) << "Self-tests: " << checks.failures << " failures\n";
     return checks.failures == 0 ? 0 : 1;

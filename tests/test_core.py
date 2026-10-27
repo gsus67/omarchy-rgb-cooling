@@ -17,6 +17,7 @@ import time
 import unittest
 
 from fakes.hwmon import FileWatch, HwmonTree
+from fakes.dmi import DmiTree
 from fakes.openrgb import OpenRgbServer, controller
 
 sys.dont_write_bytecode = True
@@ -489,7 +490,9 @@ class CoreContract(unittest.TestCase):
         self.assertIn(sensors["primary"], [sensor["id"] for sensor in sensors["sensors"]])
         for sensor in sensors["sensors"]:
             self.assertEqual(set(sensor), {"id", "label", "device", "kind", "value", "unit",
-                                          "source", "stale"})
+                                          "source", "stale", "channel", "header"})
+            self.assertEqual(sensor["channel"], sensor["id"].rsplit(":", 1)[1])
+            self.assertEqual(sensor["header"], "")
             self.assertEqual(sensor["source"], "demo")
             self.assertIn(sensor["kind"], ("temp", "fan"))
             self.assertIs(sensor["stale"], False)
@@ -771,6 +774,204 @@ class HwmonContract(unittest.TestCase):
         data = self.subscribe()
         first = next(item for item in data["sensors"] if item["kind"] == "temp")
         self.assertEqual(data["primary"], first["id"])
+
+
+class FanHeadersContract(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rgbcd-fan-headers-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.table = json.loads((REPO / "data/fan-headers.json").read_text())
+        self.entry = self.table["entries"][0]
+        self.launches = 0
+
+    def launch(self, *, vendor=None, board=None, chip="nct6687", content=None,
+               missing=False, fifo=False, environment=None):
+        self.launches += 1
+        directory = self.root / str(self.launches)
+        self.dmi = DmiTree(directory / "dmi",
+                           self.entry["dmi_vendor"] if vendor is None else vendor,
+                           self.entry["dmi_boards"][0] if board is None else board)
+        self.data = directory / "data"
+        self.data.mkdir()
+        path = self.data / "fan-headers.json"
+        if fifo:
+            os.mkfifo(path)
+        elif not missing:
+            path.write_bytes(json.dumps(self.table).encode() if content is None else content)
+        daemon = Daemon(directory, clock=True, environment=environment, extra=[
+            "--data-dir", str(self.data), "--dmi-root", str(self.dmi.root),
+        ])
+        self.addCleanup(daemon.close)
+        daemon.tree.add("hwmon18", chip, "platform/nct6687", {
+            **{f"fan{number}_input": "900" for number in range(1, 9)},
+            "temp1_input": "42000", "fan5_label": "Untrusted sysfs label",
+            "pwm1": "38", "pwm1_enable": "2",
+        })
+        client = daemon.client()
+        self.addCleanup(client.close)
+        return daemon, client
+
+    def sensors(self, client):
+        sensors = client.request("sensors")["result"]["sensors"]
+        for sensor in sensors:
+            self.assertEqual(sensor["channel"], sensor["id"].rsplit(":", 1)[1])
+            self.assertIsInstance(sensor["header"], str)
+        return {sensor["channel"]: sensor for sensor in sensors
+                if ":platform/nct6687:" in sensor["id"]}
+
+    def assert_fallback(self, client):
+        sensors = self.sensors(client)
+        self.assertEqual(len(sensors), 9)
+        for number in range(1, 9):
+            self.assertEqual(sensors[f"fan{number}"]["label"], f"Fan {number}")
+            self.assertEqual(sensors[f"fan{number}"]["header"], "")
+
+    def assert_ignored(self, content=None, **options):
+        daemon, client = self.launch(content=content, **options)
+        self.assert_fallback(client)
+        daemon.close()
+        self.assertIn("warning: fan-headers.json", daemon.stderr)
+        self.assertIn("ignoring the entire table", daemon.stderr)
+        self.assertEqual(daemon.stderr.count("warning: fan-headers.json"), 1)
+
+    def test_verified_ms_7d98_headers_unlisted_channel_and_stable_ids(self):
+        daemon, client = self.launch()
+        before = daemon.tree.snapshot()
+        sensors = self.sensors(client)
+        expected = {"fan1": "CPU_FAN1", "fan2": "PUMP_FAN1", "fan3": "SYS_FAN1",
+                    "fan4": "SYS_FAN2", "fan5": "SYS_FAN3", "fan6": "SYS_FAN4",
+                    "fan7": "SYS_FAN5"}
+        for channel, header in expected.items():
+            self.assertEqual(sensors[channel]["header"], header)
+            self.assertEqual(sensors[channel]["label"], header)
+            self.assertEqual(sensors[channel]["id"], f"nct6687:platform/nct6687:{channel}")
+        self.assertEqual(sensors["fan8"]["label"], "Fan 8")
+        self.assertEqual(sensors["fan8"]["header"], "")
+        self.assertEqual(sensors["temp1"]["header"], "")
+        self.assertEqual(daemon.tree.snapshot(), before)
+
+    def test_other_msi_board_and_other_vendor_fall_back(self):
+        for options in ({"board": "OTHER MSI (MS-1234)"}, {"vendor": "Other Vendor"},
+                        {"board": self.entry["dmi_boards"][0].lower()},
+                        {"vendor": " " + self.entry["dmi_vendor"]},
+                        {"vendor": ""}, {"board": ""}):
+            with self.subTest(options=options):
+                daemon, client = self.launch(**options)
+                self.assert_fallback(client)
+                daemon.close()
+                self.assertNotIn("warning: fan-headers.json", daemon.stderr)
+
+    def test_chip_match_is_exact(self):
+        for chip in ("nct6683", "nct6687d", "nct6687-extra"):
+            with self.subTest(chip=chip):
+                _daemon, client = self.launch(chip=chip)
+                self.assert_fallback(client)
+
+    def test_source_derived_entry_is_valid_but_never_applied(self):
+        self.entry["status"] = "source-derived"
+        daemon, client = self.launch()
+        self.assert_fallback(client)
+        daemon.close()
+        self.assertNotIn("warning: fan-headers.json", daemon.stderr)
+
+    def test_board_can_match_any_exact_list_member(self):
+        self.entry["dmi_boards"].insert(0, "Other Board")
+        _daemon, client = self.launch(board="B760 GAMING PLUS WIFI (MS-7D98)")
+        self.assertEqual(self.sensors(client)["fan5"]["header"], "SYS_FAN3")
+
+    def test_invalid_source_derived_entry_also_discards_whole_table(self):
+        invalid = json.loads(json.dumps(self.entry))
+        invalid["status"] = "source-derived"
+        invalid["headers"]["fan5"] = "<b>CPU</b>"
+        self.table["entries"].append(invalid)
+        self.assert_ignored()
+
+    def test_missing_invalid_utf8_json_and_nonregular_table_are_ignored(self):
+        self.assert_ignored(missing=True)
+        self.assert_ignored(fifo=True)
+        for content in (b"{", b"[]", b"null", b'\xff', b'{"version":1,"entries":['):
+            with self.subTest(content=content):
+                self.assert_ignored(content)
+
+    def test_maximum_file_size_is_inclusive(self):
+        valid = json.dumps(self.table).encode()
+        padded = valid + b" " * (256 * 1024 - len(valid))
+        _daemon, client = self.launch(content=padded)
+        self.assertEqual(self.sensors(client)["fan5"]["header"], "SYS_FAN3")
+        self.assert_ignored(padded + b" ")
+
+    def test_invalid_header_names_discard_even_preceding_valid_entries(self):
+        for name in ("sys_fan3", "<b>CPU_FAN1</b>", "CPU_FAN1\n", "", "A" * 17, "FÄN"):
+            with self.subTest(name=name):
+                table = json.loads(json.dumps(self.table))
+                invalid = json.loads(json.dumps(self.entry))
+                invalid["headers"]["fan5"] = name
+                table["entries"].append(invalid)
+                self.assert_ignored(json.dumps(table).encode())
+
+    def test_invalid_channels_discard_table(self):
+        for channel in ("Fan1", "temp1", "fan", "fan100", "fan1\n", "fan-1"):
+            with self.subTest(channel=channel):
+                table = json.loads(json.dumps(self.table))
+                table["entries"][0]["headers"][channel] = "CPU_FAN1"
+                self.assert_ignored(json.dumps(table).encode())
+
+    def test_exact_schema_types_and_required_fields(self):
+        cases = []
+        for field, values in {
+            "chip": (None, True, 7, [], {}),
+            "dmi_vendor": (None, True, 7, [], {}),
+            "dmi_boards": (None, True, "board", {}, [True], [7], [None]),
+            "status": (None, True, 7, [], {}, "verified"),
+            "headers": (None, True, 7, [], "CPU_FAN1", {"fan1": 1}),
+            "verified": (None, True, 7, [], {}),
+            "sources": (None, True, 7, {}, "url", [True]),
+        }.items():
+            for value in values:
+                table = json.loads(json.dumps(self.table))
+                table["entries"][0][field] = value
+                cases.append((field, value, table))
+        for field in ("chip", "dmi_vendor", "dmi_boards", "status", "headers"):
+            table = json.loads(json.dumps(self.table))
+            del table["entries"][0][field]
+            cases.append((field, "missing", table))
+        for field, values in {"version": (None, True, "1", 0, 2, 1.5),
+                              "entries": (None, True, {}, "entries", [True])}.items():
+            for value in values:
+                table = json.loads(json.dumps(self.table))
+                table[field] = value
+                cases.append((field, value, table))
+            table = json.loads(json.dumps(self.table))
+            del table[field]
+            cases.append((field, "missing", table))
+        for field, value, table in cases:
+            with self.subTest(field=field, value=value):
+                self.assert_ignored(json.dumps(table).encode())
+
+    def test_table_and_dmi_read_once_at_start_and_environment_cannot_override_dmi(self):
+        daemon, client = self.launch(environment={"DMI_ROOT": "/nonexistent",
+                                                  "RGBCD_DMI_ROOT": "/nonexistent"})
+        before = self.sensors(client)
+        watches = [FileWatch(path) for path in (
+            self.data / "fan-headers.json", self.dmi.root / "board_vendor",
+            self.dmi.root / "board_name")]
+        for watch in watches:
+            self.addCleanup(watch.close)
+        self.dmi.write("Other Vendor", "Other Board")
+        (self.data / "fan-headers.json").write_text("invalid")
+        for watch in watches:
+            watch.drain()
+        daemon.advance(1, client)
+        self.assertEqual(self.sensors(client), before)
+        for watch in watches:
+            self.assertFalse(any(mask & (0x01 | 0x20) for mask in watch.drain()))
+
+    def test_repository_table_uses_runtime_schema(self):
+        result = subprocess.run([str(BINARY), "--self-test", "--data-dir", str(REPO / "data")],
+                                capture_output=True, text=True, timeout=WAIT_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repository fan-headers.json passes the runtime schema", result.stdout)
 
 
 class OpenRgbContract(unittest.TestCase):
@@ -1574,6 +1775,7 @@ else:
         ])
         service = (self.units / "omarchy-rgb-cooling.service").read_text()
         self.assertIn(f'ExecStart=:"{self.state}/bin/rgbcd"', service)
+        self.assertIn(f' --data-dir "{REPO}/data"', service)
         self.assertNotIn("[Install]", service)
         self.assertEqual(stat.S_IMODE((self.state / "installed-files").stat().st_mode), 0o600)
 
@@ -1691,6 +1893,25 @@ else:
         result = self.bootstrap(success=False)
         self.assertIn("control characters", result["error"])
         self.assertFalse((self.home / "bad\nstate").exists())
+
+    def test_contract_bootstrap_data_directory_escapes_plugin_path_and_rejects_newlines(self):
+        plugins = self.home / ".config/omarchy/plugins"
+        source = plugins / 'plugin % " \\ $data'
+        source.mkdir(parents=True)
+        for name in ("src", "systemd"):
+            shutil.copytree(REPO / name, source / name)
+        shutil.copy2(REPO / "native_build.py", source / "native_build.py")
+        self.bootstrap(source)
+        service = (self.units / "omarchy-rgb-cooling.service").read_text()
+        expected_data = str(plugins) + r'/plugin %% \" \\ $data/data'
+        expected = f'ExecStart=:"{self.state}/bin/rgbcd" --data-dir "{expected_data}"'
+        self.assertIn(expected + "\n", service)
+        self.assertIn("ProtectHome=read-only\n", service)
+        before = self.commands()
+        for character in ("\n", "\r"):
+            result = self.bootstrap(plugins / ("bad" + character + "plugin"), success=False)
+            self.assertIn("control characters", result["error"])
+        self.assertEqual(self.commands(), before)
 
     def test_contract_bootstrap_unchanged_units_do_not_reenable_a_disabled_socket(self):
         self.bootstrap()

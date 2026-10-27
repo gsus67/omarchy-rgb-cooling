@@ -16,6 +16,11 @@ Hwmon::Hwmon(QString root) : root(std::move(root))
     clock.start();
 }
 
+void Hwmon::loadFanHeaders(const QString &dataDirectory, const QString &dmiRoot)
+{
+    fanHeaders.load(dataDirectory, dmiRoot);
+}
+
 QString Hwmon::readText(const QString &path)
 {
     QFile file(path);
@@ -128,10 +133,15 @@ void Hwmon::sample(int intervalMilliseconds)
             sensor.device = SensorNames::device(name, node.parent, node.driver, cpuVendor,
                                                 nvmeNumber);
             sensor.kind = match.captured(1);
+            sensor.channel = channel;
+            sensor.header = fanHeaders.header(name, channel);
             sensor.label = SensorNames::label(name, channel,
                                               readText(path + "/" + channel + "_label"));
             if (sensor.kind == "fan" && fans.size() > 1) {
                 sensor.label = "Fan " + channel.mid(3);
+            }
+            if (!sensor.header.isEmpty()) {
+                sensor.label = sensor.header;
             }
             sensor.cpuPackage = name == "coretemp"
                 && sensor.label.contains("package", Qt::CaseInsensitive);
@@ -188,6 +198,7 @@ QJsonObject Hwmon::snapshot(int intervalMilliseconds) const
         result.append(QJsonObject{
             {"id", sensor.id}, {"label", sensor.label}, {"device", sensor.device},
             {"kind", sensor.kind}, {"value", sensor.value},
+            {"channel", sensor.channel}, {"header", sensor.header},
             {"unit", sensor.kind == "temp" ? "C" : "rpm"},
             {"source", "hwmon"}, {"stale", stale}
         });

@@ -1,3 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-int runSelfTests();
+#include <QString>
+int runSelfTests(const QString &dataDirectory);

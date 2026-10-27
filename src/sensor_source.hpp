@@ -10,7 +10,8 @@
 // All filesystem access stays on a worker; simultaneous requests share one sample.
 class SensorSource final : public QObject {
 public:
-    explicit SensorSource(const QString &root);
+    SensorSource(const QString &root, const QString &dataDirectory, const QString &dmiRoot,
+                 bool demo);
     ~SensorSource() override;
     using Callback = std::function<void(const QJsonObject &)>;
     void request(int intervalMilliseconds, Callback ready);

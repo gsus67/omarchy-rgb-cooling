@@ -16,7 +16,8 @@
 
 class Server final : public QObject {
 public:
-    Server(bool demo, const QString &hwmonRoot);
+    Server(bool demo, const QString &hwmonRoot, const QString &dataDirectory,
+           const QString &dmiRoot);
     ~Server() override;
     bool listen(const QString &path, QString &error);
     bool adopt(qintptr descriptor, QString &error);
