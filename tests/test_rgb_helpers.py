@@ -184,9 +184,16 @@ else:
         self.assertIn("PrivateTmp=no", content)
         self.assertIn("ProtectSystem=strict", content)
         # bwrap rules out PrivateTmp/ProtectHostname/ProtectKernelLogs (see the unit).
-        for args in (["verify"], ["--offline=yes", "security", "--threshold=32"]):
-            result = subprocess.run(["systemd-analyze", "--user", *args, str(unit)],
-                                    capture_output=True, text=True, timeout=30)
+        # Security is scored as the user unit it is; systemd needs a runtime
+        # directory for that, which a CI container without a session lacks.
+        runtime = self.home / "runtime"
+        runtime.mkdir(mode=0o700)
+        commands = (["systemd-analyze", "verify", str(unit)],
+                    ["systemd-analyze", "--user", "--offline=yes", "security",
+                     "--threshold=32", str(unit)])
+        for command in commands:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    env=dict(os.environ, XDG_RUNTIME_DIR=str(runtime)))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def launcher(self, *, success=True):
