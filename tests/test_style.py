@@ -7,8 +7,8 @@ LIMIT = 100
 
 
 def sources():
-    patterns = ("src/*.cpp", "src/*.hpp", "*.py", "tests/*.py", "tests/fakes/*.py")
-    return sorted(path for pattern in patterns for path in ROOT.glob(pattern))
+    patterns = ("src/*.cpp", "src/*.hpp", "*.py", "bin/*", "tests/*.py", "tests/fakes/*.py")
+    return sorted(path for pattern in patterns for path in ROOT.glob(pattern) if path.is_file())
 
 
 class StyleTest(unittest.TestCase):

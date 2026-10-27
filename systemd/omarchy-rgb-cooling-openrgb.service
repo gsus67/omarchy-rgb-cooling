@@ -1,0 +1,48 @@
+[Unit]
+Description=Omarchy sandboxed on-demand OpenRGB SDK
+
+[Service]
+Type=simple
+ExecStart=:@OPENRGB LAUNCHER@
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@OPENRGB CONFIG@
+# Exposure is 3.1 (CI allows 3.2 for this unit only). Tested on the real
+# OpenRGB: PrivateTmp, ProtectHostname, ProtectKernelLogs (bwrap cannot mount
+# its /proc) and AF_INET-only (OpenRGB crashes) all break it.
+# bwrap builds its own /tmp and minimal /dev, and needs the host hidraw sources.
+PrivateTmp=no
+PrivateDevices=no
+PrivateUsers=yes
+# bwrap --unshare-all requires user, mount, PID, IPC, UTS and cgroup namespaces.
+# RestrictNamespaces=yes or denying @mount/@privileged would prevent its sandbox.
+RestrictNamespaces=cgroup ipc mnt pid user uts
+# Locked host /proc submounts prevent bwrap from mounting its fresh PID-namespace proc.
+# Verified with the identical sandbox and /usr/bin/true (no hardware access).
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=no
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=no
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+# IPAddressDeny/Allow are not applied to user units; the launcher binds OpenRGB
+# to 127.0.0.1 and rgbcd only connects to numeric loopback.
+SystemCallFilter=@system-service @mount
+SystemCallFilter=~@resources @reboot @swap @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+# On this system this filter makes bwrap 0.13 open_tree return ENOSYS.
+# NoNewPrivileges still prevents gaining privileges from setuid executables.
+RestrictSUIDSGID=no
+CapabilityBoundingSet=
+AmbientCapabilities=
+KeyringMode=private
+RemoveIPC=yes

@@ -113,11 +113,20 @@ jobs:
           if [ ${#units[@]} -eq 0 ]; then echo "No systemd units yet"; exit 0; fi
           mkdir -p /tmp/unit
           for unit in "${units[@]}"; do
-            sed 's|^ExecStart=.*|ExecStart=/usr/bin/true|' "$unit" > "/tmp/unit/${unit##*/}"
+            sed -e 's|^ExecStart=.*|ExecStart=/usr/bin/true|' -e 's|@OPENRGB CONFIG@|/tmp/openrgb-config|' \
+              "$unit" > "/tmp/unit/${unit##*/}"
           done
           systemd-analyze verify /tmp/unit/*
+          mkdir -m 0700 /tmp/runtime
           for service in /tmp/unit/*.service; do
-            systemd-analyze security --offline=yes --threshold=30 --no-pager "$service"
+            # The OpenRGB unit runs bwrap, which needs its own namespaces and a fresh
+            # /proc: PrivateTmp, ProtectHostname, ProtectKernelLogs and narrower
+            # address families all break it (tested). Its real exposure is 3.1.
+            threshold=30
+            case ${service##*/} in omarchy-rgb-cooling-openrgb.service) threshold=32 ;; esac
+            # Scored as the user units they are; --user needs a runtime directory.
+            XDG_RUNTIME_DIR=/tmp/runtime systemd-analyze --user security --offline=yes \
+              --threshold=$threshold --no-pager "$service"
           done
 
   shellcheck:

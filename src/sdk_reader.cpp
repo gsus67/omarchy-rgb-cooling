@@ -23,9 +23,9 @@ quint32 SdkReader::u32()
     return qFromLittleEndian<quint32>(bytes.constData() + offset - 4);
 }
 
-QString SdkReader::string()
+QString SdkReader::string(bool wide)
 {
-    const auto length = u16();
+    const auto length = wide ? u32() : u16();
     if (length == 0 || length > 4096 || !skip(length)) {
         good = false;
         return {};
