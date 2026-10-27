@@ -61,7 +61,8 @@ Events (only on a subscribed connection; no `id`):
 | `profile.get` | — | `{"profile": "power-saver"\|"balanced"\|"performance", "available": ["..."], "degraded": ""}`; `unavailable` if power-profiles-daemon is not running |
 | `profile.set` | `{"profile": "power-saver"\|"balanced"\|"performance"}` | same as `profile.get` after the change; the profile must be in `available`; rate limited to 2 per second per connection |
 | `lighting.get` | `{"device": "<id>"}` | `Lighting` |
-| `lighting.set` | `{"device": "<id>", "color": "#rrggbb", "brightness": 0-100}` | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
+| `lighting.set` | `{"device": "<id>", "mode": "<mode name>", "color": "#rrggbb", "brightness": 0-100, "speed": 0-100, "random": bool}` (only `device` is required; omitted fields keep their current value) | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
+| `lighting.save` | `{"device": "<id>"}` | `Lighting` with `saved: true` after `SAVEMODE`; `unsupported` if the mode cannot be saved; `rate_limited` if the device was saved less than 10 s ago |
 
 `lighting.set` is rate limited to 10 per second per connection.
 
@@ -197,6 +198,35 @@ mode-specific colours it travels inside `UPDATEMODE`. rgbcd never sends
 `SAVEMODE`, `SETCUSTOMMODE`, `UPDATEZONELEDS`, zone resizes, or LED buffers
 with different colours, and re-reads the controller to confirm the change.
 
+### Effects and saving to the device
+
+`modes` lists the controller's OpenRGB modes in OpenRGB's order, except
+`Direct` (software per-LED streaming, not a panel effect). Flags map as:
+`speed` = `MODE_FLAG_HAS_SPEED`; `brightness` = `MODE_FLAG_HAS_BRIGHTNESS`;
+`color: "single"` when the mode takes per-LED or mode-specific colours,
+`"none"` when it only animates its own colours; `random` =
+`MODE_FLAG_HAS_RANDOM_COLOR`; `savable` = `MODE_FLAG_MANUAL_SAVE` or
+`MODE_FLAG_AUTOMATIC_SAVE`.
+
+`lighting.set` validates every field against the chosen mode (a colour for a
+`"none"` mode, a speed for a mode without speed, `random` without the flag are
+`bad_request`). `speed` and `brightness` are 0-100 on the API and mapped onto
+the mode's own range (rounded; reversed when OpenRGB's minimum is larger than
+its maximum). The write is `UPDATEMODE` with the chosen mode, then, only when
+the mode uses per-LED colours and a colour is set, `UPDATELEDS` with that same
+colour for every LED. `random: true` selects `MODE_COLORS_RANDOM`.
+
+`lighting.save` sends `SAVEMODE` for the active mode exactly as last applied,
+only when the user presses the panel's **Save to device** button. It writes the
+device's own memory, so the effect survives OpenRGB stopping and reboots; it is
+never sent automatically and is limited to once per 10 s per device.
+
+`saved` is false after any `lighting.set` until the next `lighting.save`
+(true at start: nothing has been changed yet). Many devices, such as MSI
+Mystic Light, fall back to their saved state when OpenRGB stops, so the idle
+stop only happens when every enabled device is `saved`; with unsaved changes
+OpenRGB keeps running and the panel says so.
+
 ### Engine scans (no background polling)
 
 rgbcd never polls engines on its own. An engine is contacted only by:
@@ -219,9 +249,12 @@ Sensor   {id: string, label: string, device: string, kind: "temp"|"fan",
           value: number|null, unit: "C"|"rpm", source: "hwmon"|"demo", stale: bool}
 Device   {id: string, name: string, vendor: string, engine: string,
           support: "recognized"|"upstream-supported"|"simulation-tested"|"physically-tested",
-          writable: bool, blocked_reason: string, excluded: bool,
+          writable: bool, blocked_reason: string, excluded: bool, modes: [Mode],
           capabilities: ["lighting.read", "lighting.write", "brightness"]}
-Lighting {device: string, color: "#rrggbb", brightness: 0-100, brightness_emulated: bool}
+Lighting {device: string, mode: string, color: "#rrggbb", brightness: 0-100,
+          brightness_emulated: bool, speed: 0-100 | null, random: bool, saved: bool}
+Mode     {name: string, speed: bool, brightness: bool,
+          color: "single" | "none", random: bool, savable: bool}
 ```
 
 - `device` is a short human name for the physical device, never a sysfs path:
