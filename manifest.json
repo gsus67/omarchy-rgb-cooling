@@ -5,12 +5,12 @@
   "version": "0.1.0",
   "author": "gsus",
   "license": "GPL-3.0-or-later",
-  "description": "Temperatures, fan speeds and RGB lighting in the Omarchy bar. Unprivileged: it never writes fan or hardware registers itself.",
+  "description": "Read temperatures and fan RPM, view RGB devices, and select power profiles in Omarchy.",
   "kinds": ["bar-widget"],
   "entryPoints": {"barWidget": "RgbCooling.qml"},
   "barWidget": {
     "displayName": "RGB & Cooling",
-    "description": "CPU temperature in the bar; sensors and lighting in the popup.",
+    "description": "CPU temperature in the bar; sensors, power profiles, and RGB status in the popup.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
