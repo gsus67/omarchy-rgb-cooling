@@ -203,9 +203,20 @@ Panel {
   function applyDevices(data) {
     devices = Array.isArray(data.devices) ? data.devices : []
     if (currentDevice === null) {
-      selectedDevice = lightingDevices.length > 0 ? lightingDevices[0].id : ""
+      // Prefer a device that can already be controlled (OpenRGB may still be
+      // starting for the others).
+      var first = ""
+      for (var i = 0; i < lightingDevices.length && first === ""; i++)
+        if (lightingDevices[i].writable === true) first = lightingDevices[i].id
+      if (first === "" && lightingDevices.length > 0) first = lightingDevices[0].id
+      selectedDevice = first
       refreshLighting()
+      return
     }
+    // The selected device just became controllable (OpenRGB finished starting)
+    // or its state is missing: ask again instead of waiting for a tab switch.
+    if (currentDevice.writable === true && (lighting === null || lighting.device !== currentDevice.id))
+      refreshLighting()
   }
 
   function subscribe() {
