@@ -10,8 +10,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-Server::Server(bool demo, const QString &hwmonRoot)
-    : demo(demo), sensorSource(hwmonRoot),
+Server::Server(bool demo, const QString &hwmonRoot, const QString &dataDirectory,
+               const QString &dmiRoot)
+    : demo(demo), sensorSource(hwmonRoot, dataDirectory, dmiRoot, demo),
       powerProfiles([this](const auto &data) { profileChanged(data); })
 {
     clock.start();

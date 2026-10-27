@@ -37,6 +37,7 @@
     "Turbo": "Turbo",
     "MODE": "MODO",
     "Fans follow your BIOS curves.": "Los ventiladores siguen las curvas de tu BIOS.",
-    "Hottest core": "Núcleo más caliente"
+    "Hottest core": "Núcleo más caliente",
+    "Right-click a sensor to rename it.": "Clic derecho en un sensor para renombrarlo."
   }
 }

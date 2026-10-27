@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "chip": "nct6687",
+      "dmi_vendor": "Micro-Star International Co., Ltd.",
+      "dmi_boards": ["B760 GAMING PLUS WIFI (MS-7D98)"],
+      "status": "user-verified",
+      "verified": "2026-10-26: fans observed on fan5/fan6 are physically on SYS_FAN3/SYS_FAN4 (channel - 2); EC firmware 1.0 build 11/01/22",
+      "sources": [
+        "https://github.com/torvalds/linux/blob/master/drivers/hwmon/nct6683.c",
+        "https://github.com/Fred78290/nct6687d/blob/main/nct6687.c",
+        "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/blob/master/LibreHardwareMonitorLib/Hardware/Motherboard/Lpc/Nct677X.cs",
+        "https://www.msi.com/Motherboard/B760-GAMING-PLUS-WIFI/Specification"
+      ],
+      "headers": {
+        "fan1": "CPU_FAN1",
+        "fan2": "PUMP_FAN1",
+        "fan3": "SYS_FAN1",
+        "fan4": "SYS_FAN2",
+        "fan5": "SYS_FAN3",
+        "fan6": "SYS_FAN4",
+        "fan7": "SYS_FAN5"
+      }
+    }
+  ]
+}
