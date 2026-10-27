@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP_COMMAND = ('["python3", root.pluginDirectory + "/bootstrap.py", '
                      'root.pluginDirectory]')
+ENGINES_COMMAND = '[root.enginesHelper, root.engineAction, "openrgb"]'
 QML_FILES = sorted(path for path in ROOT.rglob("*.qml") if ".git" not in path.parts)
 # Elements that interpret markup unless told otherwise.
 TEXT_ELEMENTS = ("Text", "TextEdit", "Label", "Controls.Label", "Controls.TextArea", "TextArea")
@@ -61,16 +62,29 @@ class QmlSecurityTest(unittest.TestCase):
                     self.assertNotRegex(line, r"https?://",
                                         f"{path.name}:{number} references a remote URL")
 
-    def test_only_process_is_bootstrap(self):
+    def test_only_known_processes(self):
+        """The panel runs only bootstrap and the engines helper, with fixed arguments."""
+        allowed = {BOOTSTRAP_COMMAND, ENGINES_COMMAND}
         for path in QML_FILES:
             source = path.read_text()
             with self.subTest(file=path.name):
                 self.assertNotRegex(source, r"\bexecDetached\b",
                                     f"{path.name} must not detach processes")
+                self.assertNotRegex(source, r"\.command\s*=",
+                                    f"{path.name} must not build commands at runtime")
                 commands = re.findall(r"^\s*command:\s*(.+)$", source, re.MULTILINE)
                 for command in commands:
-                    self.assertEqual(command.strip(), BOOTSTRAP_COMMAND,
-                                     f"{path.name} starts an unexpected process: {command.strip()}")
+                    self.assertIn(command.strip(), allowed,
+                                  f"{path.name} starts an unexpected process: {command.strip()}")
+
+    def test_engine_actions_are_a_closed_list(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        self.assertIn('readonly property var engineActions: ["status", "install", "uninstall"]',
+                      source)
+        self.assertIn("if (engineProc.running || engineActions.indexOf(action) < 0) return",
+                      source)
+        self.assertIn('readonly property string enginesHelper: pluginDirectory '
+                      '+ "/bin/omarchy-rgb-engines"', source)
 
     def test_core_lines_are_bounded(self):
         source = (ROOT / "RgbCooling.qml").read_text()

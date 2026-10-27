@@ -108,7 +108,7 @@ The panel can rename any sensor. Names are stored by the UI, not rgbcd, in
 `{"v": 1, "labels": {"<sensor id>": "<name>"}}`, at most 32 characters each,
 shown as plain text. bootstrap creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
 with `0700` permissions (it is user data, so it is not in the ledger);
-`uninstall.sh --purge` removes it. rgbcd stays read-only.
+`uninstall.sh` removes it unless `--keep-settings` is given. rgbcd stays read-only.
 
 ### Engines (install from the panel)
 
@@ -178,8 +178,13 @@ identity is known and unique, it is not `0416:5302`, OpenRGB runs through the
 plugin's own unit, and it has a `Static` mode with a mode-specific or per-LED
 colour. `lighting.set` then sends `UPDATEMODE` with that `Static` mode and the
 colour; brightness uses the mode's own range when it has one, otherwise the
-colour is scaled and `brightness_emulated` is true. rgbcd never sends
-`SAVEMODE`, `SETCUSTOMMODE` to other modes, zone resizes or per-LED effects.
+colour is scaled and `brightness_emulated` is true. When the `Static` mode
+uses per-LED colours (`MODE_COLORS_PER_LED`, as on MSI Mystic Light), the
+colour is applied with `UPDATELEDS` carrying the **same** colour for every LED
+of that controller, right after `UPDATEMODE` selects `Static`; with
+mode-specific colours it travels inside `UPDATEMODE`. rgbcd never sends
+`SAVEMODE`, `SETCUSTOMMODE`, `UPDATEZONELEDS`, zone resizes, or LED buffers
+with different colours, and re-reads the controller to confirm the change.
 
 ### Engine scans (no background polling)
 
@@ -257,12 +262,14 @@ It runs `systemctl --user daemon-reload` and `enable --now omarchy-rgb-cooling.s
 (never the service). It prints one JSON line: `{"ok": true}` or
 `{"ok": false, "error": "<plain text>"}`.
 
-`uninstall.sh` stops and disables the socket and service, removes every path
-in the ledger plus the fixed list above, removes the plugin through
-`omarchy plugin remove`, and removes `$XDG_STATE_HOME/omarchy-rgb-cooling`
-and the runtime socket. `uninstall.sh --purge` also removes
-`$XDG_CONFIG_HOME/omarchy-rgb-cooling` (user settings). Nothing outside these
-paths is touched, and nothing needs `sudo`.
+`uninstall.sh` stops the units, removes the engines the plugin installed
+(`bin/omarchy-rgb-engines uninstall-all`, which asks for the password through
+pkexec), removes the plugin through `omarchy plugin remove`, every path in the
+ledger plus the fixed list above, `$XDG_STATE_HOME/omarchy-rgb-cooling`, the
+runtime socket and the user settings in `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
+(sensor names, enabled devices). `uninstall.sh --keep-settings` keeps those
+settings. Nothing outside these paths is touched, and only the engines step
+needs a password.
 
 Tests drive `bootstrap.py` and `uninstall.sh` in a throwaway `HOME` with stub
 `systemctl` and `omarchy` executables first on `PATH`.

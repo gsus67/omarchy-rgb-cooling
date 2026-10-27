@@ -123,8 +123,9 @@ def install(source, state, config, entries):
             os.replace(compiled, binary)
     unit_dir = config / "systemd/user"
     make_directory(unit_dir, entries)
-    for suffix in ("socket", "service"):
-        name = f"{NAME}.{suffix}"
+    for suffix in ("socket", "service", "openrgb.service"):
+        name = (f"{NAME}-openrgb.service" if suffix == "openrgb.service"
+                else f"{NAME}.{suffix}")
         destination = unit_dir / name
         content = (source / "systemd" / name).read_text(encoding="utf-8")
         if suffix == "service":
@@ -132,6 +133,12 @@ def install(source, state, config, entries):
                 raise ValueError("Service template must contain exactly one executable placeholder")
             command = quote(binary) + " --data-dir " + quote(source / "data")
             content = content.replace(PLACEHOLDER, command)
+        if suffix == "openrgb.service":
+            rgb_config = state / "openrgb"
+            make_directory(rgb_config, entries)
+            content = content.replace("@OPENRGB LAUNCHER@",
+                                      quote(source / "bin/omarchy-rgb-openrgb"))
+            content = content.replace("@OPENRGB CONFIG@", quote(rgb_config))
         entries.add(str(destination))
         if not destination.is_file() or destination.read_text(encoding="utf-8") != content:
             atomic_write(destination, content)

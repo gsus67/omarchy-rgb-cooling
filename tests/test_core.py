@@ -19,6 +19,8 @@ import unittest
 from fakes.hwmon import FileWatch, HwmonTree
 from fakes.dmi import DmiTree
 from fakes.openrgb import OpenRgbServer, controller
+from fakes.usb import UsbTree
+from rgb_contract import OpenRgbContractMixin
 
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[1]
@@ -28,6 +30,7 @@ PEERCRED_LIBRARY = None
 UDEV_LIBRARY = None
 RUNTIME_LIBRARY = None
 POWER_PROFILES_FAKE = None
+SYSTEMD_FAKE = None
 WAIT_TIMEOUT = 30
 
 
@@ -88,7 +91,7 @@ class TestClock:
 def setUpModule():
     """Compile exactly once for this module, in a disposable directory."""
     global BUILD_DIRECTORY, BINARY, PEERCRED_LIBRARY, UDEV_LIBRARY, RUNTIME_LIBRARY
-    global POWER_PROFILES_FAKE
+    global POWER_PROFILES_FAKE, SYSTEMD_FAKE
     BUILD_DIRECTORY = tempfile.TemporaryDirectory(prefix="rgbcd-contract-")
     result = subprocess.run(
         [sys.executable, str(REPO / "native_build.py"), "--output", BUILD_DIRECTORY.name],
@@ -117,6 +120,14 @@ def setUpModule():
     result = subprocess.run([
         compiler, "-std=c++20", "-fPIC", "-Wall", "-Wextra", "-Wpedantic",
         str(REPO / "tests/fakes/power_profiles.cpp"), *qt_flags, "-o", str(POWER_PROFILES_FAKE),
+    ], capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(result.stdout + result.stderr)
+
+    SYSTEMD_FAKE = Path(BUILD_DIRECTORY.name) / "systemd-fake"
+    result = subprocess.run([
+        compiler, "-std=c++20", "-fPIC", "-Wall", "-Wextra", "-Wpedantic",
+        str(REPO / "tests/fakes/systemd.cpp"), *qt_flags, "-o", str(SYSTEMD_FAKE),
     ], capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
@@ -209,7 +220,13 @@ class Daemon:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.tree = HwmonTree(self.directory / "hwmon")
         self.path = self.directory / "core.sock"
+        self.usb = UsbTree(self.directory / "sys")
+        rules = self.directory / "openrgb.rules"
+        rules.write_text("")
         environment = {**os.environ,
+                       "HOME": str(self.directory),
+                       "XDG_CONFIG_HOME": str(self.directory / "config"),
+                       "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent/rgbcd-session-bus",
                        "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/nonexistent/rgbcd-test-bus",
                        **(environment or {})}
         for variable in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES", "CORE_TEST_CLOCK"):
@@ -223,7 +240,8 @@ class Daemon:
         self.clock = TestClock(self.directory) if clock else None
         if self.clock:
             environment["CORE_TEST_CLOCK"] = str(self.clock.path)
-        arguments = [str(BINARY), "--hwmon-root", str(self.tree.root)]
+        arguments = [str(BINARY), "--hwmon-root", str(self.tree.root),
+                     "--sys-root", str(self.usb.root), "--openrgb-rules", str(rules)]
         if demo:
             arguments.append("--demo")
         if extra:
@@ -996,348 +1014,8 @@ class FanHeadersContract(unittest.TestCase):
         self.assertIn("repository fan-headers.json passes the runtime schema", result.stdout)
 
 
-class OpenRgbContract(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="rgbcd-sdk-")
-        self.addCleanup(self.temporary.cleanup)
-        self.counter = 0
-        self.udev_fifo = Path(self.temporary.name) / "udev.fifo"
-        os.mkfifo(self.udev_fifo)
-        self.udev_fd = os.open(self.udev_fifo, os.O_RDWR | os.O_NONBLOCK)
-        self.addCleanup(os.close, self.udev_fd)
-        self.udev_ack_fifo = Path(self.temporary.name) / "udev-ack.fifo"
-        os.mkfifo(self.udev_ack_fifo)
-        self.udev_ack_fd = os.open(self.udev_ack_fifo, os.O_RDWR | os.O_NONBLOCK)
-        self.addCleanup(os.close, self.udev_ack_fd)
-        self.environment = {
-            "CORE_TEST_UDEV_FIFO": str(self.udev_fifo),
-            "CORE_TEST_UDEV_ACK_FIFO": str(self.udev_ack_fifo),
-        }
-
-    def launch(self, *, interested=True, clock=True, **options):
-        fake = OpenRgbServer(**options)
-        self.addCleanup(fake.close)
-        self.counter += 1
-        daemon = Daemon(Path(self.temporary.name) / str(self.counter),
-                        environment={**self.environment, "CORE_TEST_OPENRGB_PORT": str(fake.port)},
-                        clock=clock)
-        self.addCleanup(daemon.close)
-        client = daemon.client()
-        self.addCleanup(client.close)
-        if interested:
-            self.assertTrue(client.request("subscribe", {
-                "topics": ["devices"], "interval_ms": 10000,
-            })["ok"])
-            client.request("devices")
-        return fake, daemon, client
-
-    def wait_state(self, client, expected, timeout=WAIT_TIMEOUT):
-        def matching_state():
-            engine = client.request("status")["result"]["engines"][0]
-            return engine if engine["state"] == expected else None
-
-        return wait_until(matching_state, timeout, message=f"OpenRGB state to become {expected}")
-
-    def wait_disconnected(self, fake):
-        wait_until(fake.disconnected.is_set, message="fake OpenRGB peer to disconnect")
-
-    def subscribe_devices(self, client):
-        return client.request("subscribe", {"topics": ["devices"], "interval_ms": 500})
-
-    def hotplug(self, client):
-        os.write(self.udev_fd, b"+")
-
-        def acknowledged():
-            try:
-                return os.read(self.udev_ack_fd, 1) == b"+"
-            except BlockingIOError:
-                return False
-
-        wait_until(acknowledged, message="fake udev notification to be consumed")
-        # The daemon finishes the udev callback before dispatching this request.
-        self.assertTrue(client.request("hello")["ok"])
-
-    def test_contract_openrgb_no_requests_or_subscriptions_start_engine_polling(self):
-        fake, daemon, client = self.launch(interested=False)
-        # Exercise virtual timer deadlines as well as a real absence observation window.
-        daemon.advance(5.6, client)
-        time.sleep(5.3)
-        self.assertEqual(fake.accepted, 0)
-        for operation in ("hello", "status", "sensors"):
-            self.assertTrue(client.request(operation)["ok"])
-        client.request("subscribe", {"topics": ["sensors"], "interval_ms": 500})
-        client.event("sensors")
-        self.hotplug(client)
-        time.sleep(0.2)
-        self.assertEqual(fake.accepted, 0)
-        self.subscribe_devices(client)
-        client.event("devices")
-        daemon.advance(5.6, client)
-        time.sleep(5.3)
-        self.assertEqual(fake.accepted, 0)
-        self.assertEqual(fake.commands, [])
-
-    def test_contract_openrgb_first_devices_then_lighting_and_devices_use_cache(self):
-        fake, daemon, client = self.launch(interested=False, clock=True)
-        devices = client.request("devices")["result"]
-        self.assertEqual(client.request("devices")["result"], devices)
-        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
-        device = devices["devices"][0]
-        self.assertTrue(client.request("lighting.get", {"device": device["id"]})["ok"])
-        response = client.request("lighting.set", {
-            "device": device["id"], "color": "#ABCDEF", "brightness": 50,
-        })
-        self.assertEqual(response["error"]["code"], "blocked")
-        self.assertEqual(fake.accepted, 1)
-        self.wait_disconnected(fake)
-        self.subscribe_devices(client)
-        daemon.advance(5.6, client)
-        time.sleep(5.3)
-        self.assertEqual(fake.accepted, 1)
-
-    def test_contract_openrgb_first_lighting_operations_each_scan_once(self):
-        for operation in ("lighting.get", "lighting.set"):
-            with self.subTest(operation=operation):
-                fake, daemon, client = self.launch(interested=False)
-                response = client.request(operation, {
-                    "device": "unknown", "color": "#123456", "brightness": 50,
-                })
-                self.assertEqual(response["error"]["code"], "unavailable")
-                self.assertTrue(client.request("devices")["result"]["devices"])
-                self.assertEqual(fake.accepted, 1)
-                client.close()
-                daemon.close()
-                fake.close()
-
-    def test_contract_openrgb_rescan_fresh_list_global_rate_limit_and_deferred_response(self):
-        fake, daemon, client = self.launch(interested=False, clock=True)
-        # devices.rescan may also be the very first scan.
-        self.assertTrue(client.request("devices.rescan")["ok"])
-        self.wait_disconnected(fake)
-        other = daemon.client()
-        self.addCleanup(other.close)
-        response = other.request("devices.rescan")
-        self.assertEqual(response["error"]["code"], "rate_limited")
-        self.assertEqual(fake.accepted, 1)
-        daemon.advance(2.3, client)
-        fake.descriptors = [controller("Replacement")]
-        fake.respond.clear()
-        client.send({"v": 1, "id": 100, "op": "devices.rescan"})
-        wait_until(lambda: fake.accepted >= 2, message="second OpenRGB scan to connect")
-        self.assertTrue(other.request("hello")["ok"])
-        self.assertEqual(select.select([client.socket], [], [], 0.1)[0], [])
-        # Reads and manual scans on different peers share this scan, not stale cache.
-        other.send({"v": 1, "id": 101, "op": "devices"})
-        other.send({"v": 1, "id": 102, "op": "devices.rescan"})
-        other.send({"v": 1, "id": 103, "op": "lighting.get",
-                    "params": {"device": "missing"}})
-        other.send({"v": 1, "id": 104, "op": "lighting.set",
-                    "params": {"device": "missing", "color": "#112233", "brightness": 50}})
-        # A barrier proves all requests were dispatched while the scan was still running.
-        other.send({"v": 1, "id": 105, "op": "hello"})
-        self.assertEqual(other.read()["id"], 105)
-        fake.respond.set()
-        response = client.read()
-        self.assertEqual(response["id"], 100)
-        self.assertEqual(response["result"]["devices"][0]["name"], "Replacement")
-        for identifier in (101, 102):
-            joined = other.read()
-            self.assertEqual(joined["id"], identifier)
-            self.assertEqual(joined["result"], response["result"])
-        for identifier in (103, 104):
-            joined = other.read()
-            self.assertEqual(joined["id"], identifier)
-            self.assertEqual(joined["error"]["code"], "unavailable")
-        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
-        self.wait_disconnected(fake)
-        self.assertEqual(fake.accepted, 2)
-
-    def test_contract_openrgb_failed_scan_cached_without_automatic_retries(self):
-        fake, daemon, client = self.launch(behavior="magic")
-        self.wait_state(client, "unreachable")
-        self.wait_disconnected(fake)
-        fake.behavior = "normal"
-        # Even a subscribed client and subsequent reads must not cause retries.
-        self.assertEqual(client.request("devices")["result"], {"devices": []})
-        daemon.advance(6.6, client)
-        time.sleep(6.3)
-        self.assertEqual(fake.accepted, 1)
-        self.wait_state(client, "unreachable")
-        self.assertTrue(client.request("devices.rescan")["result"]["devices"])
-        self.assertEqual(fake.accepted, 2)
-
-    def test_contract_openrgb_udev_hotplug_requires_a_device_subscriber(self):
-        fake, daemon, client = self.launch(interested=False, clock=True)
-        self.hotplug(client)
-        time.sleep(0.2)
-        self.assertEqual(fake.accepted, 0)
-        self.subscribe_devices(client)
-        self.hotplug(client)
-        self.wait_state(client, "blocked")
-        self.assertEqual(fake.accepted, 1)
-        self.wait_disconnected(fake)
-        # Only one of the two peers needs to subscribe to devices.
-        other = daemon.client()
-        self.addCleanup(other.close)
-        self.subscribe_devices(other)
-        client.request("unsubscribe")
-        fake.descriptors = [controller("Hotplug replacement")]
-        self.hotplug(client)
-        wait_event(other, "devices", lambda data: data["devices"]
-                   and data["devices"][0]["name"] == "Hotplug replacement",
-                   message="udev replacement inventory to arrive")
-        self.assertEqual(fake.accepted, 2)
-        # Hotplug scans also count towards the manual scan rate limit.
-        self.assertEqual(client.request("devices.rescan")["error"]["code"], "rate_limited")
-        # An explicit unsubscribe response proves there are no device subscribers.
-        other.request("unsubscribe")
-        other.close()
-        client.request("hello")
-        self.hotplug(client)
-        time.sleep(0.2)
-        self.assertEqual(fake.accepted, 2)
-
-    def test_contract_openrgb_initial_scan_shares_failures_and_keeps_loop_responsive(self):
-        fake, daemon, client = self.launch(interested=False, behavior="timeout", clock=True)
-        client.send({"v": 1, "id": 100, "op": "devices"})
-        other = daemon.client()
-        self.addCleanup(other.close)
-        other.send({"v": 1, "id": 101, "op": "devices"})
-        other.send({"v": 1, "id": 102, "op": "devices.rescan"})
-        abandoned = daemon.client()
-        abandoned.send({"v": 1, "id": 200, "op": "devices"})
-        abandoned.close()
-        wait_until(lambda: fake.commands, message="pending OpenRGB SDK request to arrive")
-        self.assertTrue(other.request("hello")["ok"])
-        # The timeout can settle 101/102 before advance() reads its waking hello.
-        # Use a peer without pending replies so either dispatch order is valid.
-        with daemon.client() as control:
-            daemon.advance(2.3, control)
-        reply = client.read()
-        self.assertEqual(reply["id"], 100)
-        self.assertEqual(reply["result"], {"devices": []})
-        self.wait_disconnected(fake)
-        for identifier in (101, 102):
-            joined = other.read()
-            self.assertEqual(joined["id"], identifier)
-            self.assertEqual(joined["result"], {"devices": []})
-        self.assertEqual(fake.accepted, 1)
-        accepted = fake.accepted
-        daemon.advance(2.3, client)
-        time.sleep(2.3)
-        self.assertEqual(fake.accepted, accepted)
-
-    def test_contract_openrgb_negotiates_version_fragments_and_blocks_all_real_writes(self):
-        fake, daemon, client = self.launch(fragment=True)
-        self.wait_state(client, "blocked")
-        self.assertFalse(client.request("hello")["result"]["demo"])
-        before = daemon.tree.snapshot()
-        device = client.request("devices")["result"]["devices"][0]
-        self.assertEqual(device["support"], "recognized")
-        self.assertFalse(device["writable"])
-        for gate in ("identity", "ownership", "exclusions", "support"):
-            self.assertIn(gate, device["blocked_reason"])
-        self.assertEqual(device["capabilities"], ["lighting.read"])
-        lighting = client.request("lighting.get", {"device": device["id"]})["result"]
-        self.assertEqual(lighting, {"device": device["id"], "color": "#112233",
-                                    "brightness": 100, "brightness_emulated": False})
-        response = client.request("lighting.set", {
-            "device": device["id"], "color": "#ffffff", "brightness": 100,
-        })
-        self.assertEqual(response["error"]["code"], "blocked")
-        self.assertEqual(before, daemon.tree.snapshot())
-        self.assertEqual(fake.commands[0][1:], (40, b"\x01\x00\x00\x00"))
-        self.assertTrue(all(command in (0, 1, 40) for _device, command, _payload in fake.commands))
-
-    def test_contract_trofeo_0416_5302_excluded_never_opened_and_no_capabilities(self):
-        fake, _daemon, client = self.launch(descriptors=[
-            controller(), controller("Trofeo", "USB:0416:5302:port2"),
-        ])
-        self.wait_state(client, "blocked")
-        devices = client.request("devices")["result"]["devices"]
-        excluded = next(device for device in devices if device["excluded"])
-        self.assertFalse(excluded["writable"])
-        self.assertEqual(excluded["capabilities"], [])
-        self.assertIn("omarchy-trcc", excluded["blocked_reason"])
-        for operation in ("lighting.get", "lighting.set"):
-            response = client.request(operation, {
-                "device": excluded["id"], "color": "#000000", "brightness": 0,
-            })
-            self.assertEqual(response["error"]["code"], "blocked")
-        # Enumeration is descriptor-only; no open, detection or write SDK command is sent.
-        self.assertTrue(all(command in (0, 1, 40) for _device, command, _payload in fake.commands))
-
-    def test_contract_openrgb_unsupported_without_static_read_capability(self):
-        _fake, _daemon, client = self.launch(descriptors=[controller(with_lighting=False)])
-        self.wait_state(client, "blocked")
-        device = client.request("devices")["result"]["devices"][0]
-        response = client.request("lighting.get", {"device": device["id"]})
-        self.assertEqual(response["error"]["code"], "unsupported")
-
-    def test_contract_openrgb_stable_identity_across_reordered_protocol_indices(self):
-        first = controller()
-        second = controller("Other RGB", "USB:1234:abcd:port2", "other")
-        fake, daemon, client = self.launch(descriptors=[first, second])
-        self.wait_state(client, "blocked")
-        before = client.request("devices")["result"]
-        fake.descriptors = [second, first]
-        daemon.advance(2.3, client)
-        self.assertEqual(client.request("devices.rescan")["result"], before)
-        self.assertEqual(client.request("devices")["result"], before)
-
-    def test_contract_openrgb_bad_magic_lengths_counts_ids_commands_timeout_unreachable(self):
-        for behavior in ("magic", "huge", "huge_count", "wrong_id", "wrong_command", "timeout"):
-            with self.subTest(behavior=behavior):
-                fake, daemon, client = self.launch(behavior=behavior, clock=behavior != "timeout")
-                self.assertTrue(client.request("hello")["ok"])
-                engine = self.wait_state(client, "unreachable")
-                self.assertTrue(engine["reason"])
-                self.assertEqual(client.request("devices")["result"], {"devices": []})
-                self.assertTrue(client.request("hello")["ok"])
-                client.close()
-                daemon.close()
-                fake.close()
-
-    def test_contract_openrgb_strict_descriptor_inner_lengths_and_truncation(self):
-        valid = controller()
-        for descriptor in (valid[:-1], valid + b"extra", b"\xff" * 50,
-                           valid[:8] + b"\xff\xff" + valid[10:]):
-            with self.subTest(length=len(descriptor)):
-                fake, daemon, client = self.launch(descriptors=[descriptor])
-                self.wait_state(client, "unreachable")
-                self.assertEqual(client.request("devices")["result"], {"devices": []})
-                client.close()
-                daemon.close()
-                fake.close()
-
-    def test_contract_openrgb_v0_server_and_absent_server_are_normal_engine_states(self):
-        fake, daemon, client = self.launch(advertised=0, descriptors=[controller(version=0)])
-        self.wait_state(client, "blocked")
-        client.close()
-        daemon.close()
-        fake.close()
-        reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.addCleanup(reserved.close)
-        reserved.bind(("127.0.0.1", 0))
-        absent = Daemon(Path(self.temporary.name) / "absent", clock=True, environment={
-            **self.environment, "CORE_TEST_OPENRGB_PORT": str(reserved.getsockname()[1]),
-        })
-        self.addCleanup(absent.close)
-        client = absent.client()
-        self.addCleanup(client.close)
-        engine = self.wait_state(client, "absent")
-        self.assertTrue(engine["reason"])
-        self.assertEqual(client.request("devices")["result"], {"devices": []})
-        recovery = OpenRgbServer(listener=reserved)
-        self.addCleanup(recovery.close)
-        self.subscribe_devices(client)
-        absent.advance(3.5, client)
-        time.sleep(3.2)
-        self.assertEqual(recovery.accepted, 0)
-        self.assertEqual(client.request("devices")["result"], {"devices": []})
-        self.assertEqual(client.request("status")["result"]["engines"][0]["state"], "absent")
-        self.assertTrue(client.request("devices.rescan")["result"]["devices"])
-        self.assertEqual(recovery.accepted, 1)
+class OpenRgbContract(OpenRgbContractMixin, unittest.TestCase):
+    pass
 
 
 class ActivationAndLifetimeContract(unittest.TestCase):
@@ -1779,11 +1457,13 @@ else:
             self.state / ".bootstrap.lock", self.state / "installed-files",
             self.units / "omarchy-rgb-cooling.socket",
             self.units / "omarchy-rgb-cooling.service",
+            self.units / "omarchy-rgb-cooling-openrgb.service",
             self.units / "sockets.target.wants/omarchy-rgb-cooling.socket",
         }
         directories = {
             self.home / "state", self.state, self.state / "bin", self.home / "config",
             self.home / "config/systemd", self.units, self.units / "sockets.target.wants",
+            self.state / "openrgb",
         }
         ledger = set((self.state / "installed-files").read_text().splitlines())
         expected_ledger = {str(path) for path in expected_files}
@@ -1803,6 +1483,16 @@ else:
         self.assertIn(f' --data-dir "{REPO}/data"', service)
         self.assertNotIn("[Install]", service)
         self.assertEqual(stat.S_IMODE((self.state / "installed-files").stat().st_mode), 0o600)
+
+    def test_contract_bootstrap_openrgb_unit_in_ledger_and_never_started(self):
+        self.bootstrap()
+        path = self.units / "omarchy-rgb-cooling-openrgb.service"
+        content = path.read_text()
+        self.assertNotIn("[Install]", content)
+        self.assertIn(f'ExecStart=:"{REPO}/bin/omarchy-rgb-openrgb"', content)
+        self.assertIn(f'ReadWritePaths="{self.state}/openrgb"', content)
+        self.assertIn(str(path), (self.state / "installed-files").read_text().splitlines())
+        self.assertFalse(any("openrgb.service" in " ".join(cmd) for cmd in self.commands()))
 
     def test_contract_bootstrap_idempotent_no_changes_no_systemctl_or_binary_replacement(self):
         self.bootstrap()

@@ -11,8 +11,9 @@
 #include <unistd.h>
 
 Server::Server(bool demo, const QString &hwmonRoot, const QString &dataDirectory,
-               const QString &dmiRoot)
-    : demo(demo), sensorSource(hwmonRoot, dataDirectory, dmiRoot, demo),
+               const QString &dmiRoot, const QString &sysRoot, const QString &openrgbRules)
+    : demo(demo), sysRoot(sysRoot), openrgbRules(openrgbRules),
+      sensorSource(hwmonRoot, dataDirectory, dmiRoot, demo),
       powerProfiles([this](const auto &data) { profileChanged(data); })
 {
     clock.start();
@@ -20,7 +21,13 @@ Server::Server(bool demo, const QString &hwmonRoot, const QString &dataDirectory
     idleExit.setSingleShot(true);
     idleExit.setInterval(Protocol::ExitMilliseconds);
     idleExit.setTimerType(Qt::PreciseTimer);
-    connect(&idleExit, &QTimer::timeout, qApp, &QCoreApplication::quit);
+    connect(&idleExit, &QTimer::timeout, this, [this] {
+        if (!this->demo && adapter && static_cast<OpenRgbAdapter *>(adapter.get())->running()) {
+            idleExit.start();
+        } else {
+            QCoreApplication::quit();
+        }
+    });
     idleExit.start();
     events.setSingleShot(true);
     events.setTimerType(Qt::PreciseTimer);
@@ -33,7 +40,8 @@ void Server::initializeAdapters()
     if (demo) {
         adapter = std::make_unique<DemoAdapter>();
     } else {
-        adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); });
+        adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); },
+                                                   sysRoot, openrgbRules);
         hotplug = std::make_unique<Hotplug>([this] {
             sensorSource.invalidate();
             if (deviceSubscriber) {
@@ -115,6 +123,9 @@ void Server::readSensors(SensorSource::Callback ready)
 
 void Server::dispatch(Connection *connection, const Protocol::Request &request)
 {
+    if (!demo) {
+        static_cast<OpenRgbAdapter *>(adapter.get())->wake();
+    }
     Protocol::Reply reply;
     const auto &op = request.operation;
     const auto &params = request.params;
@@ -184,6 +195,13 @@ void Server::subscriptionsChanged()
         profileSubscriber = profileSubscriber || connection->topics.contains("profile");
     }
     powerProfiles.setSubscribed(profileSubscriber);
+    if (!demo && adapter) {
+        bool subscribed = false;
+        for (const auto *client : clients) {
+            subscribed = subscribed || !client->topics.isEmpty();
+        }
+        static_cast<OpenRgbAdapter *>(adapter.get())->setSubscribed(subscribed);
+    }
     scheduleEvents();
 }
 
