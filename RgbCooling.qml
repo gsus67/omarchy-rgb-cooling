@@ -110,8 +110,14 @@ Panel {
     return null
   }
   readonly property bool canWrite: currentDevice !== null && currentDevice.writable === true
-      && currentDevice.capabilities.indexOf("lighting.write") >= 0
-  readonly property bool hasBrightness: canWrite && currentDevice.capabilities.indexOf("brightness") >= 0
+  // Effects the controller offers (docs/API.md, "Effects and saving").
+  readonly property var currentModes: currentDevice && Array.isArray(currentDevice.modes) ? currentDevice.modes : []
+  readonly property var currentMode: {
+    if (lighting === null) return null
+    for (var i = 0; i < currentModes.length; i++)
+      if (currentModes[i].name === lighting.mode) return currentModes[i]
+    return null
+  }
 
   function hex(c) {
     function part(v) { var s = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16); return s.length < 2 ? "0" + s : s }
@@ -457,9 +463,11 @@ Panel {
   }
 
   // ---- lighting -----------------------------------------------------------
+  // Changes are merged and sent after a short pause, so dragging the colour
+  // picker or a slider produces a handful of writes instead of hundreds.
 
-  property string pendingColor: ""
-  property int pendingBrightness: -1
+  property var pendingLighting: ({})
+  property bool savingLighting: false
 
   function refreshLighting() {
     lighting = null
@@ -479,11 +487,41 @@ Panel {
     refreshLighting()
   }
 
-  function setLighting(color, brightness) {
+  // changes: any of {mode, color, brightness, speed, random}
+  function setLighting(changes) {
     if (!canWrite || lighting === null) return
-    pendingColor = color !== "" ? color : lighting.color
-    pendingBrightness = brightness >= 0 ? brightness : lighting.brightness
+    var merged = {}
+    for (var key in pendingLighting) merged[key] = pendingLighting[key]
+    for (var name in changes) merged[name] = changes[name]
+    // A new effect may not take a colour or a speed: drop what it cannot use.
+    if (merged.mode !== undefined) {
+      var mode = null
+      for (var i = 0; i < currentModes.length; i++) if (currentModes[i].name === merged.mode) mode = currentModes[i]
+      if (mode && mode.color !== "single") delete merged.color
+      if (mode && !mode.speed) delete merged.speed
+      if (mode && !mode.brightness) delete merged.brightness
+      if (mode && !mode.random) delete merged.random
+    }
+    pendingLighting = merged
+    // Show the change at once; the core's reply replaces it.
+    var preview = {}
+    for (var field in lighting) preview[field] = lighting[field]
+    for (var change in merged) preview[change] = merged[change]
+    preview.saved = false
+    lighting = preview
     lightingDebounce.restart()
+  }
+
+  function saveLighting() {
+    if (!canWrite || lighting === null || savingLighting) return
+    var device = selectedDevice
+    savingLighting = true
+    send("lighting.save", { device: device }, function(ok, r) {
+      root.savingLighting = false
+      if (device !== root.selectedDevice) return
+      if (ok) { root.lighting = r; root.lightingError = "" }
+      else root.lightingError = String(r.message || "")
+    })
   }
 
   Timer {
@@ -492,10 +530,13 @@ Panel {
     repeat: false
     onTriggered: {
       var device = root.selectedDevice
-      root.send("lighting.set", { device: device, color: root.pendingColor, brightness: root.pendingBrightness }, function(ok, r) {
+      var params = { device: device }
+      for (var key in root.pendingLighting) params[key] = root.pendingLighting[key]
+      root.pendingLighting = ({})
+      root.send("lighting.set", params, function(ok, r) {
         if (device !== root.selectedDevice) return
         if (ok) { root.lighting = r; root.lightingError = "" }
-        else root.lightingError = String(r.message || "")
+        else { root.lightingError = String(r.message || ""); root.refreshLighting() }
       })
     }
   }
@@ -505,14 +546,11 @@ Panel {
   readonly property var visibleSections: {
     var list = []
     if (modes.length > 0) list.push("modes")
-    if (lightingDevices.length > 0) list.push("devices")
-    if (canWrite) list.push("colors")
-    if (hasBrightness) list.push("brightness")
+    if (tab === "lighting" && lightingDevices.length > 1) list.push("devices")
     return list
   }
   function sectionCount(section) {
     if (section === "devices") return lightingDevices.length
-    if (section === "colors") return swatches.length
     return 0
   }
   function moveCursor(dy) {
@@ -527,17 +565,14 @@ Panel {
     var target = s + dy
     if (target < 0 || target >= sections.length) return
     focusSection = sections[target]
-    selectedIndex = focusSection === "brightness" ? -1 : (dy < 0 && focusSection === "devices" ? lightingDevices.length - 1 : 0)
+    selectedIndex = dy < 0 && focusSection === "devices" ? lightingDevices.length - 1 : 0
   }
   function moveCursorH(dx) {
     if (focusSection === "modes") selectedIndex = Math.max(0, Math.min(modes.length - 1, selectedIndex + dx))
-    else if (focusSection === "colors") selectedIndex = Math.max(0, Math.min(swatches.length - 1, selectedIndex + dx))
-    else if (focusSection === "brightness" && lighting !== null) setLighting("", Math.max(0, Math.min(100, lighting.brightness + dx * 5)))
   }
   function activateCursor() {
     if (focusSection === "modes" && selectedIndex >= 0 && selectedIndex < modes.length) setProfile(modes[selectedIndex].value)
     else if (focusSection === "devices" && selectedIndex >= 0 && selectedIndex < lightingDevices.length) selectDevice(lightingDevices[selectedIndex].id)
-    else if (focusSection === "colors" && selectedIndex >= 0 && selectedIndex < swatches.length) setLighting(swatches[selectedIndex].color, -1)
   }
 
   // ---- bar ----------------------------------------------------------------
@@ -809,241 +844,10 @@ Panel {
           }
 
           // Lighting
-          PanelSeparator {
-            visible: root.tab === "lighting" && root.coreReady
-            foreground: root.bar.foreground
-          }
-
-          Column {
+          LightingTab {
             visible: root.tab === "lighting" && root.coreReady
             width: parent.width
-            spacing: Style.space(8)
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(lightingHeader.implicitHeight, scanButton.height)
-
-              PanelSectionHeader {
-                id: lightingHeader
-                text: root.t("LIGHTING")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              PanelActionButton {
-                id: scanButton
-                iconText: root.scanning ? "󰑓" : "󰍉"
-                tooltipText: root.scanning ? root.t("Scanning…") : root.t("Scan for devices (S)")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                enabled: !root.scanning
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                onClicked: root.scan()
-              }
-            }
-
-            Text {
-              visible: root.lightingDevices.length === 0
-              textFormat: Text.PlainText
-              text: root.t("No lighting devices found. If you have RGB hardware, install its engine in the Engines tab.")
-              color: Qt.darker(root.bar.foreground, 1.4)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-              width: parent.width
-            }
-
-            Repeater {
-              model: root.lightingDevices
-
-              CursorSurface {
-                id: deviceRow
-                required property var modelData
-                required property int index
-                width: panelColumn.width
-                height: deviceColumn.implicitHeight + Style.spacing.controlGap
-                foreground: root.bar.foreground
-                hasCursor: root.cursorActive && root.focusSection === "devices" && root.selectedIndex === index
-                current: modelData.id === root.selectedDevice
-
-                Column {
-                  id: deviceColumn
-                  anchors.left: parent.left
-                  anchors.right: enableButton.left
-                  anchors.leftMargin: Style.space(8)
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: root.deviceName(deviceRow.modelData)
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.body
-                    font.bold: deviceRow.modelData.id === root.selectedDevice
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-
-                  Text {
-                    textFormat: Text.PlainText
-                    text: root.supportLabel(deviceRow.modelData) + (deviceRow.modelData.writable ? "" : " · " + root.t("read only"))
-                          + (deviceRow.modelData.enabled === true && !deviceRow.modelData.writable && deviceRow.modelData.blocked_reason ? " · " + String(deviceRow.modelData.blocked_reason) : "")
-                    wrapMode: Text.Wrap
-                    color: Qt.darker(root.bar.foreground, 1.4)
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                    width: parent.width
-                  }
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  onEntered: { root.cursorActive = true; root.focusSection = "devices"; root.selectedIndex = deviceRow.index }
-                  onClicked: root.selectDevice(deviceRow.modelData.id)
-                }
-
-                // Declared after the row's MouseArea so it receives its own clicks.
-                Button {
-                  id: enableButton
-                  visible: String(deviceRow.modelData.usb || "") !== ""
-                  width: visible ? implicitWidth : 0
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: deviceRow.modelData.enabled === true ? root.t("Disable") : root.t("Enable")
-                  foreground: root.bar.foreground
-                  fontFamily: root.bar.fontFamily
-                  bordered: true
-                  onClicked: {
-                    if (deviceRow.modelData.enabled === true) root.setEnabled(deviceRow.modelData.usb, false)
-                    else root.pendingEnable = deviceRow.modelData
-                  }
-                }
-              }
-            }
-
-            // Why writes are off for this device
-            Text {
-              visible: root.currentDevice !== null && !root.canWrite
-              textFormat: Text.PlainText
-              text: root.currentDevice ? String(root.currentDevice.blocked_reason || root.t("This device is read only.")) : ""
-              color: Qt.darker(root.bar.foreground, 1.4)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-              width: parent.width
-            }
-
-            Text {
-              visible: root.lightingError !== ""
-              textFormat: Text.PlainText
-              text: root.lightingError
-              color: Commons.Color.urgent
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-              width: parent.width
-            }
-
-            Grid {
-              id: swatchGrid
-              visible: root.canWrite && root.lighting !== null
-              width: parent.width
-              columns: 5
-              spacing: Style.spacing.xs
-              readonly property real cell: (width - spacing * (columns - 1)) / columns
-
-              Repeater {
-                model: root.swatches
-
-                CursorSurface {
-                  id: swatch
-                  required property var modelData
-                  required property int index
-                  width: swatchGrid.cell
-                  height: Style.spacing.controlHeight
-                  foreground: root.bar.foreground
-                  hasCursor: root.cursorActive && root.focusSection === "colors" && root.selectedIndex === index
-                  current: root.lighting !== null && root.lighting.color === modelData.color
-
-                  Rectangle {
-                    anchors.fill: parent
-                    anchors.margins: Style.space(5)
-                    radius: Style.space(3)
-                    color: swatch.modelData.color
-                    border.width: 1
-                    border.color: Qt.darker(root.bar.foreground, 2)
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    onEntered: { root.cursorActive = true; root.focusSection = "colors"; root.selectedIndex = swatch.index }
-                    onClicked: root.setLighting(swatch.modelData.color, -1)
-                  }
-                }
-              }
-            }
-
-            Item {
-              visible: root.hasBrightness && root.lighting !== null
-              width: parent.width
-              implicitHeight: brightnessHeader.implicitHeight
-
-              PanelSectionHeader {
-                id: brightnessHeader
-                text: root.t("BRIGHTNESS")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                anchors.left: parent.left
-              }
-
-              Text {
-                textFormat: Text.PlainText
-                text: root.lighting ? Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.lighting.brightness) + "%" + (root.lighting.brightness_emulated ? " · " + root.t("emulated") : "") : ""
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(6)
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
-
-            CursorSurface {
-              visible: root.hasBrightness && root.lighting !== null
-              width: parent.width
-              height: brightnessSlider.implicitHeight + Style.spacing.controlGap
-              foreground: root.bar.foreground
-              outline: true
-              hasCursor: root.cursorActive && root.focusSection === "brightness"
-
-              PanelSlider {
-                id: brightnessSlider
-                bar: root.bar
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(6)
-                anchors.rightMargin: Style.space(6)
-                minimum: 0
-                maximum: 100
-                step: 1
-                integer: true
-                value: root.lighting ? root.lighting.brightness : 0
-                onMoved: function(v) { root.setLighting("", Math.round(v)) }
-              }
-
-              HoverHandler {
-                onHoveredChanged: if (hovered) { root.cursorActive = true; root.focusSection = "brightness"; root.selectedIndex = -1 }
-              }
-            }
+            panel: root
           }
 
           // Engines

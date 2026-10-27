@@ -27,10 +27,11 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         if (--acknowledgements[key] == 0) {
             acknowledgements.remove(key);
         }
-        if (acknowledged == 1101 || acknowledged == 1050) {
+        if (acknowledged == 1101 || acknowledged == 1050 || acknowledged == 1102) {
             const auto prefix = quint64(device) << 32;
             awaitingWriteAck = acknowledgements.contains(prefix | 1101)
-                || acknowledgements.contains(prefix | 1050);
+                || acknowledgements.contains(prefix | 1050)
+                || acknowledgements.contains(prefix | 1102);
         }
         return true;
     }
@@ -93,12 +94,14 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         if (writing) {
             writing = false;
             const auto params = requests.head().params;
-            if (!write(id, params.value("color").toString(), params.value("brightness").toInt())) {
+            const auto result = write(id, params);
+            if (!result.ok()) {
+                saving = false;
+                writtenMode = -1;
                 reading.clear();
                 phase = Phase::Idle;
                 timeout.stop();
-                finish(Protocol::Reply::failure(
-                    "blocked", inventory[id]["blocked_reason"].toString()));
+                finish(result);
                 return true;
             }
             send(device, 1, version >= 6 ? QByteArray() : sdkWord(version));
@@ -111,13 +114,33 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
             phase = Phase::Idle;
             notify();
             auto result = lighting(id);
-            if (writtenMode >= 0 && (controller.active != unsigned(writtenMode)
-                || !result.ok() || result.result.value("color").toString() != writtenColor
-                || (writtenBrightness >= 0
-                    && controller.modes[controller.active].brightness != writtenBrightness))) {
-                result = Protocol::Reply::failure("unsupported",
-                    "OpenRGB did not apply the Static colour or brightness");
+            if (writtenMode >= 0) {
+                if (controller.active >= unsigned(controller.modes.size())) {
+                    return false;
+                }
+                const auto &actual = controller.modes[controller.active];
+                if (controller.active != unsigned(writtenMode) || !result.ok()
+                    || (!writtenColor.isEmpty()
+                        && result.result.value("color").toString() != writtenColor)
+                    || actual.speed != writtenDescriptor.speed
+                    || actual.colorMode != writtenDescriptor.colorMode
+                    || actual.colors != writtenDescriptor.colors
+                    || (writtenBrightness >= 0 && actual.brightness != writtenBrightness)) {
+                    result = Protocol::Reply::failure("unsupported",
+                        "OpenRGB did not apply the requested mode values");
+                }
             }
+            if (writtenMode >= 0 && result.ok()) {
+                auto payload = sdkWord(writtenMode) + writtenDescriptor.encode(version);
+                payload.prepend(sdkWord(payload.size() + 4));
+                appliedModes[inventory[id].value("usb").toString()] = payload;
+            }
+            if (saving && result.ok()) {
+                unsaved.remove(inventory[id].value("usb").toString());
+                updateSaved();
+                result = lighting(id);
+            }
+            saving = false;
             writtenColor.clear();
             writtenMode = -1;
             finish(result);
@@ -166,8 +189,8 @@ void OpenRgbWorker::gates()
             gate = "RGB control is disabled for this device";
         } else if (!unit.owned()) {
             gate = "OpenRGB is not running through the plugin's own unit";
-        } else if (version != 6 || controller.staticMode() < 0) {
-            gate = "A supported Static mode with colour is required (SDK protocol 6)";
+        } else if (version < 3 || controller.staticMode() < 0) {
+            gate = "A supported Static mode with colour is required (SDK protocol 3 or later)";
         }
         device.insert("enabled", enabled);
         device.insert("excluded", excluded);
@@ -185,6 +208,7 @@ void OpenRgbWorker::gates()
         inventory.remove(identity);
         inventory.insert(device.value("id").toString(), device);
     }
+    updateSaved();
 }
 
 Protocol::Reply OpenRgbWorker::lighting(const QString &id) const
@@ -199,69 +223,10 @@ Protocol::Reply OpenRgbWorker::lighting(const QString &id) const
     if (!controllers.contains(id)) {
         return Protocol::Reply::failure("unavailable", "OpenRGB controller is not available");
     }
-    const auto value = controllers[id].lighting();
+    auto value = controllers[id].lighting();
     if (value.isEmpty()) {
         return Protocol::Reply::failure("unsupported", "No uniform current colour is available");
     }
+    value.insert("saved", !unsaved.contains(controllers[id].device.value("usb").toString()));
     return {value, {}, {}};
-}
-
-bool OpenRgbWorker::write(const QString &id, const QString &color, int brightness)
-{
-    if (!inventory[id].value("writable").toBool()) {
-        return false;
-    }
-    const auto &controller = controllers[id];
-    const auto modeIndex = controller.staticMode();
-    if (modeIndex < 0 || version != 6) {
-        return false;
-    }
-    auto mode = controller.modes[modeIndex];
-    const bool native = (mode.flags & 16U) && mode.brightnessMax > mode.brightnessMin;
-    if (native) {
-        mode.brightness = mode.brightnessMin
-            + (quint64(mode.brightnessMax - mode.brightnessMin) * brightness + 50) / 100;
-    }
-    bool valid = false;
-    const auto rgb = color.mid(1).toUInt(&valid, 16);
-    if (!valid || color.size() != 7 || brightness < 0 || brightness > 100) {
-        return false;
-    }
-    auto component = [&](int shift) {
-        const auto value = (rgb >> shift) & 255;
-        return native ? value : (value * brightness + 50) / 100;
-    };
-    const auto packed = component(16) | (component(8) << 8) | (component(0) << 16);
-    mode.colorMode = mode.flags & 32U ? 1 : 2;
-    // colors was decoded with a matching LED count and a 4096-LED limit.
-    const auto count = mode.colorMode == 1 ? controller.colors.size()
-                                         : qsizetype(std::max(1U, mode.colorsMin));
-    if (count < 1 || count > 4096 || (mode.colorMode == 2 && count > mode.colorsMax)) {
-        return false;
-    }
-    QByteArray leds;
-    if (mode.colorMode == 1) {
-        mode.colors.clear();
-        leds = sdkHalf(count);
-        for (qsizetype i = 0; i < count; ++i) {
-            leds += sdkWord(packed);
-        }
-        leds.prepend(sdkWord(leds.size() + 4));
-    } else {
-        mode.colors.fill(packed, count);
-    }
-    auto payload = sdkWord(modeIndex) + mode.encode();
-    payload.prepend(sdkWord(payload.size() + 4));
-    // Select Static; per-LED modes require a separate, strictly uniform LED buffer.
-    writtenColor = QString("#%1%2%3").arg(packed & 255, 2, 16, QChar('0'))
-        .arg((packed >> 8) & 255, 2, 16, QChar('0'))
-        .arg((packed >> 16) & 255, 2, 16, QChar('0'));
-    writtenMode = modeIndex;
-    writtenBrightness = native ? qint64(mode.brightness) : -1;
-    awaitingWriteAck = true;
-    send(controller.index, 1101, payload);
-    if (!leds.isEmpty()) {
-        send(controller.index, 1050, leds);
-    }
-    return true;
 }

@@ -182,6 +182,17 @@ void testSdk(Checks &checks)
     }
     checks.verify(modernBounds && !SdkController::decode(modern + 'x', 6, decoded),
                   "SDK v6 rejects every truncated descriptor and trailing bytes");
+    const auto legacyBytes = staticMode.encode(4);
+    SdkReader legacyMode(legacyBytes);
+    SdkMode roundtrip;
+    checks.verify(SdkMode::decode(legacyMode, 4, roundtrip) && legacyMode.done()
+                  && roundtrip.encode(4) == staticMode.encode(4),
+                  "SDK protocol 4 mode descriptors round-trip exactly");
+    checks.verify(modeRange(25, 0, 2) == 1 && modeRange(25, 2, 0) == 2
+                  && modeRange(75, 90, 10) == 30 && modePercent(30, 90, 10) == 75
+                  && modeRange(100, 0, 0xffffffffU) == 0xffffffffU
+                  && modePercent(0xffffffffU, 0, 0xffffffffU) == 100,
+                  "Mode ranges round, reverse and avoid integer overflow");
     quint32 modernSeed = 0x197912;
     for (int i = 0; i < 4000; ++i) {
         modernSeed = modernSeed * 1664525U + 1013904223U;

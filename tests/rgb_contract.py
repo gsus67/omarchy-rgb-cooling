@@ -167,7 +167,9 @@ class OpenRgbContractMixin:
         payload = word(len(payload) + 4) + payload
         self.assertEqual(self.writes(), [(0, 1101, payload)])
         self.assertEqual(result["result"], {"device": device["id"], "color": "#123456",
-                                          "brightness": 25, "brightness_emulated": False})
+                                          "brightness": 25, "brightness_emulated": False,
+                                          "mode": "Static", "speed": None,
+                                          "random": False, "saved": False})
         self.assertEqual(self.fake.commands[0], (0, 40, word(6)))
         current = self.client.request("lighting.get", {"device": device["id"]})
         self.assertEqual(current["result"], result["result"])
@@ -396,6 +398,7 @@ class OpenRgbContractMixin:
         self.advance(119.9)
         self.assertEqual(len(self.command()["calls"]), 1)
         self.assertTrue(self.set_color(device)["ok"])
+        self.assertTrue(self.client.request("lighting.save", {"device": device["id"]})["ok"])
         self.advance(119.9)
         self.assertEqual(len(self.command()["calls"]), 1)
         self.advance(0.11)
@@ -499,7 +502,7 @@ class OpenRgbContractMixin:
         self.launch(advertised=1, descriptors=[controller(version=1)])
         device = self.devices()[0]
         self.assertFalse(device["writable"])
-        self.assertIn("protocol 6", device["blocked_reason"])
+        self.assertIn("protocol 3 or later", device["blocked_reason"])
         self.assertTrue(self.client.request("lighting.get", {"device": device["id"]})["ok"])
         self.assertEqual(self.set_color(device)["error"]["code"], "blocked")
         self.assertEqual(self.writes(), [])
@@ -603,7 +606,9 @@ class OpenRgbContractMixin:
         result = self.set_color(device, brightness=25)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["result"], {"device": device["id"], "color": "#123456",
-                                          "brightness": 25, "brightness_emulated": False})
+                                          "brightness": 25, "brightness_emulated": False,
+                                          "mode": "Static", "speed": None,
+                                          "random": False, "saved": False})
         expected = mode(brightness=30, colors=[])
         body = word(1) + mode_bytes(expected)
         leds = struct.pack("<IH3I", 18, 3, 0x563412, 0x563412, 0x563412)
@@ -692,3 +697,262 @@ class OpenRgbContractMixin:
         current = self.client.request("lighting.get", {"device": device["id"]})["result"]
         self.assertEqual(current["color"], "#123456")
         self.assertNotEqual(current["brightness"], 50)
+
+    def effect(self, device, **params):
+        return self.client.request("lighting.set", {"device": device["id"], **params})
+
+    def save(self, device):
+        return self.client.request("lighting.save", {"device": device["id"]})
+
+    def launch_msi(self, version=4, modes=None):
+        from fakes.openrgb import msi_modes
+        modes = msi_modes() if modes is None else modes
+        self.launch(advertised=version, descriptors=[controller(
+            version=version, modes=modes, active=1, led_colors=[0x332211] * 3)])
+        return self.devices()[0], modes
+
+    def test_msi_modes_come_from_real_descriptors_in_order_without_direct(self):
+        device, modes = self.launch_msi()
+        self.assertTrue(device["writable"], device)
+        self.assertEqual([item["name"] for item in device["modes"]],
+                         [item["name"] for item in modes[1:]])
+        for descriptor, actual in zip(modes[1:], device["modes"]):
+            flags = descriptor["flags"]
+            self.assertEqual(actual, {
+                "name": descriptor["name"], "speed": bool(flags & 1),
+                "brightness": bool(flags & 16),
+                "color": "single" if flags & (32 | 64) else "none",
+                "random": bool(flags & 128), "savable": bool(flags & (256 | 512))})
+        current = self.client.request("lighting.get", {"device": device["id"]})["result"]
+        self.assertEqual((current["mode"], current["speed"], current["random"], current["saved"]),
+                         ("Static", None, False, True))
+
+    def test_msi_effects_exact_update_and_save_bytes_protocol_4_and_uniform_leds(self):
+        device, modes = self.launch_msi()
+        cases = [
+            (1, {"color": "#123456", "brightness": 25}, 0, 30, 1, True),
+            (2, {"color": "#abcdef", "brightness": 75, "speed": 25}, 1, 70, 1, True),
+            (3, {"brightness": 50, "speed": 100, "random": True}, 2, 50, 3, False),
+            (7, {"brightness": 0, "speed": 50, "random": True}, 1, 10, 3, False),
+        ]
+        for index, params, speed, brightness, color_mode, per_led in cases:
+            with self.subTest(mode=modes[index]["name"]):
+                before = len(self.writes())
+                result = self.effect(device, mode=modes[index]["name"], **params)
+                self.assertTrue(result["ok"], result)
+                expected = {**modes[index], "speed": speed, "brightness": brightness,
+                            "color_mode": color_mode}
+                if per_led:
+                    expected["colors"] = []
+                body = word(index) + mode_bytes(expected, 4)
+                payload = word(len(body) + 4) + body
+                writes = [(0, 1101, payload)]
+                if per_led:
+                    rgb = params["color"]
+                    packed = int(rgb[5:7] + rgb[3:5] + rgb[1:3], 16)
+                    writes.append((0, 1050, struct.pack("<IH", 18, 3) + word(packed) * 3))
+                self.assertEqual(self.writes()[before:], writes)
+                lighting = result["result"]
+                self.assertEqual(lighting["mode"], modes[index]["name"])
+                self.assertEqual(lighting["random"], color_mode == 3)
+                self.assertFalse(lighting["saved"])
+                saved = self.save(device)
+                self.assertTrue(saved["ok"], saved)
+                self.assertTrue(saved["result"]["saved"])
+                self.assertEqual(self.writes()[-1], (0, 1102, payload))
+                self.assertEqual(self.fake.saved_modes[0], payload)
+                self.advance(10)
+        self.assertFalse(any(command in (1051, 1100) for _, command, _ in self.fake.commands))
+
+    def test_per_led_mode_without_color_does_not_send_updateleds_and_omissions_keep_values(self):
+        device, modes = self.launch_msi(6)
+        first = self.effect(device, mode="Breathing", color="#abcdef", brightness=25, speed=100)
+        self.assertTrue(first["ok"], first)
+        before = len(self.writes())
+        result = self.effect(device)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], first["result"])
+        expected = {**modes[2], "brightness": 30, "speed": 2, "colors": []}
+        body = word(2) + mode_bytes(expected)
+        payload = word(len(body) + 4) + body
+        self.assertEqual(self.writes()[before:], [(0, 1101, payload)])
+        self.assertTrue(self.save(device)["ok"])
+        self.assertEqual(self.writes()[-1], (0, 1102, payload))
+
+    def test_mode_validation_and_save_capabilities_fail_without_writes(self):
+        device, _ = self.launch_msi()
+        for params in ({"mode": "Direct"}, {"mode": "missing"}, {"mode": "Static", "speed": 0},
+                       {"mode": "Static", "random": False},
+                       {"mode": "Color ring", "color": "#123456"},
+                       {"speed": True}, {"speed": 101}, {"speed": -1}, {"speed": 1.5},
+                       {"mode": None}, {"mode": ""}, {"random": 0}, {"random": "true"}):
+            with self.subTest(params=params):
+                reply = self.effect(device, **params)
+                self.assertEqual(reply["error"]["code"], "bad_request", reply)
+                self.assertEqual(self.writes(), [])
+                # Parameter type validation and the connection's write quota are independent.
+                self.advance(0.11)
+        self.fake.descriptors = [controller(version=4, modes=[mode(flags=32)], active=0)]
+        self.assertEqual(self.save(device)["error"]["code"], "unsupported")
+        self.assertEqual(self.writes(), [])
+
+    def test_save_rate_limit_is_per_device_across_connections_and_exact_ten_seconds(self):
+        device, _ = self.launch_msi()
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        self.assertTrue(self.save(device)["result"]["saved"])
+        self.assertTrue(self.effect(device, brightness=25)["ok"])
+        self.assertFalse(self.client.request("lighting.get", {"device": device["id"]})[
+            "result"]["saved"])
+        before = len(self.writes())
+        with self.daemon.client() as other:
+            self.assertEqual(other.request("lighting.save", {"device": device["id"]})[
+                "error"]["code"], "rate_limited")
+        self.advance(9.999)
+        self.assertEqual(self.save(device)["error"]["code"], "rate_limited")
+        self.assertEqual(len(self.writes()), before)
+        self.advance(0.001)
+        self.assertTrue(self.save(device)["result"]["saved"])
+        self.assertEqual(len(self.writes()), before + 1)
+
+    def test_reversed_mode_ranges_rounding_and_get_percent(self):
+        from fakes.openrgb import msi_modes
+        modes = msi_modes()
+        modes[2].update(speed_min=2, speed_max=0, brightness_min=90, brightness_max=10)
+        device, _ = self.launch_msi(modes=modes)
+        for percent, speed, brightness in ((0, 2, 90), (25, 2, 70), (50, 1, 50),
+                                           (75, 1, 30), (100, 0, 10)):
+            result = self.effect(device, mode="Breathing", speed=percent, brightness=percent)
+            self.assertTrue(result["ok"], result)
+            expected = {**modes[2], "speed": speed, "brightness": brightness}
+            body = word(2) + mode_bytes(expected, 4)
+            self.assertEqual(self.writes()[-1], (0, 1101, word(len(body) + 4) + body))
+            self.assertEqual(result["result"]["speed"], (2 - speed) * 50)
+            self.assertEqual(result["result"]["brightness"], percent)
+
+    def test_unsaved_changes_cancel_idle_timer_until_explicit_save(self):
+        device, _ = self.launch_msi()
+        self.advance(119.9)
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        self.advance(240)
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit"])
+        self.assertTrue(self.save(device)["result"]["saved"])
+        self.advance(119.999)
+        self.assertEqual(len(self.command()["calls"]), 1)
+        self.advance(0.001)
+        self.core.wait_until(lambda: len(self.command()["calls"]) == 2,
+                             message="StopUnit after saved idle deadline")
+        self.assertEqual(self.command()["calls"][-1][0], "StopUnit")
+
+    def test_unsaved_state_survives_rescan_and_disable_allows_unit_stop(self):
+        device, _ = self.launch_msi()
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        self.advance(2.01)
+        self.devices("devices.rescan")
+        self.assertFalse(self.client.request("lighting.get", {"device": device["id"]})[
+            "result"]["saved"])
+        self.advance(121)
+        self.assertEqual(len(self.command()["calls"]), 1)
+        self.enable(False)
+        self.devices("devices.rescan")
+        self.assertEqual([call[0] for call in self.command()["calls"]], ["StartUnit", "StopUnit"])
+
+    def test_save_limit_failure_keeps_dirty_state_and_no_idle_stop(self):
+        device, _ = self.launch_msi()
+        self.assertTrue(self.save(device)["ok"])
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        self.assertEqual(self.save(device)["error"]["code"], "rate_limited")
+        current = self.client.request("lighting.get", {"device": device["id"]})
+        self.assertFalse(current["result"]["saved"])
+        self.advance(121)
+        self.assertEqual(len(self.command()["calls"]), 1)
+
+    def test_all_enabled_devices_must_be_saved_and_save_limits_are_independent(self):
+        second = self.usb.add(12, "1234", "abcd", "other")
+        self.rules.write_text(self.rules.read_text() + rule("1234", "abcd", "Other"))
+        self.launch(descriptors=[controller(active=1), controller(
+            name="Other", location="HID: /dev/hidraw12", active=1)])
+        self.config.write_text(json.dumps({"v": 1, "enabled": {
+            self.identity: True, second: True}}))
+        devices = self.devices()
+        self.assertEqual(len(devices), 2)
+        self.assertTrue(all(device["writable"] for device in devices))
+        for device in devices:
+            self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        self.assertTrue(self.save(devices[0])["ok"])
+        self.advance(121)
+        self.assertEqual(len(self.command()["calls"]), 1)
+        self.assertTrue(self.save(devices[1])["ok"])
+        # Both devices can be saved at exactly the same monotonic timestamp.
+        self.assertTrue(self.save(devices[0])["ok"])
+        self.advance(120)
+        self.core.wait_until(lambda: len(self.command()["calls"]) == 2,
+                             message="StopUnit once every enabled device is saved")
+
+    def test_rejected_save_ack_never_marks_unsaved_changes_as_saved(self):
+        device, _ = self.launch_msi(6)
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        applied = self.writes()[-2][2]
+        self.fake.behavior = "write_rejected"
+        self.assertFalse(self.save(device)["ok"])
+        self.assertNotIn(0, self.fake.saved_modes)
+        self.assertEqual(self.writes()[-1], (0, 1102, applied))
+        self.fake.behavior = "normal"
+        self.advance(10)
+        self.devices("devices.rescan")
+        self.assertFalse(self.client.request("lighting.get", {"device": device["id"]})[
+            "result"]["saved"])
+        self.advance(121)
+        self.assertEqual(len(self.command()["calls"]), 1)
+
+    def test_omitted_native_fields_preserve_raw_values_without_requantizing(self):
+        from fakes.openrgb import msi_modes
+        modes = msi_modes()
+        modes[2].update(speed_max=1000, speed=333, brightness_max=1000, brightness=337)
+        self.launch(advertised=4, descriptors=[controller(version=4, modes=modes, active=2)])
+        device = self.devices()[0]
+        result = self.effect(device)
+        self.assertTrue(result["ok"], result)
+        body = word(2) + mode_bytes(modes[2], 4)
+        self.assertEqual(self.writes(), [(0, 1101, word(len(body) + 4) + body)])
+
+    def test_random_false_restores_per_led_or_intrinsic_color_mode(self):
+        device, _ = self.launch_msi()
+        self.assertTrue(self.effect(device, mode="Flashing", random=True)["ok"])
+        result = self.effect(device, random=False, color="#abcdef")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["result"]["random"])
+        self.assertEqual([command for _, command, _ in self.writes()], [1101, 1101, 1050])
+        self.assertTrue(self.effect(device, mode="Color ring", random=True)["ok"])
+        result = self.effect(device, random=False)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["result"]["random"])
+        self.assertEqual(self.writes()[-1][1], 1101)
+
+    def test_unsaved_state_and_save_limit_follow_physical_usb_after_hidraw_renumber(self):
+        device, modes = self.launch_msi()
+        self.assertTrue(self.effect(device, color="#abcdef")["ok"])
+        applied = self.writes()[0][2]
+        (self.usb.root / "class/hidraw/hidraw9").rename(
+            self.usb.root / "class/hidraw/hidraw12")
+        self.fake.descriptors = [controller(version=4, modes=modes, active=1,
+                                            location="HID: /dev/hidraw12")]
+        self.advance(2.01)
+        renamed = self.devices("devices.rescan")[0]
+        self.assertNotEqual(device["id"], renamed["id"])
+        self.assertFalse(self.client.request("lighting.get", {"device": renamed["id"]})[
+            "result"]["saved"])
+        self.assertTrue(self.save(renamed)["result"]["saved"])
+        self.assertEqual(self.writes()[-1], (0, 1102, applied))
+        self.advance(120)
+        self.core.wait_until(lambda: len(self.command()["calls"]) == 4,
+                             message="StopUnit after saving renamed physical device")
+
+    def test_failed_set_is_saved_from_actual_active_descriptor_not_rejected_attempt(self):
+        original = mode(flags=16 | 64 | 256, color_mode=2)
+        self.launch(behavior="write_ignored", descriptors=[controller(active=1)])
+        device = self.devices()[0]
+        self.assertEqual(self.effect(device, color="#abcdef")["error"]["code"], "unsupported")
+        self.fake.behavior = "normal"
+        self.assertTrue(self.save(device)["result"]["saved"])
+        body = word(1) + mode_bytes(original)
+        self.assertEqual(self.writes()[-1], (0, 1102, word(len(body) + 4) + body))

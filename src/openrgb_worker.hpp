@@ -44,6 +44,12 @@ private:
     QString writtenColor;
     int writtenMode = -1;
     qint64 writtenBrightness = -1;
+    SdkMode writtenDescriptor;
+    // Persistence belongs to the physical device, even if hidraw numbering changes.
+    QSet<QString> unsaved;
+    QMap<QString, QByteArray> appliedModes;
+    QMap<QString, QElapsedTimer> lastSave;
+    bool saving = false;
     QMap<QString, SdkController> controllers;
     QMap<QString, QJsonObject> inventory;
     QString reading;
@@ -62,5 +68,6 @@ private:
     void notify();
     void finish(const Protocol::Reply &reply);
     Protocol::Reply lighting(const QString &device) const;
-    bool write(const QString &device, const QString &color, int brightness);
+    Protocol::Reply write(const QString &device, const QJsonObject &params);
+    void updateSaved();
 };

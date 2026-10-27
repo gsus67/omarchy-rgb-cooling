@@ -121,7 +121,7 @@ void OpenRgbWorker::next()
     unit.activity();
     const auto id = request.params.value("device").toString();
     const auto gate = lighting(id);
-    if (op == "lighting.set") {
+    if (op == "lighting.set" || op == "lighting.save") {
         if (!inventory.contains(id) || !inventory[id].value("writable").toBool()) {
             finish(Protocol::Reply::failure(inventory.contains(id) ? "blocked" : "unavailable",
                 inventory.contains(id) ? inventory[id].value("blocked_reason").toString()
@@ -142,7 +142,7 @@ void OpenRgbWorker::next()
         return;
     }
     reading = id;
-    writing = op == "lighting.set";
+    writing = op == "lighting.set" || op == "lighting.save";
     phase = Phase::Read;
     // Re-read current mode/colour and re-check gates immediately before a write.
     send(controllers[id].index, 1, version >= 6 ? QByteArray() : sdkWord(version));
@@ -162,8 +162,10 @@ void OpenRgbWorker::scan()
     awaitingWriteAck = false;
     writtenColor.clear();
     writtenMode = -1;
+    saving = false;
     usb = UsbDevices::scan(root, rules);
     inventory = usb.candidates;
+    updateSaved();
     QSet<QString> allowed;
     for (const auto &device : inventory) {
         if (device.value("enabled").toBool()) {
@@ -307,6 +309,7 @@ void OpenRgbWorker::fail(const QString &message)
     inventory = usb.candidates;
     writtenColor.clear();
     writtenMode = -1;
+    saving = false;
     state = "unreachable";
     reason = message;
     scanning = false;

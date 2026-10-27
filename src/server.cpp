@@ -173,7 +173,7 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
         connection->subscriptionChanged();
         subscriptionsChanged();
     } else if (op == "devices" || op == "devices.rescan"
-               || op == "lighting.get" || op == "lighting.set") {
+               || op == "lighting.get" || op == "lighting.set" || op == "lighting.save") {
         dispatchLighting(connection, request);
         return;
     } else {
