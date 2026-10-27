@@ -3,10 +3,11 @@ import json
 import os
 from pathlib import Path
 import select
+import struct
 import subprocess
 import tempfile
 
-from fakes.openrgb import OpenRgbServer, controller, mode, mode_bytes, word
+from fakes.openrgb import OpenRgbServer, controller, mode, mode_bytes, string, word
 from fakes.usb import UsbTree, rule
 
 
@@ -466,16 +467,102 @@ class OpenRgbContractMixin:
         self.assertFalse(self.set_color(device)["ok"])
         self.assertEqual([command for _, command, _ in self.writes()], [1101])
 
-    def test_upstream_per_led_static_keeps_led_buffer_and_reports_failure_honestly(self):
-        self.launch(descriptors=[controller(modes=[mode("Direct", flags=32), mode()])])
+    def test_per_led_static_exact_bytes_uniform_buffer_native_brightness_and_readback(self):
+        modes = [mode("Direct", flags=32), mode()]
+        self.launch(fragment=True, device_ids=[42], descriptors=[controller(modes=modes)])
         device = self.devices()[0]
+        # A fresh read must replace the cached count; old LED colours may differ.
+        self.fake.descriptors = [controller(modes=modes, led_colors=[1, 2, 3])]
+        before = len(self.fake.commands)
         result = self.set_color(device, brightness=25)
-        self.assertFalse(result["ok"], result)
-        self.assertEqual(result["error"]["code"], "unsupported")
-        self.assertIn("per-LED", result["error"]["message"])
-        expected = mode(brightness=30, colors=[0x563412])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"], {"device": device["id"], "color": "#123456",
+                                          "brightness": 25, "brightness_emulated": False})
+        expected = mode(brightness=30, colors=[])
         body = word(1) + mode_bytes(expected)
-        self.assertEqual(self.writes(), [(0, 1101, word(len(body) + 4) + body)])
+        leds = struct.pack("<IH3I", 18, 3, 0x563412, 0x563412, 0x563412)
+        self.assertEqual(self.writes(), [(42, 1101, word(len(body) + 4) + body),
+                                         (42, 1050, leds)])
+        self.assertEqual([command for _, command, _ in self.fake.commands[before:]],
+                         [1, 1101, 1050, 1])
+        self.assertEqual(set(struct.unpack_from("<3I", self.writes()[1][2], 6)), {0x563412})
         current = self.client.request("lighting.get", {"device": device["id"]})["result"]
-        self.assertEqual(current["color"], "#112233")
-        self.assertEqual(current["brightness"], 25)
+        self.assertEqual(current, result["result"])
+
+    def test_per_led_emulated_brightness_and_validated_led_count_boundaries(self):
+        static = mode(flags=32, minimum=0, maximum=0, brightness=0, colors=[])
+        self.launch(descriptors=[controller(modes=[static])])
+        device = self.devices()[0]
+        for count, brightness, packed in ((1, 0, 0), (4, 50, 0x102040), (4096, 100, 0x204080)):
+            with self.subTest(count=count, brightness=brightness):
+                self.fake.descriptors = [controller(modes=[static], led_colors=[1] * count)]
+                before = len(self.writes())
+                result = self.set_color(device, "#804020", brightness)
+                self.assertTrue(result["ok"], result)
+                self.assertTrue(result["result"]["brightness_emulated"])
+                expected_color = {0: "#000000", 50: "#402010", 100: "#804020"}[brightness]
+                self.assertEqual(result["result"]["color"], expected_color)
+                body = word(0) + mode_bytes(static)
+                expected_leds = struct.pack("<IH", 6 + 4 * count, count) + word(packed) * count
+                self.assertEqual(self.writes()[before:], [
+                    (0, 1101, word(len(body) + 4) + body), (0, 1050, expected_leds)])
+                values = struct.unpack_from(f"<{count}I", self.writes()[-1][2], 6)
+                self.assertEqual(len(values), count)
+                self.assertEqual(set(values), {packed})
+
+    def test_per_led_invalid_counts_mismatches_and_truncation_never_write(self):
+        valid = controller(modes=[mode()])
+        marker = struct.pack("<H", 1) + string("LED") + struct.pack("<HI", 1, 0x332211)
+        self.assertEqual(valid.count(marker), 1)
+        offset = valid.index(marker)
+        malformed = [controller(modes=[mode()], led_colors=[]),
+                     controller(modes=[mode()], led_colors=[1] * 4097),
+                     valid[:offset] + b"\xff\xff" + valid[offset + 2:],
+                     valid.replace(marker, marker[:-6] + struct.pack("<HI", 2, 0x332211)),
+                     valid[:-1]]
+        self.launch(descriptors=[valid])
+        for descriptor in malformed:
+            with self.subTest(size=len(descriptor)):
+                self.fake.descriptors = [valid]
+                self.advance(2.01)
+                device = self.devices("devices.rescan")[0]
+                self.assertTrue(device["writable"])
+                self.fake.descriptors = [descriptor]
+                self.assertFalse(self.set_color(device)["ok"])
+                self.assertEqual(self.writes(), [])
+
+    def test_per_led_rejected_malformed_and_missing_ack_never_succeed(self):
+        self.launch(descriptors=[controller(modes=[mode()])])
+        for behavior in ("led_write_rejected", "bad_led_ack", "missing_led_ack"):
+            with self.subTest(behavior=behavior):
+                self.fake.behavior = behavior
+                self.advance(2.01)
+                device = self.devices("devices.rescan")[0]
+                result = self.set_color(device)
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["error"]["code"], "unavailable")
+
+    def test_successful_ack_without_applying_static_is_rejected_on_readback(self):
+        self.launch(behavior="write_ignored")
+        device = self.devices()[0]
+        reply = self.set_color(device)
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["error"]["code"], "unsupported")
+
+    def test_per_led_successful_ack_without_updating_leds_is_rejected_on_readback(self):
+        self.launch(behavior="led_write_ignored", descriptors=[controller(modes=[mode()])])
+        device = self.devices()[0]
+        reply = self.set_color(device)
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["error"]["code"], "unsupported")
+        self.assertEqual([command for _, command, _ in self.writes()], [1101, 1050])
+
+    def test_native_brightness_must_match_readback_even_if_static_color_matches(self):
+        self.launch(behavior="brightness_ignored")
+        device = self.devices()[0]
+        reply = self.set_color(device)
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual(reply["error"]["code"], "unsupported")
+        current = self.client.request("lighting.get", {"device": device["id"]})["result"]
+        self.assertEqual(current["color"], "#123456")
+        self.assertNotEqual(current["brightness"], 50)

@@ -41,6 +41,7 @@ private:
     bool awaitingWriteAck = false;
     QString writtenColor;
     int writtenMode = -1;
+    qint64 writtenBrightness = -1;
     QMap<QString, SdkController> controllers;
     QMap<QString, QJsonObject> inventory;
     QString reading;

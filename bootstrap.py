@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,19 @@ def systemctl(*arguments):
     native_build.run("systemctl", "--user", *arguments)
 
 
+def user_directory(path):
+    """Keep user data outside the ledger; never chmod a symlink or another owner's data."""
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        return
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        os.chmod(path, 0o700, follow_symlinks=False)
+
+
 def ensure(source):
     """Build under flock and activate only the socket when the installation changes."""
     source = Path(source).resolve()
@@ -123,6 +137,7 @@ def install(source, state, config, entries):
             os.replace(compiled, binary)
     unit_dir = config / "systemd/user"
     make_directory(unit_dir, entries)
+    user_directory(config / NAME)
     for suffix in ("socket", "service", "openrgb.service"):
         name = (f"{NAME}-openrgb.service" if suffix == "openrgb.service"
                 else f"{NAME}.{suffix}")

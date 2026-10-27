@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from fakes.hwmon import FileWatch, HwmonTree
 from fakes.dmi import DmiTree
@@ -1493,6 +1494,58 @@ else:
         self.assertIn(f'ReadWritePaths="{self.state}/openrgb"', content)
         self.assertIn(str(path), (self.state / "installed-files").read_text().splitlines())
         self.assertFalse(any("openrgb.service" in " ".join(cmd) for cmd in self.commands()))
+
+    def test_bootstrap_user_settings_created_0700_outside_ledger_and_preserved(self):
+        self.bootstrap()
+        settings = self.home / "config/omarchy-rgb-cooling"
+        self.assertTrue(settings.is_dir())
+        self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o700)
+        labels = settings / "labels.json"
+        labels.write_text('{"v":1,"labels":{"fan":"CPU"}}')
+        before = labels.read_bytes(), settings.stat().st_ino
+        for permissions in (0o755, 0o777, 0o2700, 0o000):
+            with self.subTest(permissions=oct(permissions)):
+                settings.chmod(permissions)
+                self.bootstrap()
+                self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o700)
+                self.assertEqual((labels.read_bytes(), settings.stat().st_ino), before)
+        ledger = (self.state / "installed-files").read_text().splitlines()
+        self.assertNotIn(str(settings), ledger)
+        self.assertNotIn(str(settings) + "/", ledger)
+        self.assertNotIn(str(labels), ledger)
+        self.assertEqual(len(self.commands()), 3)
+
+    def test_bootstrap_user_settings_symlink_file_and_foreign_owner_not_chmodded(self):
+        import bootstrap
+
+        config = self.home / "config"
+        config.mkdir()
+        settings = config / "omarchy-rgb-cooling"
+        target = self.home / "other-data"
+        target.mkdir(mode=0o755)
+        target.chmod(0o755)
+        settings.symlink_to(target, target_is_directory=True)
+        self.bootstrap()
+        self.assertTrue(settings.is_symlink())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        settings.unlink()
+        settings.write_text("existing file")
+        settings.chmod(0o644)
+        self.bootstrap()
+        self.assertEqual(settings.read_text(), "existing file")
+        self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o644)
+        settings.unlink()
+        settings.symlink_to(self.home / "missing")
+        self.bootstrap()
+        self.assertTrue(settings.is_symlink())
+        self.assertFalse(settings.exists())
+        settings.unlink()
+        settings.mkdir(mode=0o755)
+        settings.chmod(0o755)
+        # Simulate a directory owned by another UID without privileged chown.
+        with patch.object(bootstrap.os, "getuid", return_value=settings.stat().st_uid + 1):
+            bootstrap.user_directory(settings)
+        self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o755)
 
     def test_contract_bootstrap_idempotent_no_changes_no_systemctl_or_binary_replacement(self):
         self.bootstrap()

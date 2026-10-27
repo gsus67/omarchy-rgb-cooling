@@ -44,7 +44,7 @@ def mode_bytes(value, version=6):
 
 
 def controller(name="MSI RGB", location="HID: /dev/hidraw9", serial="unique", version=6,
-               with_lighting=True, modes=None, active=0):
+               with_lighting=True, modes=None, active=0, led_colors=None):
     # Independent fixture including v6 zone/segment/display/configuration extensions.
     if modes is None:
         modes = [mode("Direct", flags=32), mode(flags=16 | 64 | 256, color_mode=2)]
@@ -64,15 +64,16 @@ def controller(name="MSI RGB", location="HID: /dev/hidraw9", serial="unique", ve
         body += word(0)  # Zone flags.
     if version >= 6:
         body += struct.pack("<IH", 0, 0) + string("")
-    count = 1 if with_lighting else 0
+    if led_colors is None:
+        led_colors = [0x00332211] if with_lighting else []
+    count = len(led_colors)
     body += struct.pack("<H", count)
-    if count:
+    for _ in led_colors:
         body += string("LED")
         if version < 6:
             body += word(0)
     body += struct.pack("<H", count)
-    if count:
-        body += word(0x00332211)
+    body += b"".join(word(color) for color in led_colors)
     if version >= 5:
         body += struct.pack("<H", 0) + word(0)
     if version >= 6:
@@ -80,7 +81,7 @@ def controller(name="MSI RGB", location="HID: /dev/hidraw9", serial="unique", ve
     return word(len(body) + 4) + body
 
 
-def apply_mode(descriptor, payload):
+def apply_mode(descriptor, payload, *, ignore_brightness=False):
     """Apply precisely UPDATEMODE v6 to the fake's descriptor, without hardware."""
     size, chosen = struct.unpack_from("<II", payload)
     if size != len(payload):
@@ -108,12 +109,38 @@ def apply_mode(descriptor, payload):
     if len(payload) != color_offset + 2 + 4 * colors:
         raise ValueError("Wrong mode color count")
     start, end = ranges[chosen]
-    changed = bytearray(descriptor[:start] + payload[8:] + descriptor[end:])
+    replacement = bytearray(payload[8:])
+    if ignore_brightness:
+        offset = 2 + name_length + 8 * 4
+        replacement[offset:offset + 4] = descriptor[start + offset:start + offset + 4]
+    changed = bytearray(descriptor[:start] + replacement + descriptor[end:])
     struct.pack_into("<I", changed, active_offset, chosen)
     # OpenRGB 1.1 SetModeValuesFromMode updates mode.colors only. In particular,
     # UPDATEMODE does NOT change the controller's per-LED colour buffer.
     struct.pack_into("<I", changed, 0, len(changed))
     return bytes(changed)
+
+
+def apply_leds(descriptor, payload):
+    """Apply UPDATELEDS to the v6 fixture, validating its LED count and uniformity."""
+    size, count = struct.unpack_from("<IH", payload)
+    if size != len(payload) or size != 6 + 4 * count or not 1 <= count <= 4096:
+        raise ValueError("Wrong UPDATELEDS length")
+    values = struct.unpack_from(f"<{count}I", payload, 6)
+    if len(set(values)) != 1:
+        raise ValueError("Only uniform LED buffers are allowed")
+    # This fixture's v6 trailer: no LED names, flags=0, empty display name, config={};
+    # immediately before it are the LED descriptors and the controller colour buffer.
+    trailer = struct.pack("<HI", 0, 0) + string("") + word(3) + b"{}\0"
+    if not descriptor.endswith(trailer):
+        raise ValueError("Unexpected fake controller trailer")
+    offset = len(descriptor) - len(trailer) - 4 * count
+    actual, = struct.unpack_from("<H", descriptor, offset - 2)
+    led_offset = offset - 2 - count * len(string("LED")) - 2
+    leds, = struct.unpack_from("<H", descriptor, led_offset)
+    if actual != count or leds != count:
+        raise ValueError("UPDATELEDS must match the controller's LED count")
+    return descriptor[:offset] + payload[6:] + descriptor[offset + 4 * count:]
 
 
 class OpenRgbServer:
@@ -223,17 +250,28 @@ class OpenRgbServer:
                             if self.advertised >= 6:
                                 self.send(packet(device, 10, word(1) + word(0)))
                             self.ready.set()
-                        elif command == 1101:
+                        elif command in (1101, 1050):
                             ids = self.device_ids or list(range(len(self.descriptors)))
                             index = ids.index(device)
-                            if self.behavior != "write_rejected":
-                                changed = apply_mode(self.descriptors[index], payload)
-                                self.descriptors[index] = changed
-                            status = 3 if self.behavior == "write_rejected" else 0
-                            ack = word(1101) + word(status)
-                            if self.behavior == "bad_write_ack":
+                            rejected = self.behavior == "write_rejected" or (
+                                command == 1050 and self.behavior == "led_write_rejected")
+                            ignored = self.behavior == "write_ignored" or (
+                                command == 1050 and self.behavior == "led_write_ignored")
+                            if not rejected and not ignored:
+                                if command == 1101:
+                                    self.descriptors[index] = apply_mode(
+                                        self.descriptors[index], payload,
+                                        ignore_brightness=self.behavior == "brightness_ignored")
+                                else:
+                                    self.descriptors[index] = apply_leds(
+                                        self.descriptors[index], payload)
+                            status = 3 if rejected else 0
+                            ack = word(command) + word(status)
+                            if self.behavior == "bad_write_ack" or (
+                                    command == 1050 and self.behavior == "bad_led_ack"):
                                 ack = ack[:-1]
-                            self.send(packet(device, 10, ack))
+                            if command != 1050 or self.behavior != "missing_led_ack":
+                                self.send(packet(device, 10, ack))
                         else:
                             raise ValueError("Unexpected write or engine command")
             except (OSError, ValueError):

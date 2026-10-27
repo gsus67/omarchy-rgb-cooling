@@ -27,8 +27,10 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         if (--acknowledgements[key] == 0) {
             acknowledgements.remove(key);
         }
-        if (acknowledged == 1101) {
-            awaitingWriteAck = false;
+        if (acknowledged == 1101 || acknowledged == 1050) {
+            const auto prefix = quint64(device) << 32;
+            awaitingWriteAck = acknowledgements.contains(prefix | 1101)
+                || acknowledgements.contains(prefix | 1050);
         }
         return true;
     }
@@ -110,10 +112,11 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
             notify();
             auto result = lighting(id);
             if (writtenMode >= 0 && (controller.active != unsigned(writtenMode)
-                || !result.ok() || result.result.value("color").toString() != writtenColor)) {
+                || !result.ok() || result.result.value("color").toString() != writtenColor
+                || (writtenBrightness >= 0
+                    && controller.modes[controller.active].brightness != writtenBrightness))) {
                 result = Protocol::Reply::failure("unsupported",
-                    "OpenRGB did not apply the Static colour: UPDATEMODE does not update "
-                    "a per-LED colour buffer; other write packets are forbidden");
+                    "OpenRGB did not apply the Static colour or brightness");
             }
             writtenColor.clear();
             writtenMode = -1;
@@ -230,20 +233,35 @@ bool OpenRgbWorker::write(const QString &id, const QString &color, int brightnes
     };
     const auto packed = component(16) | (component(8) << 8) | (component(0) << 16);
     mode.colorMode = mode.flags & 32U ? 1 : 2;
+    // colors was decoded with a matching LED count and a 4096-LED limit.
     const auto count = mode.colorMode == 1 ? controller.colors.size()
                                          : qsizetype(std::max(1U, mode.colorsMin));
     if (count < 1 || count > 4096 || (mode.colorMode == 2 && count > mode.colorsMax)) {
         return false;
     }
-    mode.colors.fill(packed, count);
+    QByteArray leds;
+    if (mode.colorMode == 1) {
+        mode.colors.clear();
+        leds = sdkHalf(count);
+        for (qsizetype i = 0; i < count; ++i) {
+            leds += sdkWord(packed);
+        }
+        leds.prepend(sdkWord(leds.size() + 4));
+    } else {
+        mode.colors.fill(packed, count);
+    }
     auto payload = sdkWord(modeIndex) + mode.encode();
     payload.prepend(sdkWord(payload.size() + 4));
-    // The sole hardware-write packet in rgbcd: never Direct/custom, per-LED effects or save.
+    // Select Static; per-LED modes require a separate, strictly uniform LED buffer.
     writtenColor = QString("#%1%2%3").arg(packed & 255, 2, 16, QChar('0'))
         .arg((packed >> 8) & 255, 2, 16, QChar('0'))
         .arg((packed >> 16) & 255, 2, 16, QChar('0'));
     writtenMode = modeIndex;
+    writtenBrightness = native ? qint64(mode.brightness) : -1;
     awaitingWriteAck = true;
     send(controller.index, 1101, payload);
+    if (!leds.isEmpty()) {
+        send(controller.index, 1050, leds);
+    }
     return true;
 }
