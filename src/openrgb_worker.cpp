@@ -22,6 +22,28 @@ OpenRgbWorker::OpenRgbWorker(const QString &root, const QString &rules)
     connect(&startupDeadline, &QTimer::timeout, this, [this] {
         fail("OpenRGB SDK server did not become reachable within 10 s after StartUnit");
     });
+    for (auto *timer : {&recoveryDebounce, &recoveryDeadline, &writeFailure}) {
+        timer->setParent(this);
+        timer->setSingleShot(true);
+        timer->setTimerType(Qt::PreciseTimer);
+    }
+    recoveryDebounce.setInterval(1000);
+    recoveryDeadline.setInterval(15000);
+    writeFailure.setInterval(1000);
+    connect(&recoveryDebounce, &QTimer::timeout, this, [this] {
+        recoveryDue = true;
+        recover();
+    });
+    connect(&recoveryDeadline, &QTimer::timeout, this, [this] {
+        recoveryDebounce.stop();
+        suspendOperation();
+        fail("Device reconnection did not complete within 15 s", false);
+    });
+    connect(&writeFailure, &QTimer::timeout, this, [this] {
+        if (!recovering) {
+            fail(pendingFailure, false);
+        }
+    });
     socket.setReadBufferSize(1024 * 1024 + 16);
     timeout.setSingleShot(true);
     timeout.setInterval(2000);
@@ -47,7 +69,13 @@ OpenRgbWorker::OpenRgbWorker(const QString &root, const QString &rules)
             fail("OpenRGB SDK server disconnected");
         }
     });
-    unit.settled = [this] { next(); };
+    unit.settled = [this] {
+        if (recovering) {
+            recover();
+        } else {
+            next();
+        }
+    };
     unit.stopped = [this] {
         if (scanning || !reading.isEmpty()) {
             fail("OpenRGB unit stopped before the SDK operation completed");
@@ -74,6 +102,14 @@ OpenRgbWorker::~OpenRgbWorker()
 void OpenRgbWorker::subscribed(bool value) { unit.setSubscribed(value); }
 void OpenRgbWorker::perform(const QString &op, const QJsonObject &params, Callback ready)
 {
+    if (recovering && op == "devices") {
+        QJsonArray devices;
+        for (const auto &device : inventory) {
+            devices.append(device);
+        }
+        ready({{{"devices", devices}}, {}, {}});
+        return;
+    }
     requests.enqueue({op, params, std::move(ready), scanning});
     if (requests.size() == 1) {
         next();
@@ -85,13 +121,135 @@ void OpenRgbWorker::refresh()
         perform("devices.hotplug", {}, [](const auto &) {});
     }
 }
+void OpenRgbWorker::hotplug(const QVector<HotplugEvent> &events, bool discover)
+{
+    const auto current = UsbDevices::scan(root, rules);
+    QSet<QString> affected;
+    if (unit.owned() || unit.transitioning()) {
+        for (auto it = launchedNodes.begin(); it != launchedNodes.end(); ++it) {
+            const auto &identity = it.value();
+            if (!current.enabled.contains(identity) || identity.startsWith("usb:0416:5302:")) {
+                continue;
+            }
+            if (current.nodes.value(it.key()) != identity) {
+                affected.insert(identity);
+            }
+            for (const auto &event : events) {
+                if (event.action != "remove" && event.action != "add") {
+                    continue;
+                }
+                // Removed sysfs attributes may already be gone. Match their last
+                // validated node or USB parent path as well as a resolved ID.
+                const bool knownPath = !event.path.isEmpty()
+                    && usb.locations.value(identity).contains(event.path);
+                if (event.identity == identity || event.node == it.key() || knownPath) {
+                    affected.insert(identity);
+                }
+            }
+        }
+    }
+    usb = current;
+    if (!affected.isEmpty()) {
+        reconnecting.unite(affected);
+        if (!recovering) {
+            recovering = true;
+            recoveryRestarted = false;
+            recoveryDirty = false;
+            recoveryDeadline.start();
+            unit.activity();
+        }
+        // Events after StartUnit may invalidate that new sandbox too. Keep
+        // them pending until another quiet interval, including during startup.
+        recoveryDirty = recoveryRestarted;
+        recoveryDue = false;
+        recoveryDebounce.start();
+        gates();
+        state = "blocked";
+        reason = "Device reconnected; restarting OpenRGB";
+        notify();
+    } else if (!recovering && discover) {
+        refresh();
+    }
+}
+
+void OpenRgbWorker::completeAppliedWrite()
+{
+    if (reading.isEmpty()) {
+        return;
+    }
+    const auto identity = controllers.value(reading).device.value("usb").toString();
+    if (writtenMode >= 0) {
+        auto payload = sdkWord(writtenMode) + writtenDescriptor.encode(version);
+        payload.prepend(sdkWord(payload.size() + 4));
+        appliedModes[identity] = payload;
+        auto &controller = controllers[reading];
+        controller.active = writtenMode;
+        controller.modes[writtenMode] = writtenDescriptor;
+        if (writtenDescriptor.colorMode == 1 && !writtenColor.isEmpty()) {
+            const auto rgb = writtenColor.mid(1).toUInt(nullptr, 16);
+            const auto packed = ((rgb >> 16) & 255) | (rgb & 0xff00) | ((rgb & 255) << 16);
+            controller.colors.fill(packed);
+        }
+    }
+    if (saving) {
+        unsaved.remove(identity);
+        updateSaved();
+    }
+}
+
+void OpenRgbWorker::suspendOperation()
+{
+    writeFailure.stop();
+    if (!reading.isEmpty() && !requests.isEmpty() && (writtenMode >= 0 || saving)) {
+        auto &request = requests.head();
+        if (version >= 6 && !awaitingWriteAck && !writeAckFailed) {
+            // An ACK confirms the write even if re-enumeration loses REQ_DATA.
+            completeAppliedWrite();
+            request.applied = lighting(reading).result;
+        } else if (writeAckFailed || request.retries >= 1) {
+            finish(Protocol::Reply::failure("unavailable",
+                "OpenRGB write was not acknowledged after reconnection"));
+        } else {
+            ++request.retries;
+        }
+    }
+    reading.clear();
+    writing = false;
+    writtenMode = -1;
+    saving = false;
+}
+
+void OpenRgbWorker::recover()
+{
+    if (!recovering || !recoveryDue || (recoveryRestarted && !recoveryDirty)
+        || unit.transitioning()) {
+        return;
+    }
+    for (const auto &identity : reconnecting) {
+        if (usb.locations.value(identity).isEmpty()) {
+            return; // Only a later udev event can resume recovery; never poll USB.
+        }
+    }
+    recoveryRestarted = true;
+    recoveryDirty = false;
+    suspendOperation();
+    scan();
+}
+
 void OpenRgbWorker::next()
 {
+    if (recovering || writeFailure.isActive()) {
+        return;
+    }
     if (scanning || requests.isEmpty() || phase == Phase::Read || unit.transitioning()) {
         return;
     }
     auto &request = requests.head();
     const auto &op = request.operation;
+    if (!request.applied.isEmpty()) {
+        finish({request.applied, {}, {}});
+        return;
+    }
     if ((op == "devices.rescan" || op == "devices.hotplug") && !request.join) {
         if (op == "devices.rescan" && lastScan.isValid() && lastScan.elapsed() < 2000) {
             finish(Protocol::Reply::failure("rate_limited", "Scans must be at least 2 s apart"));
@@ -161,6 +319,7 @@ void OpenRgbWorker::next()
 }
 void OpenRgbWorker::scan()
 {
+    const auto generation = ++scanGeneration;
     scanning = true;
     idleStopped = false;
     lastScan.start();
@@ -178,7 +337,7 @@ void OpenRgbWorker::scan()
     saving = false;
     usb = UsbDevices::scan(root, rules);
     if (controllers.isEmpty()) {
-        inventory = usb.candidates;
+        gates();
     }
     updateSaved();
     QSet<QString> allowed;
@@ -194,7 +353,10 @@ void OpenRgbWorker::scan()
             nodes.insert(it.key(), it.value());
         }
     }
-    auto activate = [this, allowed, nodes](bool stopped) {
+    auto activate = [this, allowed, nodes, generation](bool stopped) {
+        if (generation != scanGeneration) {
+            return;
+        }
         if (!stopped) {
             fail("Unable to stop OpenRGB after the enabled USB device list changed");
             return;
@@ -212,12 +374,24 @@ void OpenRgbWorker::scan()
         }
         phase = Phase::Starting;
         const bool starting = !unit.owned();
-        unit.start([this, allowed, nodes, starting](bool success) {
+        if (starting) {
+            launchedDevices = allowed;
+            launchedNodes = nodes;
+        }
+        unit.start([this, allowed, nodes, starting, generation](bool success) {
+            if (generation != scanGeneration) {
+                return;
+            }
             if (!success) {
                 fail("Unable to start the plugin's OpenRGB unit through the session bus");
             } else {
                 launchedDevices = allowed;
                 launchedNodes = nodes;
+                if (recovering && !recoveryRestarted) {
+                    scanning = false;
+                    recover();
+                    return;
+                }
                 if (starting) {
                     // Only a new StartUnit gets a bounded connection grace period.
                     startup.start();
@@ -228,7 +402,8 @@ void OpenRgbWorker::scan()
             }
         });
     };
-    if (unit.owned() && (allowed != launchedDevices || nodes != launchedNodes)) {
+    if (unit.owned()
+        && (recoveryRestarted || allowed != launchedDevices || nodes != launchedNodes)) {
         unit.stop(std::move(activate));
     } else {
         activate(true);
@@ -315,8 +490,36 @@ void OpenRgbWorker::receive()
         QTimer::singleShot(0, this, [this] { receive(); });
     }
 }
-void OpenRgbWorker::fail(const QString &message)
+void OpenRgbWorker::fail(const QString &message, bool allowGrace)
 {
+    if (allowGrace && !reading.isEmpty() && (writtenMode >= 0 || saving)
+        && !recovering) {
+        // A transport failure can precede processed udev delivery. Give that
+        // event one debounce interval to claim the interrupted write.
+        pendingFailure = message;
+        if (!writeFailure.isActive()) {
+            writeFailure.start();
+        }
+        phase = Phase::Disconnected;
+        timeout.stop();
+        socket.abort();
+        return;
+    }
+    if (allowGrace && recovering && (!recoveryRestarted || recoveryDirty)) {
+        phase = Phase::Disconnected;
+        timeout.stop();
+        socket.abort();
+        return;
+    }
+    ++scanGeneration;
+    const bool recoveryFailed = recovering;
+    recovering = false;
+    recoveryRestarted = false;
+    recoveryDirty = false;
+    reconnecting.clear();
+    recoveryDebounce.stop();
+    recoveryDeadline.stop();
+    writeFailure.stop();
     endStartup();
     phase = Phase::Disconnected;
     socket.abort();
@@ -329,7 +532,9 @@ void OpenRgbWorker::fail(const QString &message)
         inventory = usb.candidates;
     }
     for (auto &device : inventory) {
-        if (device.value("writable").toBool()) {
+        if (device.value("writable").toBool()
+            || device.value("blocked_reason").toString()
+                == "Device reconnected; restarting OpenRGB") {
             device.insert("writable", false);
             device.insert("blocked_reason", message);
             device.insert("capabilities", QJsonArray{"lighting.read"});
@@ -345,8 +550,15 @@ void OpenRgbWorker::fail(const QString &message)
     if (!reading.isEmpty()) {
         reading.clear();
         finish(Protocol::Reply::failure("unavailable", message));
-    } else {
+    } else if (!recoveryFailed) {
         next();
+    }
+    if (recoveryFailed) {
+        while (!requests.isEmpty()) {
+            const auto applied = requests.head().applied;
+            finish(applied.isEmpty() ? Protocol::Reply::failure("unavailable", message)
+                                     : Protocol::Reply{applied, {}, {}});
+        }
     }
 }
 void OpenRgbWorker::publish()
@@ -356,11 +568,21 @@ void OpenRgbWorker::publish()
     pendingControllers.clear();
     scanning = false;
     phase = Phase::Idle;
+    if (recovering && recoveryRestarted && !recoveryDirty) {
+        recovering = false;
+        recoveryRestarted = false;
+        recoveryDeadline.stop();
+        reconnecting.clear();
+    }
     gates();
-    state = "ready";
-    reason.clear();
+    state = recovering ? "blocked" : "ready";
+    reason = recovering ? "Device reconnected; restarting OpenRGB" : QString();
     notify();
-    next();
+    if (recovering) {
+        recover();
+    } else {
+        next();
+    }
 }
 void OpenRgbWorker::notify()
 {

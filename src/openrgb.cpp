@@ -68,3 +68,10 @@ void OpenRgbAdapter::wake()
 {
     QMetaObject::invokeMethod(worker, [] {}, Qt::QueuedConnection);
 }
+
+void OpenRgbAdapter::hotplug(const QVector<HotplugEvent> &events, bool discover)
+{
+    QMetaObject::invokeMethod(worker, [this, events, discover] {
+        worker->hotplug(events, discover);
+    }, Qt::QueuedConnection);
+}

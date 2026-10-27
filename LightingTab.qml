@@ -140,15 +140,29 @@ Column {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(10)
 
+        // Current colour; multicolour or random effects have no single colour
+        // (OpenRGB reports #000000), so they show a rainbow instead of black.
         Rectangle {
           id: dot
+          readonly property bool multicolour: card.selected && tab.lighting !== null
+            && (tab.lighting.random === true || (tab.mode !== null && tab.mode.color !== "single"))
           width: Style.space(12)
           height: width
           radius: width / 2
           anchors.verticalCenter: parent.verticalCenter
           color: card.selected && tab.lighting && tab.lighting.color ? tab.lighting.color : "transparent"
+          gradient: multicolour ? rainbow : null
           border.width: 1
           border.color: tab.dim
+
+          Gradient {
+            id: rainbow
+            orientation: Gradient.Horizontal
+            GradientStop { position: 0.0; color: "#ff0000" }
+            GradientStop { position: 0.33; color: "#00ff00" }
+            GradientStop { position: 0.66; color: "#0000ff" }
+            GradientStop { position: 1.0; color: "#ff00ff" }
+          }
         }
 
         Column {

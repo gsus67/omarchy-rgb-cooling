@@ -175,6 +175,14 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
         controllers[id] = controller;
         gates();
         if (writing) {
+            if (recovering) {
+                timeout.stop();
+                reading.clear();
+                writing = false;
+                phase = Phase::Idle;
+                notify();
+                return true;
+            }
             writing = false;
             const auto params = requests.head().params;
             const auto result = write(id, params);
@@ -189,6 +197,12 @@ bool OpenRgbWorker::packet(quint32 device, quint32 command, const QByteArray &pa
             }
             send(device, 1, version >= 6 ? QByteArray() : sdkWord(version));
         } else {
+            if (recovering && (writtenMode >= 0 || saving)
+                && (awaitingWriteAck || writeAckFailed)) {
+                timeout.stop();
+                phase = Phase::Idle;
+                return true;
+            }
             timeout.stop();
             reading.clear();
             phase = Phase::Idle;
@@ -279,6 +293,11 @@ void OpenRgbWorker::identify(SdkController &controller, const SdkController *kno
 void OpenRgbWorker::gates()
 {
     inventory = usb.candidates;
+    for (auto &device : inventory) {
+        if (recovering && reconnecting.contains(device.value("usb").toString())) {
+            device.insert("blocked_reason", "Device reconnected; restarting OpenRGB");
+        }
+    }
     QMap<QString, int> identities;
     const QRegularExpression hid("\\AHID: (/dev/hidraw[0-9]+)\\z");
     for (auto &controller : controllers) {
@@ -298,6 +317,8 @@ void OpenRgbWorker::gates()
         QString gate;
         if (excluded) {
             gate = "0416:5302 is reserved exclusively for omarchy-trcc";
+        } else if (recovering && reconnecting.contains(identity)) {
+            gate = "Device reconnected; restarting OpenRGB";
         } else if (identity.isEmpty()) {
             gate = "USB identity is unknown";
         } else if (controller.ambiguous || identities.value(identity) != 1
