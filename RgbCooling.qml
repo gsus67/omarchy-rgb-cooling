@@ -135,6 +135,8 @@ Panel {
     if (s.kind === "fan") return Math.round(s.value) + " RPM"
     return Math.round(s.value) + "°"
   }
+  // Names from OpenRGB's udev rules use underscores (MSI_Mystic_Light_MS7D98).
+  function deviceName(d) { return String(d.name || d.id).replace(/_/g, " ") }
   function supportLabel(d) {
     var labels = {
       "recognized": t("Recognized"),
@@ -878,7 +880,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: String(deviceRow.modelData.name || deviceRow.modelData.id)
+                    text: root.deviceName(deviceRow.modelData)
                     color: root.bar.foreground
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.body
@@ -1145,7 +1147,7 @@ Panel {
         anchors.fill: parent
         z: 10
         opened: root.pendingEnable !== null
-        message: root.pendingEnable === null ? "" : root.t("Let this plugin change the lighting of") + " " + String(root.pendingEnable.name || root.pendingEnable.id) + "? " + root.t("Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.")
+        message: root.pendingEnable === null ? "" : root.t("Let this plugin change the lighting of") + " " + root.deviceName(root.pendingEnable) + "? " + root.t("Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.")
         confirmText: root.t("Enable")
         cancelText: root.t("Cancel")
         foreground: root.bar.foreground
