@@ -155,11 +155,19 @@ else:
 
     def test_closed_commands_and_names_rejected_before_any_side_effect(self):
         for args in ([], ["install"], ["install", "--help"], ["install", "other"],
-                     ["uninstall", "openrgb;id"], ["status", "openrgb"], ["wat"]):
+                     ["uninstall", "openrgb;id"], ["status", "other"],
+                     ["status", "openrgb", "extra"], ["wat"]):
             with self.subTest(args=args):
                 self.run_helper(*args, success=False)
         self.assertFalse(self.log.exists())
         self.assertFalse(self.record.parent.exists())
+
+    def test_status_accepts_the_engine_name_the_panel_passes(self):
+        # Regression: the panel runs `status openrgb`; rejecting it left the
+        # Engines tab empty.
+        self.assertEqual(self.run_helper("status", "openrgb"), self.run_helper("status"))
+        # Status only queries pacman; it never asks for privileges.
+        self.assertNotIn("pkexec", self.log.read_text() if self.log.exists() else "")
 
     def test_uninstall_all_skips_explicit_external_ownership_record(self):
         self.run_helper("install", "openrgb")
