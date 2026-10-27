@@ -44,6 +44,7 @@ Events (only on a subscribed connection; no `id`):
 ```json
 {"v": 1, "event": "sensors", "data": {"sensors": [], "primary": "..."}}
 {"v": 1, "event": "devices", "data": {"devices": []}}
+{"v": 1, "event": "profile", "data": {"profile": "balanced", "available": [], "degraded": ""}}
 ```
 
 ## Operations (closed set)
@@ -54,13 +55,31 @@ Events (only on a subscribed connection; no `id`):
 | `status` | — | `{"engines": [Engine], "uptime_s": 12}` |
 | `sensors` | — | `{"sensors": [Sensor], "primary": "<sensor id or empty>"}`; reads hwmon on request (results younger than 500 ms are reused), so it never needs a subscription |
 | `devices` | — | `{"devices": [Device]}` |
-| `subscribe` | `{"topics": ["sensors", "devices"], "interval_ms": 2000}` | `{}`; `interval_ms` is clamped to 500–10000 |
+| `subscribe` | `{"topics": ["sensors", "devices", "profile"], "interval_ms": 2000}` | `{}`; `interval_ms` is clamped to 500–10000 |
 | `unsubscribe` | — | `{}` |
 | `devices.rescan` | — | `{"devices": [Device]}` after one fresh scan of every engine; `rate_limited` if the last scan was under 2 s ago |
+| `profile.get` | — | `{"profile": "power-saver"\|"balanced"\|"performance", "available": ["..."], "degraded": ""}`; `unavailable` if power-profiles-daemon is not running |
+| `profile.set` | `{"profile": "power-saver"\|"balanced"\|"performance"}` | same as `profile.get` after the change; the profile must be in `available`; rate limited to 2 per second per connection |
 | `lighting.get` | `{"device": "<id>"}` | `Lighting` |
 | `lighting.set` | `{"device": "<id>", "color": "#rrggbb", "brightness": 0-100}` | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
 
 `lighting.set` is rate limited to 10 per second per connection.
+
+### Power profiles (the panel's Silent / Balanced / Turbo modes)
+
+rgbcd talks to power-profiles-daemon on the system D-Bus
+(`org.freedesktop.UPower.PowerProfiles`, property `ActiveProfile`); it never
+runs `powerprofilesctl`. The modes change how much heat the CPU produces; fan
+curves stay in the BIOS. A `profile` event is sent to subscribers when the
+daemon emits `PropertiesChanged` (also when the profile is changed elsewhere,
+such as the Omarchy menu), never by polling. rgbcd only connects to the
+system bus while some connection uses a `profile.*` operation or subscribes
+to `profile`.
+
+Motherboard Super I/O sensors (`nct6683`, `nct6687`, `nct6775`, `nct6779`,
+`it87`, `it8xxx`) use the device name `Motherboard`; their fans are listed with
+`Fan N` labels. Fan channels are read-only in rgbcd regardless of sysfs
+permissions.
 
 ### Engine scans (no background polling)
 
