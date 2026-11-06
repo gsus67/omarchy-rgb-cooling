@@ -42,6 +42,7 @@
     "Removing…": "Quitando…",
     "The operation did not finish.": "La operación no terminó.",
     "No lighting devices found. If you have RGB hardware, install its engine in the Engines tab.": "No se encontraron dispositivos de iluminación. Si tienes hardware RGB, instala su motor en la pestaña Motores.",
+    "Choose a device and select Enable to start controlling its lighting.": "Elige un dispositivo y pulsa Activar para empezar a controlar su iluminación.",
     "Disable": "Desactivar",
     "Enable": "Activar",
     "To control RGB lighting the plugin needs an engine. Install only what your hardware needs; nothing else is added, and uninstalling the plugin removes it again.": "Para controlar la iluminación RGB el plugin necesita un motor. Instala solo lo que tu hardware necesita; no se añade nada más y al desinstalar el plugin se quita también.",
@@ -58,6 +59,7 @@
     "EFFECT": "EFECTO",
     "Not enabled": "No activado",
     "Not saved: OpenRGB keeps running so the lights stay as they are.": "Sin guardar: OpenRGB sigue activo para que las luces se mantengan.",
+    "This effect cannot be saved to the device.": "Este efecto no se puede guardar en la placa.",
     "Random": "Aleatorio",
     "SPEED": "VELOCIDAD",
     "Save to device": "Guardar en la placa",
@@ -65,6 +67,10 @@
     "Saving…": "Guardando…",
     "Starting…": "Arrancando…",
     "Loading RGB engine…": "Cargando el motor RGB…",
+    "OpenRGB is taking longer than expected. Press S or select Scan to try again.": "OpenRGB está tardando más de lo esperado. Pulsa S o selecciona Buscar para intentarlo de nuevo.",
+    "Lighting error:": "Error de iluminación:",
+    "Hue": "Tono",
+    "Hex colour": "Color hexadecimal",
     "OpenRGB is starting and reading your devices. This takes a few seconds.": "OpenRGB está arrancando y leyendo tus dispositivos. Tarda unos segundos."
   }
 }

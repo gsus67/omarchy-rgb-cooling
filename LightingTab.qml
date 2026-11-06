@@ -14,6 +14,14 @@ Column {
   readonly property var lighting: panel.lighting
   readonly property var mode: panel.currentMode
   readonly property bool editable: panel.canWrite && lighting !== null
+  readonly property bool hasEnabledDevice: {
+    for (var i = 0; i < panel.lightingDevices.length; i++)
+      if (panel.lightingDevices[i].enabled === true) return true
+    return false
+  }
+  readonly property bool startTimedOut: panel.lightingLoading
+                                         && panel.loadingAttempts >= 6
+                                         && !panel.scanning
   readonly property color dim: Qt.darker(bar.foreground, 1.4)
 
   spacing: Style.space(12)
@@ -44,6 +52,7 @@ Column {
       foreground: tab.bar.foreground
       fontFamily: tab.bar.fontFamily
       enabled: !tab.panel.scanning
+      Accessible.name: tooltipText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       onClicked: tab.panel.scan()
@@ -61,9 +70,21 @@ Column {
     width: parent.width
   }
 
+  Text {
+    visible: !tab.panel.lightingLoading && tab.panel.lightingDevices.length > 0
+             && !tab.hasEnabledDevice
+    textFormat: Text.PlainText
+    text: tab.t("Choose a device and select Enable to start controlling its lighting.")
+    color: tab.bar.foreground
+    font.family: tab.bar.fontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.Wrap
+    width: parent.width
+  }
+
   // ---- loading state ------------------------------------------------------
   Row {
-    visible: tab.panel.lightingLoading
+    visible: tab.panel.lightingLoading && !tab.startTimedOut
     width: parent.width
     spacing: Style.space(10)
 
@@ -109,6 +130,28 @@ Column {
     }
   }
 
+  Text {
+    visible: tab.startTimedOut
+    textFormat: Text.PlainText
+    text: tab.t("OpenRGB is taking longer than expected. Press S or select Scan to try again.")
+    color: tab.bar.foreground
+    font.family: tab.bar.fontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.Wrap
+    width: parent.width
+  }
+
+  Text {
+    visible: tab.panel.lightingError !== ""
+    textFormat: Text.PlainText
+    text: tab.t("Lighting error:") + " " + tab.panel.lightingError
+    color: Commons.Color.urgent
+    font.family: tab.bar.fontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.Wrap
+    width: parent.width
+  }
+
   // ---- device cards -------------------------------------------------------
   Repeater {
     model: tab.panel.lightingLoading ? [] : tab.panel.lightingDevices
@@ -123,12 +166,15 @@ Column {
       foreground: tab.bar.foreground
       bordered: true
       current: selected
-      hasCursor: tab.panel.cursorActive && tab.panel.focusSection === "devices" && tab.panel.selectedIndex === index
+      hasCursor: tab.panel.cursorActive && tab.panel.focusSection === "devices"
+                 && tab.panel.selectedIndex === index
 
       // Selecting is the whole card; the enable button sits on top of it.
       MouseArea {
         anchors.fill: parent
         cursorShape: Qt.PointingHandCursor
+        Accessible.name: tab.panel.deviceName(card.modelData)
+        Accessible.role: Accessible.Button
         onClicked: tab.panel.selectDevice(card.modelData.id)
       }
 
@@ -203,6 +249,7 @@ Column {
           foreground: tab.bar.foreground
           fontFamily: tab.bar.fontFamily
           bordered: true
+          Accessible.name: text
           onClicked: {
             if (card.modelData.enabled === true) tab.panel.setEnabled(card.modelData.usb, false)
             else tab.panel.pendingEnable = card.modelData
@@ -238,6 +285,7 @@ Column {
         fontFamily: tab.bar.fontFamily
         options: tab.panel.currentModes.map(function(m) { return { value: m.name, label: m.name } })
         value: tab.lighting ? String(tab.lighting.mode || "") : ""
+        Accessible.name: tab.t("EFFECT")
         onChanged: function(v) { tab.panel.setLighting({ mode: v }) }
       }
     }
@@ -280,6 +328,7 @@ Column {
             id: randomSwitch
             checked: tab.lighting !== null && tab.lighting.random === true
             foreground: tab.bar.foreground
+            Accessible.name: tab.t("Random")
             onToggled: tab.panel.setLighting({ random: !checked })
           }
         }
@@ -292,6 +341,7 @@ Column {
         fontFamily: tab.bar.fontFamily
         swatches: tab.panel.swatches
         value: tab.lighting ? String(tab.lighting.color || "#ffffff") : "#ffffff"
+        t: function(text) { return tab.t(text) }
         onPicked: function(color) { tab.panel.setLighting({ color: color }) }
       }
     }
@@ -335,6 +385,7 @@ Column {
         step: 1
         integer: true
         value: tab.lighting && tab.lighting.speed !== null ? tab.lighting.speed : 0
+        Accessible.name: tab.t("SPEED")
         onMoved: function(v) { tab.panel.setLighting({ speed: Math.round(v) }) }
       }
     }
@@ -379,6 +430,7 @@ Column {
         step: 1
         integer: true
         value: tab.lighting ? tab.lighting.brightness : 0
+        Accessible.name: tab.t("BRIGHTNESS")
         onMoved: function(v) { tab.panel.setLighting({ brightness: Math.round(v) }) }
       }
     }
@@ -386,20 +438,19 @@ Column {
     PanelSeparator { foreground: tab.bar.foreground }
 
     // Save to device
-    Item {
+    Column {
       width: parent.width
-      implicitHeight: Math.max(saveText.implicitHeight, saveButton.implicitHeight)
+      spacing: Style.space(8)
 
       Text {
         id: saveText
-        anchors.left: parent.left
-        anchors.right: saveButton.left
-        anchors.rightMargin: Style.space(10)
-        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width
         textFormat: Text.PlainText
-        text: tab.lighting && tab.lighting.saved
-          ? tab.t("Saved to the device: it stays after reboots, OpenRGB can stop.")
-          : tab.t("Not saved: OpenRGB keeps running so the lights stay as they are.")
+        text: tab.mode !== null && tab.mode.savable !== true
+          ? tab.t("This effect cannot be saved to the device.")
+          : (tab.lighting && tab.lighting.saved
+             ? tab.t("Saved to the device: it stays after reboots, OpenRGB can stop.")
+             : tab.t("Not saved: OpenRGB keeps running so the lights stay as they are."))
         color: tab.lighting && tab.lighting.saved ? tab.dim : tab.bar.foreground
         font.family: tab.bar.fontFamily
         font.pixelSize: Style.font.caption
@@ -409,26 +460,15 @@ Column {
       Button {
         id: saveButton
         anchors.right: parent.right
-        anchors.verticalCenter: parent.verticalCenter
         enabled: tab.mode !== null && tab.mode.savable === true && tab.lighting !== null
                  && tab.lighting.saved !== true && !tab.panel.savingLighting
         text: tab.panel.savingLighting ? tab.t("Saving…") : tab.t("Save to device")
         foreground: tab.bar.foreground
         fontFamily: tab.bar.fontFamily
         bordered: true
+        Accessible.name: text
         onClicked: tab.panel.saveLighting()
       }
     }
-  }
-
-  Text {
-    visible: tab.panel.lightingError !== ""
-    textFormat: Text.PlainText
-    text: tab.panel.lightingError
-    color: Commons.Color.urgent
-    font.family: tab.bar.fontFamily
-    font.pixelSize: Style.font.caption
-    wrapMode: Text.Wrap
-    width: parent.width
   }
 }

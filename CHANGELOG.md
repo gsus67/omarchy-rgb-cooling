@@ -11,7 +11,7 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 - RGB control per enabled device: colour, brightness, effects, speed and random
   colour through sandboxed, on-demand OpenRGB; saving to the device is an explicit
   action.
-- Colour picker and redesigned Lighting tab.
+- Accessible colour picker and clearer Lighting first-run and status states.
 - Panel tabs: Cooling, Lighting, Engines.
 - `uninstall.sh` removes settings by default; `--keep-settings` keeps them.
 

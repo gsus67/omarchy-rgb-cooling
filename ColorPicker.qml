@@ -84,17 +84,41 @@ Item {
         border.color: root.brightness > 0.5 ? "#000000" : "#ffffff"
       }
       MouseArea {
+        id: squareArea
         anchors.fill: parent
         preventStealing: true
+        Accessible.name: root.t("COLOUR")
+        Accessible.role: Accessible.Slider
+        Accessible.description: root.t("COLOUR") + ": " + root.current()
         function pick(mouse) {
           root.saturation = Math.max(0, Math.min(1, mouse.x / width))
           root.brightness = Math.max(0, Math.min(1, 1 - mouse.y / height))
           hexField.text = root.current()
           root.emitCurrent()
         }
-        onPressed: function(mouse) { root.editing = true; pick(mouse) }
+        onPressed: function(mouse) { forceActiveFocus(); root.editing = true; pick(mouse) }
         onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
         onReleased: root.editing = false
+        onCanceled: root.editing = false
+        Keys.onPressed: function(event) {
+          var step = 0.02
+          if (event.key === Qt.Key_Left) root.saturation = Math.max(0, root.saturation - step)
+          else if (event.key === Qt.Key_Right) root.saturation = Math.min(1, root.saturation + step)
+          else if (event.key === Qt.Key_Down) root.brightness = Math.max(0, root.brightness - step)
+          else if (event.key === Qt.Key_Up) root.brightness = Math.min(1, root.brightness + step)
+          else return
+          hexField.text = root.current()
+          root.emitCurrent()
+          event.accepted = true
+        }
+      }
+      Rectangle {
+        anchors.fill: parent
+        z: 2
+        radius: parent.radius
+        color: "transparent"
+        border.width: squareArea.activeFocus ? 2 : 0
+        border.color: root.foreground
       }
     }
 
@@ -124,9 +148,13 @@ Item {
         border.color: "#000000"
       }
       MouseArea {
+        id: hueArea
         anchors.fill: parent
         anchors.margins: -Style.space(4)
         preventStealing: true
+        Accessible.name: root.t("Hue")
+        Accessible.role: Accessible.Slider
+        Accessible.description: root.t("Hue") + ": " + Math.round(root.hue * 360) + "°"
         function pick(mouse) {
           root.hue = Math.max(0, Math.min(0.9999, (mouse.x - Style.space(4)) / hueBar.width))
           if (root.saturation === 0) root.saturation = 1
@@ -134,9 +162,29 @@ Item {
           hexField.text = root.current()
           root.emitCurrent()
         }
-        onPressed: function(mouse) { root.editing = true; pick(mouse) }
+        onPressed: function(mouse) { forceActiveFocus(); root.editing = true; pick(mouse) }
         onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
         onReleased: root.editing = false
+        onCanceled: root.editing = false
+        Keys.onPressed: function(event) {
+          var step = 0.02
+          if (event.key === Qt.Key_Left) root.hue = Math.max(0, root.hue - step)
+          else if (event.key === Qt.Key_Right) root.hue = Math.min(0.9999, root.hue + step)
+          else return
+          if (root.saturation === 0) root.saturation = 1
+          if (root.brightness === 0) root.brightness = 1
+          hexField.text = root.current()
+          root.emitCurrent()
+          event.accepted = true
+        }
+      }
+      Rectangle {
+        anchors.fill: parent
+        z: 2
+        radius: parent.radius
+        color: "transparent"
+        border.width: hueArea.activeFocus ? 2 : 0
+        border.color: root.foreground
       }
     }
 
@@ -162,6 +210,7 @@ Item {
         foreground: root.foreground
         maximumLength: 7
         placeholderText: "#rrggbb"
+        Accessible.name: root.t("Hex colour")
         validator: RegularExpressionValidator { regularExpression: /^#?[0-9a-fA-F]{0,6}$/ }
         onAccepted: {
           var text = String(hexField.text).trim()
@@ -180,18 +229,31 @@ Item {
         model: root.swatches
 
         Rectangle {
+          id: swatch
           required property var modelData
           width: Style.space(26)
           height: width
           radius: width / 2
           color: modelData.color
-          border.width: root.current() === modelData.color ? 2 : 1
-          border.color: root.current() === modelData.color ? root.foreground : Qt.darker(root.foreground, 2)
+          border.width: swatchArea.activeFocus || root.current() === modelData.color ? 2 : 1
+          border.color: swatchArea.activeFocus || root.current() === modelData.color
+                        ? root.foreground : Qt.darker(root.foreground, 2)
 
           MouseArea {
+            id: swatchArea
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: { root.syncFrom(parent.modelData.color); root.emitCurrent() }
+            Accessible.name: String(swatch.modelData.label || swatch.modelData.color)
+            Accessible.role: Accessible.Button
+            function activate() { root.syncFrom(swatch.modelData.color); root.emitCurrent() }
+            onClicked: { forceActiveFocus(); activate() }
+            Keys.onPressed: function(event) {
+              if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                  || event.key === Qt.Key_Space) {
+                activate()
+                event.accepted = true
+              }
+            }
           }
         }
       }
