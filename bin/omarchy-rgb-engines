@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,16 +16,27 @@ from rgb_common import read_json, xdg
 
 ENGINES = {"openrgb": {"package": "openrgb", "size": "9.5 MiB",
                        "purpose": "RGB control on supported USB HID devices"}}
+PACKAGE_NAME = re.compile(r"^[a-z0-9@._+-]+$", re.ASCII)
 
 
 def run(arguments, *, check=True):
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=600)
+    environment = {**os.environ, "LC_ALL": "C"}
+    # Package names are validated and subprocess receives an argv list.
+    result = subprocess.run(  # noqa: S603
+        arguments, capture_output=True, text=True, timeout=600, env=environment)
     if check and result.returncode:
         raise ValueError(result.stderr.strip() or f"{arguments[0]} failed or was cancelled")
     return result
 
 
+def package_name(value):
+    if not isinstance(value, str) or PACKAGE_NAME.fullmatch(value) is None:
+        raise ValueError("Invalid package name")
+    return value
+
+
 def installed(package):
+    package_name(package)
     result = run(["pacman", "-Q", package], check=False)
     return result.returncode == 0, result.stdout.strip().partition(" ")[2]
 
@@ -44,7 +56,8 @@ def record(path):
             raise ValueError("Invalid engines.json ownership")
         for field in ("packages", "new_dependencies"):
             if (not isinstance(entry.get(field), list)
-                    or any(not isinstance(item, str) for item in entry[field])):
+                    or any(not isinstance(item, str)
+                           or PACKAGE_NAME.fullmatch(item) is None for item in entry[field])):
                 raise ValueError("Invalid engines.json package record")
     return value
 
@@ -75,11 +88,11 @@ def status(value):
 
 
 def install(path, value, name):
-    package = ENGINES[name]["package"]
+    package = package_name(ENGINES[name]["package"])
     present, _version = installed(package)
-    # Capture the transaction BEFORE elevating; this list is never a command argument.
+    # Capture the transaction before elevating and validate it before recording it.
     planned = run(["pacman", "-S", "--print", "--print-format", "%n", "--needed", package])
-    packages = planned.stdout.splitlines()
+    packages = [package_name(item) for item in planned.stdout.splitlines()]
     run(["pkexec", "/usr/bin/pacman", "-S", "--needed", "--noconfirm", package])
     if not present:
         value["engines"][name] = {
@@ -92,10 +105,59 @@ def install(path, value, name):
     return {"ok": True}
 
 
+def required_by(package):
+    package_name(package)
+    result = run(["pacman", "-Qi", "--", package], check=False)
+    if result.returncode:
+        return None
+    fields = {}
+    current = None
+    for line in result.stdout.splitlines():
+        if line and not line[0].isspace() and ":" in line:
+            current, _separator, value = line.partition(":")
+            current = current.strip()
+            fields[current] = value.strip()
+        elif current and line[:1].isspace():
+            fields[current] += " " + line.strip()
+    if "Required By" not in fields:
+        raise ValueError(f"pacman -Qi returned no Required By field for {package}")
+    value = fields["Required By"]
+    if value == "None":
+        return set()
+    packages = value.split()
+    for item in packages:
+        package_name(item)
+    return set(packages)
+
+
+def removal_plan(entry, name):
+    candidates = []
+    requirements = {}
+    for package in [ENGINES[name]["package"], *entry["new_dependencies"]]:
+        package_name(package)
+        if package in requirements:
+            continue
+        required = required_by(package)
+        if required is not None:
+            candidates.append(package)
+            requirements[package] = required
+    removable = set(candidates)
+    while True:
+        required_outside = {package for package in removable
+                            if requirements[package] - removable}
+        if not required_outside:
+            break
+        removable -= required_outside
+    return [package for package in candidates if package in removable]
+
+
 def uninstall(path, value, name):
-    if not value["engines"].get(name, {}).get("installed_by_plugin", False):
+    entry = value["engines"].get(name, {})
+    if not entry.get("installed_by_plugin", False):
         raise ValueError(f"{name} was not installed by this plugin; refusing to remove it")
-    run(["pkexec", "/usr/bin/pacman", "-Rns", "--noconfirm", ENGINES[name]["package"]])
+    packages = removal_plan(entry, name)
+    if packages:
+        run(["pkexec", "/usr/bin/pacman", "-Rn", "--noconfirm", "--", *packages])
     del value["engines"][name]
     save(path, value)
     return {"ok": True}

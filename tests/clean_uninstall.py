@@ -55,6 +55,9 @@ with open(os.environ["STUB_LOG"], "a") as log:
     log.write("pacman " + " ".join(sys.argv[1:]) + "\n")
 if sys.argv[1:2] == ["-Q"]:
     print(sys.argv[2] + " 1.1-1")
+elif sys.argv[1:2] == ["-Qi"]:
+    print("Name            : " + sys.argv[-1])
+    print("Required By     : None")
 '''
 
 PKEXEC = r'''#!/usr/bin/env python3
@@ -184,7 +187,7 @@ def existing_units(home):
 
 OPENRGB_BY_PLUGIN = {"openrgb": {"installed_by_plugin": True, "packages": ["openrgb"],
                                   "new_dependencies": [], "installed_at": "2026-10-27T00:00:00"}}
-REMOVE_OPENRGB = "pkexec /usr/bin/pacman -Rns --noconfirm openrgb"
+REMOVE_OPENRGB = "pkexec /usr/bin/pacman -Rn --noconfirm -- openrgb"
 
 
 def main():

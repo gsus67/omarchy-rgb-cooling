@@ -31,7 +31,7 @@ engines="$plugin/bin/omarchy-rgb-engines"
 if [[ -f $state/engines.json && -x $engines ]]; then
   if ! "$engines" uninstall-all; then
     echo "Engines installed by this plugin were not removed." >&2
-    echo "Remove them later with: sudo pacman -Rns openrgb" >&2
+    echo "Remove them later with: sudo pacman -Rn openrgb" >&2
   fi
 fi
 

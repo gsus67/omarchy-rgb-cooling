@@ -31,3 +31,8 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
   recovery on re-enumeration.
 - Colour picker pointer input keeps the panel keyboard shortcuts active.
 - Fan channels remain read-only; fan curves stay under BIOS control.
+
+### Fixed
+
+- Engine removal preserves pre-existing orphaned packages and dependencies
+  still required outside the recorded install set.
