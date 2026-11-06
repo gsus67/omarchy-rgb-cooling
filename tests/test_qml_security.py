@@ -86,6 +86,19 @@ class QmlSecurityTest(unittest.TestCase):
         self.assertIn('readonly property string enginesHelper: pluginDirectory '
                       '+ "/bin/omarchy-rgb-engines"', source)
 
+    def test_engine_install_requires_explicit_confirmation(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        self.assertIn("property var pendingEngineInstall: null", source)
+        self.assertNotIn(
+            'onClicked: root.runEngine(engineRow.modelData.installed ? "uninstall" : "install")',
+            source,
+        )
+        self.assertRegex(
+            source,
+            r"opened:\s*root\.pendingEngineInstall !== null[\s\S]*?"
+            r"onConfirmed:\s*\{[\s\S]*?root\.runEngine\(\"install\"\)",
+        )
+
     def test_core_lines_are_bounded(self):
         source = (ROOT / "RgbCooling.qml").read_text()
         self.assertIn("if (line.length > maxLine)", source, "reject over-long lines from rgbcd")

@@ -8,6 +8,8 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 
 - Engines tab: install or remove OpenRGB with one button (pkexec), tracked so
   uninstalling the plugin removes exactly what it installed.
+- Engines show SPDX license, package source, and the exact install command;
+  official-repository installs require explicit confirmation.
 - RGB control per enabled device: colour, brightness, effects, speed and random
   colour through sandboxed, on-demand OpenRGB; saving to the device is an explicit
   action.

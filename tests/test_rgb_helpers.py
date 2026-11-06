@@ -33,6 +33,20 @@ def load_launcher():
         sys.path.remove(str(REPO / "bin"))
     return module
 
+
+def load_engines_helper():
+    """Import bin/omarchy-rgb-engines (no .py suffix) as a fresh module."""
+    path = REPO / "bin/omarchy-rgb-engines"
+    loader = importlib.machinery.SourceFileLoader("omarchy_rgb_engines", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(REPO / "bin"))
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.path.remove(str(REPO / "bin"))
+    return module
+
 class Helpers(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="rgbc-helpers-")
@@ -145,6 +159,28 @@ database.write_text(json.dumps(packages))
         self.assertEqual(status["version"], "1.1-1")
         self.assertEqual(status["size"], "9.5 MiB")
         self.assertTrue(status["purpose"])
+        self.assertEqual(status["license"], "GPL-2.0-or-later")
+        self.assertEqual(status["source"], "repo")
+        self.assertEqual(status["command"], "sudo pacman -S --needed openrgb")
+
+    def test_aur_engine_install_is_rejected_before_package_commands(self):
+        module = load_engines_helper()
+        module.ENGINES = {
+            "aur-engine": {
+                "package": "aur-engine",
+                "size": "1 MiB",
+                "purpose": "Test engine",
+                "license": "GPL-2.0-or-later",
+                "source": "aur",
+                "command": "paru -S aur-engine",
+            }
+        }
+
+        with mock.patch.object(
+                module, "installed",
+                side_effect=AssertionError("AUR rejection must precede package commands")):
+            with self.assertRaisesRegex(ValueError, "AUR"):
+                module.install(self.record, {"v": 1, "engines": {}}, "aur-engine")
 
     def test_preexisting_package_is_never_marked_or_uninstalled(self):
         self.set_packages({"openrgb": []})

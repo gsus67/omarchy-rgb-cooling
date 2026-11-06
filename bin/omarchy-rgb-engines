@@ -15,8 +15,11 @@ sys.dont_write_bytecode = True
 from rgb_common import read_json, xdg
 
 ENGINES = {"openrgb": {"package": "openrgb", "size": "9.5 MiB",
-                       "purpose": "RGB control on supported USB HID devices"}}
+                       "purpose": "RGB control on supported USB HID devices",
+                       "license": "GPL-2.0-or-later", "source": "repo",
+                       "command": "sudo pacman -S --needed openrgb"}}
 PACKAGE_NAME = re.compile(r"^[a-z0-9@._+-]+$", re.ASCII)
+ENGINE_SOURCES = {"repo", "aur"}
 
 
 def run(arguments, *, check=True):
@@ -33,6 +36,19 @@ def package_name(value):
     if not isinstance(value, str) or PACKAGE_NAME.fullmatch(value) is None:
         raise ValueError("Invalid package name")
     return value
+
+
+def engine_metadata(name):
+    metadata = ENGINES[name]
+    fields = ("package", "size", "purpose", "license", "source", "command")
+    if any(not isinstance(metadata.get(field), str) or not metadata[field]
+           or any(ord(character) < 32 or ord(character) == 127
+                  for character in metadata[field]) for field in fields):
+        raise ValueError("Invalid engine metadata")
+    package_name(metadata["package"])
+    if metadata["source"] not in ENGINE_SOURCES:
+        raise ValueError("Invalid engine source")
+    return metadata
 
 
 def installed(package):
@@ -79,16 +95,22 @@ def save(path, value):
 def status(value):
     engines = []
     for name, metadata in ENGINES.items():
+        metadata = engine_metadata(name)
         present, version = installed(metadata["package"])
         entry = value["engines"].get(name, {})
         engines.append({"id": name, "installed": present, "version": version,
                         "installed_by_plugin": entry.get("installed_by_plugin", False),
-                        "size": metadata["size"], "purpose": metadata["purpose"]})
+                        "size": metadata["size"], "purpose": metadata["purpose"],
+                        "license": metadata["license"], "source": metadata["source"],
+                        "command": metadata["command"]})
     return {"engines": engines}
 
 
 def install(path, value, name):
-    package = package_name(ENGINES[name]["package"])
+    metadata = engine_metadata(name)
+    if metadata["source"] == "aur":
+        raise ValueError("AUR engines are never installed by this plugin")
+    package = metadata["package"]
     present, _version = installed(package)
     # Capture the transaction before elevating and validate it before recording it.
     planned = run(["pacman", "-S", "--print", "--print-format", "%n", "--needed", package])

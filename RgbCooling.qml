@@ -379,8 +379,17 @@ Panel {
   property var engines: []
   property string engineAction: "status"
   property string engineMessage: ""
+  property var pendingEngineInstall: null
   readonly property bool engineBusy: engineProc.running
 
+  function engineName(engine) {
+    return engine && engine.id === "openrgb" ? "OpenRGB" : String(engine ? engine.id : "")
+  }
+  function engineSourceLabel(source) {
+    if (source === "repo") return t("Official repository (extra)")
+    if (source === "aur") return t("AUR")
+    return ""
+  }
   function refreshEngines() { runEngine("status") }
   function runEngine(action) {
     if (engineProc.running || engineActions.indexOf(action) < 0) return
@@ -916,19 +925,20 @@ Panel {
                 id: engineRow
                 required property var modelData
                 width: panelColumn.width
-                implicitHeight: Math.max(engineText.implicitHeight, engineButton.implicitHeight)
+                implicitHeight: Math.max(engineText.implicitHeight,
+                                         engineButton.visible ? engineButton.implicitHeight : 0)
 
                 Column {
                   id: engineText
                   anchors.left: parent.left
-                  anchors.right: engineButton.left
-                  anchors.rightMargin: Style.space(10)
+                  anchors.right: engineButton.visible ? engineButton.left : parent.right
+                  anchors.rightMargin: engineButton.visible ? Style.space(10) : 0
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(2)
 
                   Text {
                     textFormat: Text.PlainText
-                    text: engineRow.modelData.id === "openrgb" ? "OpenRGB" : String(engineRow.modelData.id)
+                    text: root.engineName(engineRow.modelData)
                     color: root.bar.foreground
                     font.family: root.bar.fontFamily
                     font.pixelSize: Style.font.body
@@ -948,6 +958,31 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
+                    text: root.t("License") + ": " + String(engineRow.modelData.license || "")
+                      + " · " + root.t("Source") + ": "
+                      + root.engineSourceLabel(engineRow.modelData.source)
+                    color: Qt.darker(root.bar.foreground, 1.4)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                    width: parent.width
+                  }
+
+                  TextEdit {
+                    textFormat: Text.PlainText
+                    text: root.t("Command") + ": " + String(engineRow.modelData.command || "")
+                    color: Qt.darker(root.bar.foreground, 1.4)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    readOnly: true
+                    selectByMouse: true
+                    wrapMode: TextEdit.Wrap
+                    width: parent.width
+                    height: implicitHeight
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
                     text: !engineRow.modelData.installed ? root.t("Not installed")
                       : (engineRow.modelData.installed_by_plugin ? root.t("Installed by this plugin")
                          : root.t("Installed before this plugin; it will not be removed"))
@@ -963,13 +998,20 @@ Panel {
                   id: engineButton
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  visible: !engineRow.modelData.installed || engineRow.modelData.installed_by_plugin === true
+                  visible: (engineRow.modelData.installed
+                            && engineRow.modelData.installed_by_plugin === true)
+                           || (!engineRow.modelData.installed
+                               && engineRow.modelData.source !== "aur")
+                  width: visible ? implicitWidth : 0
                   enabled: !root.engineBusy
                   text: engineRow.modelData.installed ? root.t("Uninstall") : root.t("Install")
                   foreground: root.bar.foreground
                   fontFamily: root.bar.fontFamily
                   bordered: true
-                  onClicked: root.runEngine(engineRow.modelData.installed ? "uninstall" : "install")
+                  onClicked: {
+                    if (engineRow.modelData.installed) root.runEngine("uninstall")
+                    else root.pendingEngineInstall = engineRow.modelData
+                  }
                 }
               }
             }
@@ -986,6 +1028,26 @@ Panel {
             }
           }
         }
+      }
+
+      ConfirmDialog {
+        anchors.fill: parent
+        z: 10
+        opened: root.pendingEngineInstall !== null
+        message: root.pendingEngineInstall === null ? ""
+          : root.t("Install engine") + " " + root.engineName(root.pendingEngineInstall) + "? "
+            + root.t("Download size") + ": " + String(root.pendingEngineInstall.size || "") + ". "
+            + root.t("Command") + ": " + String(root.pendingEngineInstall.command || "")
+        confirmText: root.t("Install")
+        cancelText: root.t("Cancel")
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+        onConfirmed: {
+          var engine = root.pendingEngineInstall
+          root.pendingEngineInstall = null
+          if (engine && engine.source === "repo") root.runEngine("install")
+        }
+        onCanceled: root.pendingEngineInstall = null
       }
 
       ConfirmDialog {
