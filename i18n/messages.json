@@ -51,7 +51,7 @@
     "Uninstall": "Desinstalar",
     "Install": "Instalar",
     "Let this plugin change the lighting of": "¿Permitir que este plugin cambie la iluminación de",
-    "Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.": "Solo se envían un color fijo y el brillo; no se guarda nada en el dispositivo y puedes desactivarlo aquí.",
+    "Colour, brightness, effects and speed are sent to the device. It is only told to store them when you press Save to device (some devices keep the last setting on their own), and you can disable it again here.": "Se envían al dispositivo color, brillo, efectos y velocidad. Solo se le ordena guardarlos al pulsar Guardar en la placa (algunos dispositivos conservan el último ajuste por sí solos), y puedes desactivarlo aquí de nuevo.",
     "Cancel": "Cancelar",
     "COLOUR": "COLOR",
     "DEVICES": "DISPOSITIVOS",

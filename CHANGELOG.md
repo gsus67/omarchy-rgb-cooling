@@ -8,8 +8,10 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 
 - Engines tab: install or remove OpenRGB with one button (pkexec), tracked so
   uninstalling the plugin removes exactly what it installed.
-- RGB control per enabled device: static colour and brightness through a
-  sandboxed, on-demand OpenRGB that sees only the enabled devices.
+- RGB control per enabled device: colour, brightness, effects, speed and random
+  colour through sandboxed, on-demand OpenRGB; saving to the device is an explicit
+  action.
+- Colour picker and redesigned Lighting tab.
 - Panel tabs: Cooling, Lighting, Engines.
 - `uninstall.sh` removes settings by default; `--keep-settings` keeps them.
 
@@ -17,10 +19,12 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 - Omarchy bar widget and sensor panel, including user-defined sensor names.
 - Silent, Balanced, and Turbo power-profile selection through `power-profiles-daemon`.
 - Motherboard fan labels from an exact-board verified table.
-- Optional demo mode and OpenRGB device discovery; RGB writes remain blocked.
+- Optional demo mode and OpenRGB device discovery; RGB writes require explicit
+  per-device enablement.
 - User-level install footprint tracking and uninstall support.
 - Security baseline, hardware inventory, and MSI B760 fan-control research.
 
 ### Changed
 
+- OpenRGB lifecycle fixes: bounded start-up wait, SIGNALUPDATE parsing, stable device IDs with recovery on re-enumeration.
 - Fan channels remain read-only; fan curves stay under BIOS control.

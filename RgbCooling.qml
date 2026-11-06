@@ -988,7 +988,7 @@ Panel {
         anchors.fill: parent
         z: 10
         opened: root.pendingEnable !== null
-        message: root.pendingEnable === null ? "" : root.t("Let this plugin change the lighting of") + " " + root.deviceName(root.pendingEnable) + "? " + root.t("Only a static colour and brightness are sent; nothing is saved to the device, and you can disable it again here.")
+        message: root.pendingEnable === null ? "" : root.t("Let this plugin change the lighting of") + " " + root.deviceName(root.pendingEnable) + "? " + root.t("Colour, brightness, effects and speed are sent to the device. It is only told to store them when you press Save to device (some devices keep the last setting on their own), and you can disable it again here.")
         confirmText: root.t("Enable")
         cancelText: root.t("Cancel")
         foreground: root.bar.foreground
