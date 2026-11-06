@@ -249,7 +249,11 @@ Panel {
   // Engines are only contacted on request (docs/API.md, "Engine scans"):
   // once each time the panel opens and from the Scan button.
   property bool scanning: false
-  function scan() {
+  function scan(manual) {
+    if (manual === true && lightingLoading) {
+      loadingAttempts = 0
+      loadingRetry.restart()
+    }
     if (scanning) return
     scanning = true
     var sent = send("devices.rescan", {}, function(ok, r) {
@@ -649,7 +653,7 @@ Panel {
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onCloseRequested: root.close()
       onTextKey: function(key) {
-        if (key === "s") root.scan()
+        if (key === "s") root.scan(true)
         else if (key === "c") root.coresExpanded = !root.coresExpanded
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }

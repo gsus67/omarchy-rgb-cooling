@@ -96,6 +96,35 @@ class QmlSecurityTest(unittest.TestCase):
         self.assertIn('Quickshell.env("XDG_RUNTIME_DIR") || "") + "/omarchy-rgb-cooling.sock"',
                       source)
 
+    def test_lighting_cards_remain_available_after_start_timeout(self):
+        source = (ROOT / "LightingTab.qml").read_text()
+        self.assertIn(
+            "model: tab.panel.lightingLoading && !tab.startTimedOut ? [] "
+            ": tab.panel.lightingDevices",
+            source,
+        )
+
+    def test_manual_scan_restarts_loading_retry(self):
+        panel = (ROOT / "RgbCooling.qml").read_text()
+        lighting = (ROOT / "LightingTab.qml").read_text()
+        manual_scan = re.compile(
+            r"function scan\(manual\) \{\s*"
+            r"if \(manual === true && lightingLoading\) \{\s*"
+            r"loadingAttempts = 0\s*"
+            r"loadingRetry\.restart\(\)\s*"
+            r"\}\s*"
+            r"if \(scanning\) return"
+        )
+        self.assertRegex(panel, manual_scan)
+        self.assertIn("onClicked: tab.panel.scan(true)", lighting)
+        self.assertIn('if (key === "s") root.scan(true)', panel)
+
+    def test_colour_picker_keeps_panel_keyboard_focus(self):
+        source = (ROOT / "ColorPicker.qml").read_text()
+        self.assertNotIn("forceActiveFocus()", source)
+        self.assertNotIn("activeFocus", source)
+        self.assertNotIn("Accessible.value", source)
+
 
 if __name__ == "__main__":
     unittest.main()

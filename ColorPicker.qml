@@ -96,7 +96,7 @@ Item {
           hexField.text = root.current()
           root.emitCurrent()
         }
-        onPressed: function(mouse) { forceActiveFocus(); root.editing = true; pick(mouse) }
+        onPressed: function(mouse) { root.editing = true; pick(mouse) }
         onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
         onReleased: root.editing = false
         onCanceled: root.editing = false
@@ -111,14 +111,6 @@ Item {
           root.emitCurrent()
           event.accepted = true
         }
-      }
-      Rectangle {
-        anchors.fill: parent
-        z: 2
-        radius: parent.radius
-        color: "transparent"
-        border.width: squareArea.activeFocus ? 2 : 0
-        border.color: root.foreground
       }
     }
 
@@ -162,7 +154,7 @@ Item {
           hexField.text = root.current()
           root.emitCurrent()
         }
-        onPressed: function(mouse) { forceActiveFocus(); root.editing = true; pick(mouse) }
+        onPressed: function(mouse) { root.editing = true; pick(mouse) }
         onPositionChanged: function(mouse) { if (pressed) pick(mouse) }
         onReleased: root.editing = false
         onCanceled: root.editing = false
@@ -177,14 +169,6 @@ Item {
           root.emitCurrent()
           event.accepted = true
         }
-      }
-      Rectangle {
-        anchors.fill: parent
-        z: 2
-        radius: parent.radius
-        color: "transparent"
-        border.width: hueArea.activeFocus ? 2 : 0
-        border.color: root.foreground
       }
     }
 
@@ -235,8 +219,8 @@ Item {
           height: width
           radius: width / 2
           color: modelData.color
-          border.width: swatchArea.activeFocus || root.current() === modelData.color ? 2 : 1
-          border.color: swatchArea.activeFocus || root.current() === modelData.color
+          border.width: root.current() === modelData.color ? 2 : 1
+          border.color: root.current() === modelData.color
                         ? root.foreground : Qt.darker(root.foreground, 2)
 
           MouseArea {
@@ -246,7 +230,7 @@ Item {
             Accessible.name: String(swatch.modelData.label || swatch.modelData.color)
             Accessible.role: Accessible.Button
             function activate() { root.syncFrom(swatch.modelData.color); root.emitCurrent() }
-            onClicked: { forceActiveFocus(); activate() }
+            onClicked: activate()
             Keys.onPressed: function(event) {
               if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
                   || event.key === Qt.Key_Space) {

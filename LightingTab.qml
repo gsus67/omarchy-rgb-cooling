@@ -55,7 +55,7 @@ Column {
       Accessible.name: tooltipText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      onClicked: tab.panel.scan()
+      onClicked: tab.panel.scan(true)
     }
   }
 
@@ -154,7 +154,7 @@ Column {
 
   // ---- device cards -------------------------------------------------------
   Repeater {
-    model: tab.panel.lightingLoading ? [] : tab.panel.lightingDevices
+    model: tab.panel.lightingLoading && !tab.startTimedOut ? [] : tab.panel.lightingDevices
 
     CursorSurface {
       id: card

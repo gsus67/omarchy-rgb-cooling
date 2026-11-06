@@ -26,5 +26,8 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ### Changed
 
-- OpenRGB lifecycle fixes: bounded start-up wait, SIGNALUPDATE parsing, stable device IDs with recovery on re-enumeration.
+- OpenRGB lifecycle fixes: bounded start-up wait with manual recovery and visible
+  device disable controls, SIGNALUPDATE parsing, and stable device IDs with
+  recovery on re-enumeration.
+- Colour picker pointer input keeps the panel keyboard shortcuts active.
 - Fan channels remain read-only; fan curves stay under BIOS control.
