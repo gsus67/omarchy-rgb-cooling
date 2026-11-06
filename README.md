@@ -116,6 +116,14 @@ Other devices may have a lower support level. See
 [`docs/INVENTORY.md`](docs/INVENTORY.md) and the verified
 [`fan header table`](data/fan-headers.json).
 
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Lighting backends](docs/BACKENDS.md)
+- [API and footprint](docs/API.md)
+- [OpenRGB integration notes](docs/OPENRGB_INTEGRATION.md)
+- [Security](SECURITY.md)
+
 ## Troubleshooting
 
 - **Widget missing:** run `omarchy restart shell`.
@@ -125,5 +133,4 @@ Other devices may have a lower support level. See
   resource conflicts. The board may expose no sensor node under the current
   kernel driver.
 
-More: [API and footprint](docs/API.md) · [Security](SECURITY.md) ·
-[Contributing](CONTRIBUTING.md) · [Licenses](LICENSES.md).
+More: [Contributing](CONTRIBUTING.md) · [Licenses](LICENSES.md).
