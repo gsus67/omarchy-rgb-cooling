@@ -296,21 +296,29 @@ Demo data never touches real hardware or engines.
 
 ## Footprint (what the plugin adds to a system)
 
-`bootstrap.py <plugin dir>` creates only these paths, and records every one in
-`$XDG_STATE_HOME/omarchy-rgb-cooling/installed-files` (one absolute path per line):
+`bootstrap.py <plugin dir>` creates or manages these project paths. It records
+the installation-owned paths in
+`$XDG_STATE_HOME/omarchy-rgb-cooling/installed-files` (one absolute path per
+line):
 
 - `$XDG_STATE_HOME/omarchy-rgb-cooling/bin/rgbcd`
 - `$XDG_STATE_HOME/omarchy-rgb-cooling/.core-version`, `.bootstrap.lock`
+- `$XDG_STATE_HOME/omarchy-rgb-cooling/openrgb/`
 - `$XDG_CONFIG_HOME/systemd/user/omarchy-rgb-cooling.socket`
 - `$XDG_CONFIG_HOME/systemd/user/omarchy-rgb-cooling.service`
+- `$XDG_CONFIG_HOME/systemd/user/omarchy-rgb-cooling-openrgb.service`
 - the enablement symlink `systemctl --user enable` creates for the socket
 - each of these directories that did not exist before, recorded with a
   trailing `/` (for example `$XDG_CONFIG_HOME/systemd/user/sockets.target.wants/`),
   so uninstall removes it again only if it is empty
 
-It runs `systemctl --user daemon-reload` and `enable --now omarchy-rgb-cooling.socket`
-(never the service). It prints one JSON line: `{"ok": true}` or
-`{"ok": false, "error": "<plain text>"}`.
+Bootstrap also creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling/` for user
+settings, but deliberately does not put that user-data directory in the
+ledger. When installed content changes, it runs `systemctl --user
+daemon-reload`, `enable --now omarchy-rgb-cooling.socket`, and `try-restart
+omarchy-rgb-cooling.service`. The core service remains socket-activated; it is
+not enabled as a persistent service. Bootstrap prints one JSON line:
+`{"ok": true}` or `{"ok": false, "error": "<plain text>"}`.
 
 `uninstall.sh` stops the units, removes the engines the plugin installed
 (`bin/omarchy-rgb-engines uninstall-all`, which asks for the password through
