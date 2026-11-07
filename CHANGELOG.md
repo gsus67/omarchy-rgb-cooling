@@ -3,19 +3,24 @@
 Changes are documented under
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] - unreleased
+## [0.2.0] - Unreleased
 
 ### Added
 
 - Engines tab: install or remove OpenRGB with one button (pkexec), tracked so
   uninstalling the plugin removes exactly what it installed.
+- Profiles tab: save, apply and delete up to 32 named RGB and system-power
+  combinations in private per-user configuration; fan control remains with
+  BIOS or CoolerControl.
+- Optional Omarchy theme-colour sync, off by default and driven by theme
+  change events without polling.
 - Engines show SPDX license, package source, and the exact install command;
   official-repository installs require explicit confirmation.
 - RGB control per enabled device: colour, brightness, effects, speed and random
   colour through sandboxed, on-demand OpenRGB; saving to the device is an explicit
   action.
 - Accessible colour picker and clearer Lighting first-run and status states.
-- Panel tabs: Cooling, Lighting, Engines.
+- Panel tabs: Cooling, Lighting, Profiles, Engines.
 - `uninstall.sh` removes settings by default; `--keep-settings` keeps them.
 
 - Socket-activated, unprivileged C++20 core with hwmon temperature and fan RPM

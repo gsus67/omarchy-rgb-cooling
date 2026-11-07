@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.gsus67.omarchy-rgb-cooling",
   "name": "Omarchy RGB & Cooling",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "gsus",
   "license": "GPL-3.0-or-later",
   "description": "Read temperatures and fan RPM, view RGB devices, and select power profiles in Omarchy.",

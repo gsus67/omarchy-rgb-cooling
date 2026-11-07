@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Store bounded RGB and power profiles in the user's XDG configuration."""
+# SPDX-License-Identifier: GPL-3.0-or-later
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+sys.dont_write_bytecode = True
+from rgb_common import (JsonFormatError, atomic_write_json, parse_constant,
+                        read_json, secure_directory, unique_object, xdg)
+
+
+MAX_PROFILES = 32
+MAX_NAME = 48
+TEXT = re.compile(r"[^\x00-\x1f\x7f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]+\Z")
+COLOR = re.compile(r"#[0-9a-fA-F]{6}\Z")
+POWER_PROFILES = {"power-saver", "balanced", "performance"}
+LIGHTING_FIELDS = {"device", "mode", "color", "brightness", "speed", "random"}
+
+
+def bounded_text(value, field, limit):
+    if (not isinstance(value, str) or not value or len(value) > limit
+            or value != value.strip() or TEXT.fullmatch(value) is None):
+        raise ValueError(f"Invalid profile {field}")
+    return value
+
+
+def percentage(value, field):
+    if type(value) is not int or value < 0 or value > 100:
+        raise ValueError(f"Invalid lighting {field}")
+    return value
+
+
+def validate_profile(value):
+    if not isinstance(value, dict) or set(value) != {"name", "power_profile", "lighting"}:
+        raise ValueError("Invalid profile schema")
+    bounded_text(value["name"], "name", MAX_NAME)
+    if (not isinstance(value["power_profile"], str)
+            or value["power_profile"] not in POWER_PROFILES):
+        raise ValueError("Invalid power profile")
+    lighting = value["lighting"]
+    if (not isinstance(lighting, dict) or not {"device", "mode"} <= set(lighting)
+            or not set(lighting) <= LIGHTING_FIELDS):
+        raise ValueError("Invalid lighting schema")
+    bounded_text(lighting["device"], "device", 512)
+    bounded_text(lighting["mode"], "mode", 128)
+    if "color" in lighting and (not isinstance(lighting["color"], str)
+                                 or COLOR.fullmatch(lighting["color"]) is None):
+        raise ValueError("Invalid lighting color")
+    for field in ("brightness", "speed"):
+        if field in lighting:
+            percentage(lighting[field], field)
+    if "random" in lighting and type(lighting["random"]) is not bool:
+        raise ValueError("Invalid lighting random value")
+    return value
+
+
+def validate_store(value):
+    if (not isinstance(value, dict) or set(value) != {"v", "sync_theme", "profiles"}
+            or type(value["v"]) is not int or value["v"] != 1
+            or type(value["sync_theme"]) is not bool
+            or not isinstance(value["profiles"], list)
+            or len(value["profiles"]) > MAX_PROFILES):
+        raise ValueError("Invalid profiles.json schema")
+    names = set()
+    for profile in value["profiles"]:
+        validate_profile(profile)
+        if profile["name"] in names:
+            raise ValueError("Duplicate profile name")
+        names.add(profile["name"])
+    return value
+
+
+def empty_store():
+    return {"v": 1, "sync_theme": False, "profiles": []}
+
+
+def move_corrupt_store(path):
+    stem = path.with_name(path.name + ".corrupt")
+    destination = stem
+    suffix = 0
+    while True:
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            break
+        suffix += 1
+        destination = path.with_name(f"{stem.name}.{suffix}")
+    os.rename(path, destination)
+
+
+def load(path, *, recover=False):
+    try:
+        value = read_json(path)
+    except FileNotFoundError:
+        return empty_store(), False
+    except JsonFormatError:
+        if not recover:
+            raise
+        move_corrupt_store(path)
+        return empty_store(), True
+    try:
+        return validate_store(value), False
+    except (RecursionError, ValueError):
+        if not recover:
+            raise
+        move_corrupt_store(path)
+        return empty_store(), True
+
+
+def result(value, *, recovered=False):
+    answer = {"ok": True, "profiles": value["profiles"],
+              "sync_theme": value["sync_theme"]}
+    if recovered:
+        answer["recovered"] = True
+    return answer
+
+
+def clean_orphans(directory):
+    for candidate in directory.glob(".profiles-*"):
+        try:
+            metadata = candidate.lstat()
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid():
+                candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def execute(arguments):
+    if len(arguments) == 3:
+        if arguments[0] == "list" and arguments[1:] == ["", ""]:
+            arguments = ["list"]
+        elif arguments[0] in ("delete", "sync-theme") and arguments[2] == "":
+            arguments = arguments[:2]
+    valid = (arguments == ["list"]
+             or len(arguments) == 2 and arguments[0] == "delete"
+             or len(arguments) == 2 and arguments[0] == "sync-theme"
+             and arguments[1] in ("on", "off")
+             or len(arguments) == 3 and arguments[0] == "save")
+    if not valid:
+        raise ValueError("Usage: list | save <name> <json> | delete <name> | "
+                         "sync-theme on|off")
+    directory = xdg("XDG_CONFIG_HOME", ".config")
+    path = directory / "profiles.json"
+    secure_directory(directory)
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        clean_orphans(directory)
+        value, recovered = load(path, recover=True)
+        if arguments == ["list"]:
+            if recovered:
+                os.fsync(descriptor)
+            return result(value, recovered=recovered)
+        if arguments[0] == "save":
+            name = bounded_text(arguments[1], "name", MAX_NAME)
+            try:
+                profile = validate_profile(json.loads(
+                    arguments[2], object_pairs_hook=unique_object,
+                    parse_constant=parse_constant))
+            except json.JSONDecodeError as error:
+                raise ValueError("Invalid profile JSON") from error
+            if profile["name"] != name:
+                raise ValueError("Profile name does not match")
+            matches = [index for index, item in enumerate(value["profiles"])
+                       if item["name"] == name]
+            if matches:
+                value["profiles"][matches[0]] = profile
+            elif len(value["profiles"]) >= MAX_PROFILES:
+                raise ValueError(f"At most {MAX_PROFILES} profiles are allowed")
+            else:
+                value["profiles"].append(profile)
+        elif arguments[0] == "delete":
+            name = bounded_text(arguments[1], "name", MAX_NAME)
+            profiles = [item for item in value["profiles"] if item["name"] != name]
+            if len(profiles) == len(value["profiles"]):
+                raise ValueError("Profile not found")
+            value["profiles"] = profiles
+        else:
+            value["sync_theme"] = arguments[1] == "on"
+        validate_store(value)
+        atomic_write_json(path, value, prefix=".profiles-")
+        return result(value, recovered=recovered)
+    finally:
+        os.close(descriptor)
+
+
+def main():
+    try:
+        answer = execute(sys.argv[1:])
+    except (OSError, RecursionError, ValueError) as error:
+        answer = {"ok": False, "error": str(error)}
+    print(json.dumps(answer, ensure_ascii=False, allow_nan=False))
+    return 0 if answer.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

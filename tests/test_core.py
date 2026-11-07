@@ -327,7 +327,7 @@ class CoreContract(unittest.TestCase):
         result = self.client.request("hello")
         self.assertEqual(set(result), {"v", "id", "ok", "result"})
         self.assertEqual(result, {"v": 1, "id": 1, "ok": True, "result": {
-            "version": "0.1.0", "api": 1, "demo": True,
+            "version": "0.2.0", "api": 1, "demo": True,
         }})
 
     def test_contract_demo_rescan_lists_devices_and_rate_limits(self):
