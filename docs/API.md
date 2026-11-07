@@ -52,7 +52,7 @@ Events (only on a subscribed connection; no `id`):
 
 | op | params | result |
 |---|---|---|
-| `hello` | — | `{"version": "0.1.0", "api": 1, "demo": false}` |
+| `hello` | — | `{"version": "0.2.0", "api": 1, "demo": false}` |
 | `status` | — | `{"engines": [Engine], "uptime_s": 12}` |
 | `sensors` | — | `{"sensors": [Sensor], "primary": "<sensor id or empty>"}`; reads hwmon on request (results younger than 500 ms are reused), so it never needs a subscription |
 | `devices` | — | `{"devices": [Device]}` |
@@ -294,6 +294,20 @@ Mode     {name: string, speed: bool, brightness: bool,
 simulated RGB device (`demo:rgb0`, `support: "simulation-tested"`, writable).
 Demo data never touches real hardware or engines.
 
+## UI profile storage
+
+Named profiles do not add wire operations. The panel applies them through the
+existing `lighting.set` and `profile.set` requests. Profile data is stored in
+`$XDG_CONFIG_HOME/omarchy-rgb-cooling/profiles.json` with mode `0600` inside a
+mode-`0700` directory. It contains only a bounded name, RGB device settings,
+one closed-list power profile and the theme-sync boolean; it contains no fan
+settings or credentials. Writes are atomic and the maximum is 32 profiles.
+JSON configuration files are opened with `O_NOFOLLOW`, then checked with
+`fstat` on the opened descriptor; symbolic-link-based configuration layouts
+are intentionally unsupported. If `profiles.json` contains malformed JSON or
+an invalid schema, the helper moves it to `profiles.json.corrupt` (or the next
+free numbered suffix), starts with an empty store and reports the recovery.
+
 ## Footprint (what the plugin adds to a system)
 
 `bootstrap.py <plugin dir>` creates or manages these project paths. It records
@@ -314,7 +328,8 @@ line):
 
 Bootstrap also creates `$XDG_CONFIG_HOME/omarchy-rgb-cooling/` for user
 settings, but deliberately does not put that user-data directory in the
-ledger. When installed content changes, it runs `systemctl --user
+ledger. The UI may add `labels.json`, `devices.json` and `profiles.json` there.
+When installed content changes, it runs `systemctl --user
 daemon-reload`, `enable --now omarchy-rgb-cooling.socket`, and `try-restart
 omarchy-rgb-cooling.service`. The core service remains socket-activated; it is
 not enabled as a persistent service. Bootstrap prints one JSON line:
@@ -325,9 +340,9 @@ not enabled as a persistent service. Bootstrap prints one JSON line:
 pkexec), removes the plugin through `omarchy plugin remove`, every path in the
 ledger plus the fixed list above, `$XDG_STATE_HOME/omarchy-rgb-cooling`, the
 runtime socket and the user settings in `$XDG_CONFIG_HOME/omarchy-rgb-cooling`
-(sensor names, enabled devices). `uninstall.sh --keep-settings` keeps those
-settings. Nothing outside these paths is touched, and only the engines step
-needs a password.
+(sensor names, enabled devices, profiles and theme-sync preference).
+`uninstall.sh --keep-settings` keeps those settings. Nothing outside these
+paths is touched, and only the engines step needs a password.
 
 Tests drive `bootstrap.py` and `uninstall.sh` in a throwaway `HOME` with stub
 `systemctl` and `omarchy` executables first on `PATH`.

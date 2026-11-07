@@ -8,7 +8,9 @@ documentation differ.
 
 | Component | Responsibility | Boundary |
 |---|---|---|
-| `RgbCooling.qml` | Renders the bar widget and the Cooling, Lighting, and Engines tabs; connects to the local API; stores user labels and enabled-device choices | Runs as the logged-in user and does not access hardware directly |
+| `RgbCooling.qml` | Renders the bar widget and tabs, connects to the local API, and coordinates profiles | Runs as the logged-in user and does not access hardware directly |
+| `ProfilesTab.qml` | Saves, applies, and deletes named RGB and power-mode combinations | Never stores or sends fan/PWM settings |
+| `omarchy-rgb-profiles` | Validates and atomically stores the bounded per-user profile file | Mode `0600` data in a mode `0700` XDG config directory |
 | `omarchy-rgb-cooling.socket` | Creates `$XDG_RUNTIME_DIR/omarchy-rgb-cooling.sock` for socket activation | Unix stream socket, mode `0600`, `Accept=no` |
 | `rgbcd` | Validates API requests, reads sensors, exposes adapters, and coordinates power profiles and subscriptions | Unprivileged `systemd --user` service with a hardened unit |
 | `Hwmon` / `SensorSource` | Reads temperatures and fan RPM from sysfs and builds stable sensor records | Read-only; PWM files and hardware registers are not written |
@@ -67,6 +69,37 @@ Power profiles affect CPU power and heat generation. They do not implement
 fan curves, and the Silent, Balanced, and Turbo UI names do not mean direct
 fan control.
 
+### Named profiles and theme colour
+
+The Profiles tab combines the selected device's current OpenRGB settings with
+one of the three validated system power modes. It calls
+`omarchy-rgb-profiles` with a closed action list to save, list, delete, or
+toggle `sync-theme` for at most 32 profiles. Names are 1–48 characters. The
+helper rejects unknown fields, duplicate JSON keys, non-finite or out-of-range
+values, links and oversized files. JSON files are opened with `O_NOFOLLOW` and
+checked with `fstat` on the opened descriptor, so symlink-based configuration
+layouts are intentionally unsupported. A malformed or schema-invalid profile
+store is moved to a `.corrupt` backup and reset with a warning. Orphaned
+`.profiles-*` staging files are removed while holding the store lock. The
+helper atomically replaces
+`$XDG_CONFIG_HOME/omarchy-rgb-cooling/profiles.json`; the directory is mode
+`0700` and the file mode `0600`.
+
+Applying a profile uses the existing `lighting.set` and `profile.set` API
+operations. There is no cooling operation: firmware or CoolerControl remains
+responsible for fan curves and PWM.
+
+Theme-colour sync is optional and stored off by default. Its source is
+`Commons.Color.accent`. The current shell implementation in
+`/usr/share/omarchy/shell/Commons/Color.qml` loads that role from
+`$HOME/.local/state/omarchy/current/theme/colors.toml`; it does not consult
+`XDG_STATE_HOME`. QML reacts to the singleton's change notification when
+Omarchy applies a theme; it has no polling timer. If the accent role is absent,
+the panel foreground is the fallback. When sync is on, the live theme colour
+overrides the saved profile colour and disables random colour when the mode
+supports it. The device, mode, brightness, speed and system power mode keep
+their saved values.
+
 ### Lighting discovery and control
 
 Normal discovery reads connected USB HID identities and OpenRGB's packaged
@@ -117,8 +150,7 @@ installed it.
 ## Non-goals and write limits
 
 - No PWM fan control: the project does not write `pwm*`, change fan curves, or
-  write hardware registers. Fan control remains in firmware or a separate
-  cooling engine.
+  write hardware registers. Fan control remains in firmware or CoolerControl.
 - No general hardware-control proxy: API v1 exposes only the operations in
   [API.md](API.md).
 - No broad OpenRGB discovery: the sandbox omits I2C/SMBus and all USB HID

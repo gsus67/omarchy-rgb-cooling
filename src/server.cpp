@@ -128,7 +128,7 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
     const auto &op = request.operation;
     const auto &params = request.params;
     if (op == "hello") {
-        reply.result = {{"version", "0.1.0"}, {"api", 1}, {"demo", demo}};
+        reply.result = {{"version", "0.2.0"}, {"api", 1}, {"demo", demo}};
     } else if (op == "status") {
         reply.result = {{"engines", QJsonArray{adapter->engine()}},
                         {"uptime_s", clock.elapsed() / 1000}};

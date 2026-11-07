@@ -14,11 +14,20 @@ in the **Lighting** tab. Colour, brightness, effects, speed, and random colour a
 sent to supported devices. A device is only told to store them with **Save to
 device**, though some keep the last setting on their own. OpenRGB runs sandboxed.
 
+The **Profiles** tab stores up to 32 named combinations of the current RGB
+settings and system power mode. Applying one reuses the same guarded OpenRGB
+and `power-profiles-daemon` paths; it never writes fan or PWM settings.
+Optional theme-colour sync is off by default and follows Omarchy theme-change
+events instead of polling. When enabled, the theme colour overrides a saved
+profile's colour, disables random colour, and keeps the compatible saved
+settings.
+
 ## Scope
 
 - Reads hwmon temperatures and fan RPM as the logged-in user.
 - Does not write PWM or hardware registers and never runs as root. Packages
-  are installed only from the Engines tab, from a closed list, with your password.
+  are installed only from the Engines tab, from a closed list, with your
+  password. Cooling profiles and curves belong to BIOS or CoolerControl.
 - Uses a socket-activated `systemd --user` core. `power-profiles-daemon` is
   optional; power modes are unavailable without it.
 
@@ -52,9 +61,10 @@ bash ~/.config/omarchy/plugins/io.github.gsus67.omarchy-rgb-cooling/uninstall.sh
 
 This removes the plugin checkout, its user units, the built core, its state,
 the runtime socket, your settings in `$XDG_CONFIG_HOME/omarchy-rgb-cooling/`
-(sensor names, enabled devices) and the engines it installed (it asks for your
-password; packages you had before are never removed). Add `--keep-settings` to
-keep your settings. See [API and footprint](docs/API.md#footprint-what-the-plugin-adds-to-a-system).
+(sensor names, enabled devices, profiles and theme-sync preference) and the
+engines it installed (it asks for your password; packages you had before are
+never removed). Add `--keep-settings` to keep your settings. See
+[API and footprint](docs/API.md#footprint-what-the-plugin-adds-to-a-system).
 
 ## Optional hardware setup
 

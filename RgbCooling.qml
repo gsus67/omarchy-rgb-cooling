@@ -130,8 +130,14 @@ Panel {
     function part(v) { var s = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16); return s.length < 2 ? "0" + s : s }
     return "#" + part(c.r) + part(c.g) + part(c.b)
   }
+  // Omarchy updates this singleton when its theme event is applied. Older
+  // shells without an accent role fall back to the panel foreground.
+  readonly property var themeAccent: Commons.Color.accent === undefined
+                                     || Commons.Color.accent === null
+                                   ? bar.foreground : Commons.Color.accent
+  onThemeAccentChanged: root.applyThemeColor()
   readonly property var swatches: [
-    { label: t("Theme"), color: hex(Commons.Color.accent) },
+    { label: t("Theme"), color: hex(themeAccent) },
     { label: t("White"), color: "#ffffff" },
     { label: t("Red"), color: "#ff0000" },
     { label: t("Orange"), color: "#ff6000" },
@@ -291,7 +297,10 @@ Panel {
     }
   }
 
-  Component.onCompleted: bootstrapProc.running = true
+  Component.onCompleted: {
+    bootstrapProc.running = true
+    runProfiles("list", "", "")
+  }
 
   Socket {
     id: socket
@@ -363,11 +372,13 @@ Panel {
   readonly property var tabs: [
     { value: "cooling", label: t("Cooling") },
     { value: "lighting", label: t("Lighting") },
+    { value: "profiles", label: t("Profiles") },
     { value: "engines", label: t("Engines") }
   ]
   onTabChanged: {
     if (tab === "engines") refreshEngines()
     if (tab === "lighting" && coreReady) scan()
+    if (tab === "profiles") runProfiles("list", "", "")
   }
 
   // ---- engines (docs/API.md, "Engines") ----------------------------------
@@ -512,6 +523,139 @@ Panel {
     })
   }
 
+  // ---- saved profiles ----------------------------------------------------
+  // Storage is delegated to a fixed helper. Applying reuses the closed
+  // lighting.* and profile.* API operations; no cooling/PWM operation exists.
+
+  readonly property string profilesHelper: pluginDirectory + "/bin/omarchy-rgb-profiles"
+  readonly property var profilesActions: ["list", "save", "delete", "sync-theme"]
+  property string profilesAction: "list"
+  property string profileArgument: ""
+  property string profilePayload: ""
+  property var savedProfiles: []
+  property bool syncTheme: false
+  property string profilesMessage: ""
+  readonly property bool profilesBusy: profilesProc.running
+
+  function runProfiles(action, argument, payload) {
+    if (profilesProc.running || profilesActions.indexOf(action) < 0) return
+    profilesAction = action
+    profileArgument = String(argument || "")
+    profilePayload = String(payload || "")
+    profilesProc.running = true
+  }
+
+  function handleProfilesResult(code, output) {
+    var answer = null
+    try { answer = JSON.parse(String(output).trim().split("\n").pop()) } catch (e) {}
+    if (code !== 0 || !answer || answer.ok !== true) {
+      profilesMessage = t("The profile operation did not finish.")
+      return
+    }
+    savedProfiles = Array.isArray(answer.profiles) ? answer.profiles : []
+    syncTheme = answer.sync_theme === true
+    if (answer.recovered === true) profilesMessage = t("Corrupt profile data was moved aside and reset.")
+    else if (profilesAction === "save") profilesMessage = t("Profile saved.")
+    else if (profilesAction === "delete") profilesMessage = t("Profile deleted.")
+    else profilesMessage = ""
+    if (syncTheme && (profilesAction === "list" || profilesAction === "sync-theme")) applyThemeColor()
+  }
+
+  function saveCurrentProfile(name) {
+    name = String(name || "")
+    if (name.length < 1 || name.length > 48 || name !== name.trim()
+        || /[\x00-\x1f\x7f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(name)) {
+      profilesMessage = t("Use a name of 1–48 characters without control characters.")
+      return
+    }
+    if (lighting === null || selectedDevice === "" || profilesAvailable.indexOf(profile) < 0) {
+      profilesMessage = t("Choose an available lighting device and power mode first.")
+      return
+    }
+    var rgb = { device: selectedDevice, mode: String(lighting.mode || "") }
+    if (/^#[0-9a-fA-F]{6}$/.test(String(lighting.color || ""))) rgb.color = String(lighting.color)
+    if (Number.isInteger(lighting.brightness)) rgb.brightness = lighting.brightness
+    if (Number.isInteger(lighting.speed)) rgb.speed = lighting.speed
+    if (typeof lighting.random === "boolean") rgb.random = lighting.random
+    var value = { name: name, power_profile: profile, lighting: rgb }
+    runProfiles("save", name, JSON.stringify(value))
+  }
+
+  function deleteSavedProfile(name) { runProfiles("delete", name, "") }
+  function setThemeSync(enabled) {
+    runProfiles("sync-theme", enabled === true ? "on" : "off", "")
+  }
+
+  function filterLightingChanges(changes, modes) {
+    var filtered = {}
+    for (var key in changes) filtered[key] = changes[key]
+    if (filtered.mode === undefined) return filtered
+    var mode = null
+    var available = Array.isArray(modes) ? modes : []
+    for (var i = 0; i < available.length; i++)
+      if (available[i].name === filtered.mode) mode = available[i]
+    if (mode === null || mode.color !== "single") delete filtered.color
+    if (mode === null || !mode.speed) delete filtered.speed
+    if (mode === null || !mode.brightness) delete filtered.brightness
+    if (mode === null || !mode.random) delete filtered.random
+    return filtered
+  }
+
+  function applySavedProfile(value) {
+    if (!value || !value.lighting || profilesAvailable.indexOf(value.power_profile) < 0) {
+      profilesMessage = t("This profile's power mode is not available.")
+      return
+    }
+    var target = null
+    for (var i = 0; i < lightingDevices.length; i++)
+      if (lightingDevices[i].id === value.lighting.device
+          && lightingDevices[i].writable === true) target = lightingDevices[i]
+    if (target === null) {
+      profilesMessage = t("This profile's lighting device is not available.")
+      return
+    }
+    var params = { device: value.lighting.device, mode: value.lighting.mode }
+    var fields = ["color", "brightness", "speed", "random"]
+    for (var fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
+      var field = fields[fieldIndex]
+      if (value.lighting[field] !== undefined) params[field] = value.lighting[field]
+    }
+    params = root.filterLightingChanges(params, target.modes)
+    profilesMessage = t("Applying profile…")
+    send("lighting.set", params, function(ok, result) {
+      if (!ok) { root.profilesMessage = String(result.message || root.t("Lighting could not be applied.")); return }
+      root.selectedDevice = params.device
+      root.lighting = result
+      root.send("profile.set", { profile: value.power_profile }, function(powerOk, powerResult) {
+        if (!powerOk) {
+          root.profilesMessage = root.t("Lighting was applied, but the power mode could not be applied.")
+          return
+        }
+        root.applyProfile(powerResult)
+        root.profilesMessage = root.t("Profile applied.")
+        if (root.syncTheme) Qt.callLater(root.applyThemeColor)
+      })
+    })
+  }
+
+  function applyThemeColor() {
+    if (!syncTheme || !canWrite || lighting === null || currentMode === null
+        || currentMode.color !== "single") return
+    var color = hex(themeAccent)
+    if (String(lighting.color || "").toLowerCase() === color
+        && lighting.random !== true) return
+    var changes = { color: color }
+    if (currentMode.random === true) changes.random = false
+    setLighting(changes)
+  }
+
+  Process {
+    id: profilesProc
+    command: [root.profilesHelper, root.profilesAction, root.profileArgument, root.profilePayload]
+    stdout: StdioCollector { id: profilesOut; waitForEnd: true }
+    onExited: function(code) { root.handleProfilesResult(code, profilesOut.text) }
+  }
+
   // ---- lighting -----------------------------------------------------------
   // Changes are merged and sent after a short pause, so dragging the colour
   // picker or a slider produces a handful of writes instead of hundreds.
@@ -526,7 +670,10 @@ Panel {
     var device = selectedDevice
     send("lighting.get", { device: device }, function(ok, r) {
       if (device !== root.selectedDevice) return
-      if (ok) root.lighting = r
+      if (ok) {
+        root.lighting = r
+        if (root.syncTheme) Qt.callLater(root.applyThemeColor)
+      }
       else root.lightingError = String(r.message || "")
     })
   }
@@ -544,14 +691,7 @@ Panel {
     for (var key in pendingLighting) merged[key] = pendingLighting[key]
     for (var name in changes) merged[name] = changes[name]
     // A new effect may not take a colour or a speed: drop what it cannot use.
-    if (merged.mode !== undefined) {
-      var mode = null
-      for (var i = 0; i < currentModes.length; i++) if (currentModes[i].name === merged.mode) mode = currentModes[i]
-      if (mode && mode.color !== "single") delete merged.color
-      if (mode && !mode.speed) delete merged.speed
-      if (mode && !mode.brightness) delete merged.brightness
-      if (mode && !mode.random) delete merged.random
-    }
+    merged = filterLightingChanges(merged, currentModes)
     pendingLighting = merged
     // Show the change at once; the core's reply replaces it.
     var preview = {}
@@ -896,6 +1036,12 @@ Panel {
           // Lighting
           LightingTab {
             visible: root.tab === "lighting" && root.coreReady
+            width: parent.width
+            panel: root
+          }
+
+          ProfilesTab {
+            visible: root.tab === "profiles"
             width: parent.width
             panel: root
           }

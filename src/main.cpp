@@ -13,7 +13,7 @@ int main(int argc, char **argv)
     ::umask(0077);
     QCoreApplication application(argc, argv);
     QCoreApplication::setApplicationName("rgbcd");
-    QCoreApplication::setApplicationVersion("0.1.0");
+    QCoreApplication::setApplicationVersion("0.2.0");
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addVersionOption();

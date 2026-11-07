@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP_COMMAND = ('["python3", root.pluginDirectory + "/bootstrap.py", '
                      'root.pluginDirectory]')
 ENGINES_COMMAND = '[root.enginesHelper, root.engineAction, "openrgb"]'
+PROFILES_COMMAND = ('[root.profilesHelper, root.profilesAction, '
+                    'root.profileArgument, root.profilePayload]')
 QML_FILES = sorted(path for path in ROOT.rglob("*.qml") if ".git" not in path.parts)
 # Elements that interpret markup unless told otherwise.
 TEXT_ELEMENTS = ("Text", "TextEdit", "Label", "Controls.Label", "Controls.TextArea", "TextArea")
@@ -33,6 +35,28 @@ def text_blocks(source):
             if depth <= 0:
                 break
         yield index + 1, match.group(2), "\n".join(block)
+
+
+def qml_blocks(source, opening):
+    """Return balanced QML/JavaScript blocks whose first line matches opening."""
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if re.search(opening, line) is None:
+            continue
+        depth, block = 0, []
+        for current in lines[index:]:
+            block.append(current)
+            depth += current.count("{") - current.count("}")
+            if depth <= 0:
+                break
+        yield "\n".join(block)
+
+
+def qml_function(source, name):
+    blocks = list(qml_blocks(source, rf"^\s*function\s+{re.escape(name)}\s*\("))
+    if len(blocks) != 1:
+        raise AssertionError(f"expected one QML function named {name}, found {len(blocks)}")
+    return blocks[0]
 
 
 class QmlSecurityTest(unittest.TestCase):
@@ -63,8 +87,8 @@ class QmlSecurityTest(unittest.TestCase):
                                         f"{path.name}:{number} references a remote URL")
 
     def test_only_known_processes(self):
-        """The panel runs only bootstrap and the engines helper, with fixed arguments."""
-        allowed = {BOOTSTRAP_COMMAND, ENGINES_COMMAND}
+        """The panel runs only fixed project helpers with fixed argument slots."""
+        allowed = {BOOTSTRAP_COMMAND, ENGINES_COMMAND, PROFILES_COMMAND}
         for path in QML_FILES:
             source = path.read_text()
             with self.subTest(file=path.name):
@@ -85,6 +109,76 @@ class QmlSecurityTest(unittest.TestCase):
                       source)
         self.assertIn('readonly property string enginesHelper: pluginDirectory '
                       '+ "/bin/omarchy-rgb-engines"', source)
+
+    def test_profile_helper_actions_are_a_closed_list(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        self.assertIn(
+            'readonly property var profilesActions: ["list", "save", "delete", "sync-theme"]',
+            source,
+        )
+        self.assertIn(
+            "if (profilesProc.running || profilesActions.indexOf(action) < 0) return",
+            source,
+        )
+        self.assertIn(
+            'readonly property string profilesHelper: pluginDirectory '
+            '+ "/bin/omarchy-rgb-profiles"',
+            source,
+        )
+
+    def test_theme_sync_is_event_driven_and_off_by_default(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        self.assertIn("property bool syncTheme: false", source)
+        self.assertIn("onThemeAccentChanged: root.applyThemeColor()", source)
+        timers = list(qml_blocks(source, r"^\s*Timer\s*\{"))
+        self.assertTrue(timers)
+        for timer in timers:
+            self.assertNotIn("applyThemeColor", timer)
+
+    def test_profile_apply_filters_fields_through_mode_capabilities(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        filtering = qml_function(source, "filterLightingChanges")
+        for condition in (
+            'mode.color !== "single"',
+            "!mode.speed",
+            "!mode.brightness",
+            "!mode.random",
+        ):
+            self.assertIn(condition, filtering)
+        self.assertIn(
+            "params = root.filterLightingChanges(params, target.modes)",
+            qml_function(source, "applySavedProfile"),
+        )
+        self.assertIn(
+            "merged = filterLightingChanges(merged, currentModes)",
+            qml_function(source, "setLighting"),
+        )
+
+    def test_profile_list_applies_saved_theme_sync_after_startup(self):
+        handler = qml_function((ROOT / "RgbCooling.qml").read_text(),
+                               "handleProfilesResult")
+        self.assertRegex(
+            handler,
+            r'profilesAction === "list"[\s\S]*?profilesAction === "sync-theme"'
+            r'[\s\S]*?applyThemeColor\(\)',
+        )
+
+    def test_profile_apply_reports_partial_state(self):
+        apply_profile = qml_function((ROOT / "RgbCooling.qml").read_text(),
+                                     "applySavedProfile")
+        self.assertIn(
+            "Lighting was applied, but the power mode could not be applied.",
+            apply_profile,
+        )
+
+    def test_profile_helper_errors_are_localized_before_display(self):
+        source = (ROOT / "RgbCooling.qml").read_text()
+        handler = qml_function(source, "handleProfilesResult")
+        self.assertIn(
+            'profilesMessage = t("The profile operation did not finish.")',
+            handler,
+        )
+        self.assertNotIn("answer.error", handler)
 
     def test_engine_install_requires_explicit_confirmation(self):
         source = (ROOT / "RgbCooling.qml").read_text()
