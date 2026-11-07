@@ -1,6 +1,7 @@
 # Changelog
 
-Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Changes are documented under
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.1.0] - unreleased
 
@@ -17,9 +18,11 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 - Panel tabs: Cooling, Lighting, Engines.
 - `uninstall.sh` removes settings by default; `--keep-settings` keeps them.
 
-- Socket-activated, unprivileged C++20 core with hwmon temperature and fan RPM readings.
+- Socket-activated, unprivileged C++20 core with hwmon temperature and fan RPM
+  readings.
 - Omarchy bar widget and sensor panel, including user-defined sensor names.
-- Silent, Balanced, and Turbo power-profile selection through `power-profiles-daemon`.
+- Silent, Balanced, and Turbo power-profile selection through
+  `power-profiles-daemon`.
 - Motherboard fan labels from an exact-board verified table.
 - Optional demo mode and OpenRGB device discovery; RGB writes require explicit
   per-device enablement.
@@ -27,6 +30,8 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 - Security baseline, hardware inventory, and MSI B760 fan-control research.
 - Architecture and lighting backend documentation.
 - Installation and hardware-support documentation.
+- License inventory for 12 direct and 339 required transitive runtime and build
+  dependencies, verified against local package metadata.
 
 ### Changed
 
