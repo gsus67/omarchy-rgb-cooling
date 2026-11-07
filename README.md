@@ -109,7 +109,7 @@ Support advances through four evidence levels:
 
 | Hardware tested | Physical result |
 |---|---|
-| MSI B760 GAMING PLUS WIFI (MS-7D98), NCT6687D | Temperature and fan RPM readings; verified fan header names. |
+| MSI B760 GAMING PLUS WIFI (MS-7D98), NCT6687D | Temperature and fan RPM readings; user-verified header table, with `fan5`/`fan6` physically observed as `SYS_FAN3`/`SYS_FAN4`. |
 | Same system, power profiles | Silent, Balanced, and Turbo selection through `power-profiles-daemon`; BIOS retains fan control. |
 
 Other devices may have a lower support level. See
@@ -118,6 +118,8 @@ Other devices may have a lower support level. See
 
 ## Documentation
 
+- [Installation](docs/INSTALLATION.md)
+- [Hardware support](docs/HARDWARE_SUPPORT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Lighting backends](docs/BACKENDS.md)
 - [API and footprint](docs/API.md)

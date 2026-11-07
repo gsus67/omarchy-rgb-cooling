@@ -26,6 +26,7 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
 - User-level install footprint tracking and uninstall support.
 - Security baseline, hardware inventory, and MSI B760 fan-control research.
 - Architecture and lighting backend documentation.
+- Installation and hardware-support documentation.
 
 ### Changed
 
