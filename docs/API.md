@@ -61,7 +61,8 @@ Events (only on a subscribed connection; no `id`):
 | `profile.get` | — | `{"profile": "power-saver"\|"balanced"\|"performance", "available": ["..."], "degraded": ""}`; `unavailable` if power-profiles-daemon is not running |
 | `profile.set` | `{"profile": "power-saver"\|"balanced"\|"performance"}` | same as `profile.get` after the change; the profile must be in `available`; rate limited to 2 per second per connection |
 | `lighting.get` | `{"device": "<id>"}` | `Lighting` |
-| `lighting.set` | `{"device": "<id>", "color": "#rrggbb", "brightness": 0-100}` | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
+| `lighting.set` | `{"device": "<id>", "mode": "<mode name>", "color": "#rrggbb", "brightness": 0-100, "speed": 0-100, "random": bool}` (only `device` is required; omitted fields keep their current value) | `Lighting` after applying; `blocked` / `unsupported` / `unavailable` otherwise |
+| `lighting.save` | `{"device": "<id>"}` | `Lighting` with `saved: true` after `SAVEMODE`; `unsupported` if the mode cannot be saved; `rate_limited` if the device was saved less than 10 s ago |
 
 `lighting.set` is rate limited to 10 per second per connection.
 
@@ -160,9 +161,24 @@ once per scan), never `0416:5302`. Candidates appear in `devices` with
 only starts once at least one device is enabled, and it sees only those.
 
 rgbcd starts the unit through the systemd user manager on D-Bus
-(`StartUnit`) only when a scan or lighting operation needs OpenRGB, and stops
-it (`StopUnit`) after 120 s without lighting activity or panel subscribers. No
-polling, no retries.
+(`StartUnit`) only when a scan or lighting operation needs OpenRGB. After a
+successful start, an asynchronous, bounded startup wait retries the SDK connection
+every 250 ms for at most 10 s while OpenRGB detects hardware. Pending `devices`,
+`devices.rescan` and `lighting.*` requests wait for the real scan result; a
+successful scan also emits a `devices` event. If the deadline expires, the engine
+becomes `unreachable` with an explicit reason and makes no further attempts until
+another operation requests a scan; there is no background polling.
+Udev re-enumeration of an enabled USB device is debounced for 1 s and
+asynchronously restarts the unit to refresh sandbox HID nodes, reporting
+“Device reconnected; restarting OpenRGB” while deferring lighting writes for up
+to 15 s and retrying an unacknowledged write once (acknowledged writes are never
+replayed).
+
+rgbcd stops the unit (`StopUnit`) after 120 s without lighting activity or
+subscribers to `devices` (the open panel). Only `lighting.get`, `lighting.set`
+and `devices` subscriptions count as use; `sensors` and `profile` subscriptions
+do not keep OpenRGB running. The 120 s deadline restarts when the last `devices`
+subscriber unsubscribes or disconnects, or on lighting activity.
 
 ### Enabling RGB control per device
 
@@ -186,6 +202,35 @@ mode-specific colours it travels inside `UPDATEMODE`. rgbcd never sends
 `SAVEMODE`, `SETCUSTOMMODE`, `UPDATEZONELEDS`, zone resizes, or LED buffers
 with different colours, and re-reads the controller to confirm the change.
 
+### Effects and saving to the device
+
+`modes` lists the controller's OpenRGB modes in OpenRGB's order, except
+`Direct` (software per-LED streaming, not a panel effect). Flags map as:
+`speed` = `MODE_FLAG_HAS_SPEED`; `brightness` = `MODE_FLAG_HAS_BRIGHTNESS`;
+`color: "single"` when the mode takes per-LED or mode-specific colours,
+`"none"` when it only animates its own colours; `random` =
+`MODE_FLAG_HAS_RANDOM_COLOR`; `savable` = `MODE_FLAG_MANUAL_SAVE` or
+`MODE_FLAG_AUTOMATIC_SAVE`.
+
+`lighting.set` validates every field against the chosen mode (a colour for a
+`"none"` mode, a speed for a mode without speed, `random` without the flag are
+`bad_request`). `speed` and `brightness` are 0-100 on the API and mapped onto
+the mode's own range (rounded; reversed when OpenRGB's minimum is larger than
+its maximum). The write is `UPDATEMODE` with the chosen mode, then, only when
+the mode uses per-LED colours and a colour is set, `UPDATELEDS` with that same
+colour for every LED. `random: true` selects `MODE_COLORS_RANDOM`.
+
+`lighting.save` sends `SAVEMODE` for the active mode exactly as last applied,
+only when the user presses the panel's **Save to device** button. It writes the
+device's own memory, so the effect survives OpenRGB stopping and reboots; it is
+never sent automatically and is limited to once per 10 s per device.
+
+`saved` is false after any `lighting.set` until the next `lighting.save`
+(true at start: nothing has been changed yet). Many devices, such as MSI
+Mystic Light, fall back to their saved state when OpenRGB stops, so the idle
+stop only happens when every enabled device is `saved`; with unsaved changes
+OpenRGB keeps running and the panel says so.
+
 ### Engine scans (no background polling)
 
 rgbcd never polls engines on its own. An engine is contacted only by:
@@ -196,7 +241,8 @@ rgbcd never polls engines on its own. An engine is contacted only by:
 - a udev hotplug event while some connection is subscribed to `devices`.
 
 A failed scan leaves the engine `absent` or `unreachable` until the next one;
-there are no automatic retries. The UI subscribes to `devices` only while the
+there are no retries after the bounded startup wait described above.
+The UI subscribes to `devices` only while the
 panel is open, so with the panel closed nothing contacts OpenRGB.
 
 ### Types
@@ -207,9 +253,12 @@ Sensor   {id: string, label: string, device: string, kind: "temp"|"fan",
           value: number|null, unit: "C"|"rpm", source: "hwmon"|"demo", stale: bool}
 Device   {id: string, name: string, vendor: string, engine: string,
           support: "recognized"|"upstream-supported"|"simulation-tested"|"physically-tested",
-          writable: bool, blocked_reason: string, excluded: bool,
+          writable: bool, blocked_reason: string, excluded: bool, modes: [Mode],
           capabilities: ["lighting.read", "lighting.write", "brightness"]}
-Lighting {device: string, color: "#rrggbb", brightness: 0-100, brightness_emulated: bool}
+Lighting {device: string, mode: string, color: "#rrggbb", brightness: 0-100,
+          brightness_emulated: bool, speed: 0-100 | null, random: bool, saved: bool}
+Mode     {name: string, speed: bool, brightness: bool,
+          color: "single" | "none", random: bool, savable: bool}
 ```
 
 - `device` is a short human name for the physical device, never a sysfs path:

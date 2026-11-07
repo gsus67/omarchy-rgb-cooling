@@ -102,14 +102,17 @@ def uninstall(path, value, name):
 
 
 def execute(arguments):
+    # The panel always passes the engine name, so `status openrgb` is accepted
+    # too; any name must still come from the closed ENGINES list.
     valid = (arguments in (["status"], ["uninstall-all"])
-             or len(arguments) == 2 and arguments[0] in ("install", "uninstall")
+             or len(arguments) == 2 and arguments[0] in ("status", "install", "uninstall")
              and arguments[1] in ENGINES)
     if not valid:
-        raise ValueError("Usage: status | install openrgb | uninstall openrgb | uninstall-all")
+        raise ValueError("Usage: status [openrgb] | install openrgb | uninstall openrgb"
+                         " | uninstall-all")
     state = xdg("XDG_STATE_HOME", ".local/state")
     path = state / "engines.json"
-    if arguments == ["status"]:
+    if arguments[0] == "status":
         return status(record(path))
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Lock the directory, leaving no extra persistent lock file.

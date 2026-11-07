@@ -122,7 +122,7 @@ UsbDevices UsbDevices::scan(const QString &root, const QString &rules)
             {"enabled", optedIn}, {"writable", false}, {"excluded", false},
             {"blocked_reason", optedIn ? "OpenRGB unit has not provided this controller"
                                       : "RGB control is disabled for this device"},
-            {"capabilities", QJsonArray{}}});
+            {"modes", QJsonArray{}}, {"capabilities", QJsonArray{}}});
     }
     return result;
 }

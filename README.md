@@ -10,9 +10,9 @@ exact-board entry is verified in [`data/fan-headers.json`](data/fan-headers.json
 
 RGB: install the engine your hardware needs from the panel's **Engines** tab
 (one button, your password through the Omarchy dialog), then enable each device
-in the **Lighting** tab. Only a static colour and brightness are sent, nothing
-is saved to the device, and OpenRGB runs sandboxed seeing only the devices you
-enabled.
+in the **Lighting** tab. Colour, brightness, effects, speed, and random colour are
+sent to supported devices. A device is only told to store them with **Save to
+device**, though some keep the last setting on their own. OpenRGB runs sandboxed.
 
 ## Scope
 

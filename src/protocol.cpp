@@ -29,7 +29,7 @@ bool integer(const QJsonValue &value)
 }
 
 namespace {
-enum class Type { Device, Color, Brightness, Topics, Interval, Profile };
+enum class Type { Device, Color, Brightness, Random, Topics, Interval, Profile };
 struct Field {
     const char *name;
     Type type;
@@ -39,6 +39,8 @@ struct Field {
 bool matches(const QJsonValue &value, Type type)
 {
     switch (type) {
+    case Type::Random:
+        return value.isBool();
     case Type::Profile:
         return value.isString() && (value == "power-saver" || value == "balanced"
                                     || value == "performance");
@@ -76,8 +78,10 @@ Reply validate(const QString &operation, const QJsonObject &params)
         {"profile.set", {{"profile", Type::Profile}}},
         {"subscribe", {{"topics", Type::Topics}, {"interval_ms", Type::Interval, false}}},
         {"lighting.get", {{"device", Type::Device}}},
-        {"lighting.set", {{"device", Type::Device}, {"color", Type::Color},
-                          {"brightness", Type::Brightness}}}
+        {"lighting.save", {{"device", Type::Device}}},
+        {"lighting.set", {{"device", Type::Device}, {"mode", Type::Device, false},
+                          {"color", Type::Color, false}, {"brightness", Type::Brightness, false},
+                          {"speed", Type::Brightness, false}, {"random", Type::Random, false}}}
     };
     const auto schema = schemas.constFind(operation);
     if (schema == schemas.cend()) {
@@ -127,7 +131,8 @@ Reply parse(const QByteArray &line, Request &request)
     request.operation = object.value("op").toString();
     request.params = object.value("params").toObject();
     const auto validation = validate(request.operation, request.params);
-    if (validation.ok() && request.operation == "lighting.set") {
+    if (validation.ok() && request.operation == "lighting.set"
+        && request.params.contains("color")) {
         request.params.insert("color", request.params.value("color").toString().toLower());
     }
     return validation;

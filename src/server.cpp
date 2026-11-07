@@ -42,11 +42,9 @@ void Server::initializeAdapters()
     } else {
         adapter = std::make_unique<OpenRgbAdapter>([this] { devicesChanged(); },
                                                    sysRoot, openrgbRules);
-        hotplug = std::make_unique<Hotplug>([this] {
+        hotplug = std::make_unique<Hotplug>([this](const auto &events) {
             sensorSource.invalidate();
-            if (deviceSubscriber) {
-                static_cast<OpenRgbAdapter *>(adapter.get())->refresh();
-            }
+            static_cast<OpenRgbAdapter *>(adapter.get())->hotplug(events, deviceSubscriber);
         });
     }
 }
@@ -173,7 +171,7 @@ void Server::dispatch(Connection *connection, const Protocol::Request &request)
         connection->subscriptionChanged();
         subscriptionsChanged();
     } else if (op == "devices" || op == "devices.rescan"
-               || op == "lighting.get" || op == "lighting.set") {
+               || op == "lighting.get" || op == "lighting.set" || op == "lighting.save") {
         dispatchLighting(connection, request);
         return;
     } else {
@@ -196,11 +194,7 @@ void Server::subscriptionsChanged()
     }
     powerProfiles.setSubscribed(profileSubscriber);
     if (!demo && adapter) {
-        bool subscribed = false;
-        for (const auto *client : clients) {
-            subscribed = subscribed || !client->topics.isEmpty();
-        }
-        static_cast<OpenRgbAdapter *>(adapter.get())->setSubscribed(subscribed);
+        static_cast<OpenRgbAdapter *>(adapter.get())->setSubscribed(deviceSubscriber);
     }
     scheduleEvents();
 }
