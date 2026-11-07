@@ -53,12 +53,21 @@ root = Path(os.environ['RGB_TEST_HOME'])
 args = sys.argv[1:]
 with (root/'log').open('a') as log:
     log.write(json.dumps(['pacman', *args])+'\\n')
+database = root/'packages.json'
+packages = json.loads(database.read_text()) if database.exists() else {}
 if args[0] == '-Q':
-    if not (root/'installed').exists():
+    if args[1] not in packages:
         sys.exit(1)
-    print('openrgb 1.1-1')
+    print(args[1] + ' 1.1-1')
+elif args[0] == '-Qi':
+    package = args[-1]
+    if package not in packages:
+        sys.exit(1)
+    required = packages[package]
+    print('Name            : ' + package)
+    print('Required By     : ' + ('  '.join(required) if required else 'None'))
 else:
-    if not (root/'installed').exists():
+    if 'openrgb' not in packages:
         print('new-dependency\\nopenrgb')
 ''')
         self.stub("pkexec", '''
@@ -69,10 +78,31 @@ with (root/'log').open('a') as log:
     log.write(json.dumps(['pkexec', *sys.argv[1:]])+'\\n')
 if os.environ.get('CANCEL'):
     sys.exit(126)
+database = root/'packages.json'
+packages = json.loads(database.read_text()) if database.exists() else {}
 if '-S' in sys.argv:
-    (root/'installed').touch()
+    for required in packages.values():
+        if 'openrgb' not in required:
+            required.append('openrgb')
+    packages.update({'openrgb': [], 'new-dependency': ['openrgb']})
 else:
-    (root/'installed').unlink(missing_ok=True)
+    removed = sys.argv[sys.argv.index('--') + 1:]
+    if '-Rns' in sys.argv:
+        pending = list(removed)
+        while pending:
+            package = pending.pop()
+            packages.pop(package, None)
+            for dependency, required in list(packages.items()):
+                if package in required:
+                    required.remove(package)
+                    if not required:
+                        pending.append(dependency)
+    else:
+        for package in removed:
+            packages.pop(package, None)
+        for required in packages.values():
+            required[:] = [package for package in required if package not in removed]
+database.write_text(json.dumps(packages))
 ''')
 
     def stub(self, name, code):
@@ -88,6 +118,12 @@ else:
 
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def set_packages(self, packages):
+        (self.home / "packages.json").write_text(json.dumps(packages))
+
+    def packages(self):
+        return json.loads((self.home / "packages.json").read_text())
 
     def test_new_install_records_plan_before_pkexec_atomic_0600_and_status(self):
         self.assertTrue(self.run_helper("install", "openrgb")["ok"])
@@ -111,7 +147,7 @@ else:
         self.assertTrue(status["purpose"])
 
     def test_preexisting_package_is_never_marked_or_uninstalled(self):
-        (self.home / "installed").touch()
+        self.set_packages({"openrgb": []})
         self.run_helper("install", "openrgb")
         self.assertFalse(self.record.exists())
         self.assertFalse(self.run_helper("status")["engines"][0]["installed_by_plugin"])
@@ -140,8 +176,52 @@ else:
         self.assertEqual(self.record.read_bytes(), before)
         self.run_helper("uninstall", "openrgb")
         self.assertEqual(self.commands()[-1],
-                         ["pkexec", "/usr/bin/pacman", "-Rns", "--noconfirm", "openrgb"])
+                         ["pkexec", "/usr/bin/pacman", "-Rn", "--noconfirm", "--",
+                          "openrgb", "new-dependency"])
         self.assertEqual(json.loads(self.record.read_text()), {"v": 1, "engines": {}})
+
+    def test_preexisting_orphan_survives_engine_uninstall(self):
+        self.set_packages({"preexisting-orphan": []})
+        self.run_helper("install", "openrgb")
+
+        self.run_helper("uninstall", "openrgb")
+
+        self.assertEqual(self.packages(), {"preexisting-orphan": []})
+
+    def test_new_dependency_is_removed_with_engine(self):
+        self.run_helper("install", "openrgb")
+
+        self.run_helper("uninstall", "openrgb")
+
+        self.assertEqual(self.packages(), {})
+        self.assertEqual(self.commands()[-1],
+                         ["pkexec", "/usr/bin/pacman", "-Rn", "--noconfirm", "--",
+                          "openrgb", "new-dependency"])
+
+    def test_new_dependency_required_by_external_package_is_preserved(self):
+        self.run_helper("install", "openrgb")
+        self.set_packages({"openrgb": [],
+                           "new-dependency": ["openrgb", "external-package"],
+                           "external-package": []})
+
+        self.run_helper("uninstall", "openrgb")
+
+        self.assertIn("new-dependency", self.packages())
+        self.assertEqual(self.commands()[-1],
+                         ["pkexec", "/usr/bin/pacman", "-Rn", "--noconfirm", "--",
+                          "openrgb"])
+
+    def test_invalid_package_name_in_record_is_rejected_before_commands(self):
+        self.run_helper("install", "openrgb")
+        value = json.loads(self.record.read_text())
+        value["engines"]["openrgb"]["new_dependencies"] = ["new-dependency;id"]
+        self.record.write_text(json.dumps(value))
+        before = self.record.read_bytes(), self.commands()
+
+        reply = self.run_helper("uninstall", "openrgb", success=False)
+
+        self.assertIn("Invalid engines.json package record", reply["error"])
+        self.assertEqual((self.record.read_bytes(), self.commands()), before)
 
     def test_uninstall_all_only_plugin_owned_and_is_idempotent(self):
         self.run_helper("uninstall-all")
@@ -151,7 +231,7 @@ else:
         before = self.commands()
         self.run_helper("uninstall-all")
         self.assertEqual(self.commands(), before)
-        self.assertFalse((self.home / "installed").exists())
+        self.assertEqual(self.packages(), {})
 
     def test_closed_commands_and_names_rejected_before_any_side_effect(self):
         for args in ([], ["install"], ["install", "--help"], ["install", "other"],
