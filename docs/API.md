@@ -8,7 +8,8 @@ against it in parallel; change it only through a PR that updates both.
 - Unix stream socket `$XDG_RUNTIME_DIR/omarchy-rgb-cooling.sock`, created by
   the systemd user socket unit (`Accept=no`, `SocketMode=0600`). `rgbcd`
   adopts it from `LISTEN_FDS`; with `--listen <path>` (tests and demo only)
-  it binds its own socket at `0600` and refuses to replace a non-socket file.
+  it binds its own socket at `0600` and refuses to replace any existing path,
+  including a socket.
 - Every accepted connection is checked with `SO_PEERCRED`; a UID other than
   `rgbcd`'s own is closed before any byte is read.
 - Framing: one JSON object per line, UTF-8, `\n` terminated. A line over

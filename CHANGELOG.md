@@ -25,6 +25,7 @@ Changes are documented under [Keep a Changelog](https://keepachangelog.com/en/1.
   per-device enablement.
 - User-level install footprint tracking and uninstall support.
 - Security baseline, hardware inventory, and MSI B760 fan-control research.
+- Architecture and lighting backend documentation.
 
 ### Changed
 
